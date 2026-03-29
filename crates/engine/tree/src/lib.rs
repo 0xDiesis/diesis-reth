@@ -94,6 +94,8 @@
 
 /// Support for backfill sync mode.
 pub mod backfill;
+/// Pluggable state commitment trait for the payload validation path.
+pub mod commitment;
 /// The type that drives the chain forward.
 pub mod chain;
 /// Support for downloading blocks on demand for live sync.

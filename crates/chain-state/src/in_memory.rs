@@ -561,6 +561,28 @@ impl<N: NodePrimitives> CanonicalInMemoryState<N> {
         self.inner.in_memory_state.head_state().into_iter().flat_map(|head| head.iter())
     }
 
+    /// DIESIS: Inject serialized Verkle commitment data into an in-memory canonical block.
+    ///
+    /// Called by the pipeline publication stage after successful Engine API publication.
+    /// Re-inserts the block with `verkle_updates` populated so that `save_blocks` can
+    /// write the data to `tables::VerkleStateDiffs` when the block is flushed to disk.
+    ///
+    /// No-ops if the block hash is not found in the in-memory state.
+    pub fn set_block_verkle_updates(&self, hash: B256, bytes: Vec<u8>) {
+        let mut numbers = self.inner.in_memory_state.numbers.write();
+        let mut blocks = self.inner.in_memory_state.blocks.write();
+
+        if let Some(existing) = blocks.get(&hash).cloned() {
+            let mut updated_block = existing.block.clone();
+            updated_block.verkle_updates = Some(bytes);
+            let parent = existing.parent.clone();
+            let new_state = Arc::new(BlockState::with_parent(updated_block, parent));
+            let number = new_state.number();
+            blocks.insert(hash, new_state);
+            numbers.insert(number, hash);
+        }
+    }
+
     /// Returns [`SignedTransaction`] type for the given `TxHash` if found.
     pub fn transaction_by_hash(&self, hash: TxHash) -> Option<N::SignedTx> {
         for block_state in self.canonical_chain() {
@@ -760,6 +782,12 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// This allows deferring the computation of the trie data which can be expensive.
     /// The data can be populated asynchronously after the block was validated.
     pub trie_data: DeferredTrieData,
+    /// DIESIS: Serialized Verkle commitment data for this block.
+    ///
+    /// Contains a bincode-serialized `VerkleBlockResult`. `None` when Verkle processing
+    /// is skipped (`skip_verkle=true`) or when the data has not yet been injected.
+    /// Written to `tables::VerkleStateDiffs` during canonical persistence.
+    pub verkle_updates: Option<Vec<u8>>,
 }
 
 impl<N: NodePrimitives> Default for ExecutedBlock<N> {
@@ -776,6 +804,7 @@ impl<N: NodePrimitives> Default for ExecutedBlock<N> {
                 state: Default::default(),
             }),
             trie_data: DeferredTrieData::ready(ComputedTrieData::default()),
+            verkle_updates: None,
         }
     }
 }
@@ -798,7 +827,12 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: ComputedTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data: DeferredTrieData::ready(trie_data) }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data: DeferredTrieData::ready(trie_data),
+            verkle_updates: None,
+        }
     }
 
     /// Create a new [`ExecutedBlock`] with deferred trie data.
@@ -820,7 +854,7 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: DeferredTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data }
+        Self { recovered_block, execution_output, trie_data, verkle_updates: None }
     }
 
     /// Returns a reference to an inner [`SealedBlock`]

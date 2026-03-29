@@ -274,6 +274,10 @@ where
     /// Whether the node uses hashed state as canonical storage (v2 mode).
     /// Cached at construction to avoid threading `StorageSettingsCache` bounds everywhere.
     use_hashed_state: bool,
+    /// Shared atomic for notifying external consumers of the latest persisted
+    /// block number. Written here on persistence completion, read by the
+    /// pipeline overlay eviction logic.
+    persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -340,6 +344,7 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         use_hashed_state: bool,
+        persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -362,6 +367,7 @@ where
             evm_config,
             changeset_cache,
             use_hashed_state,
+            persisted_head_notifier,
         }
     }
 
@@ -383,6 +389,7 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         use_hashed_state: bool,
+        persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
     ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
     {
         let best_block_number = provider.best_block_number().unwrap_or(0);
@@ -416,6 +423,7 @@ where
             evm_config,
             changeset_cache,
             use_hashed_state,
+            persisted_head_notifier,
         );
         let incoming = task.incoming_tx.clone();
         spawn_os_thread("engine", || task.run());
@@ -1379,6 +1387,8 @@ where
 
         debug!(target: "engine::tree", ?last_persisted_block_hash, ?last_persisted_block_number, elapsed=?start_time.elapsed(), "Finished persisting, calling finish");
         self.persistence_state.finish(last_persisted_block_hash, last_persisted_block_number);
+        self.persisted_head_notifier
+            .store(last_persisted_block_number, std::sync::atomic::Ordering::Relaxed);
 
         // Evict trie changesets for blocks below the eviction threshold.
         // Keep at least CHANGESET_CACHE_RETENTION_BLOCKS from the persisted tip, and also respect

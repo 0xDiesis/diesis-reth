@@ -817,6 +817,20 @@ where
     Ok(())
 }
 
+/// Computes the genesis state root using MPT, for use by [`crate::commitment::MptGenesisCommitment`].
+///
+/// This is a crate-internal bridge that exposes the private [`compute_state_root`] function to the
+/// commitment module without making the full implementation part of the public API.
+pub(crate) fn compute_state_root_for_commitment<Provider>(
+    provider: &Provider,
+    prefix_sets: Option<TriePrefixSets>,
+) -> Result<B256, InitStorageError>
+where
+    Provider: DBProvider<Tx: DbTxMut> + TrieWriter + StorageSettingsCache,
+{
+    compute_state_root(provider, prefix_sets)
+}
+
 /// Computes the state root (from scratch) based on the accounts and storages present in the
 /// database.
 fn compute_state_root<Provider>(

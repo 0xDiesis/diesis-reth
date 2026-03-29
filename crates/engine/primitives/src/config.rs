@@ -186,6 +186,12 @@ pub struct TreeConfig {
     /// computation is spawned in parallel and whichever finishes first is used.
     /// If `None`, the timeout fallback is disabled.
     state_root_task_timeout: Option<Duration>,
+    /// Whether to skip MPT state root re-validation after block execution.
+    ///
+    /// Diesis uses Verkle state roots in block headers, not MPT roots. When enabled,
+    /// the engine accepts the header's state root without recomputing it via MPT,
+    /// avoiding the inevitable mismatch between Verkle and MPT roots.
+    skip_state_root_validation: bool,
 }
 
 impl Default for TreeConfig {
@@ -220,6 +226,7 @@ impl Default for TreeConfig {
             sparse_trie_max_storage_tries: DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
             disable_sparse_trie_cache_pruning: false,
             state_root_task_timeout: Some(DEFAULT_STATE_ROOT_TASK_TIMEOUT),
+            skip_state_root_validation: false,
         }
     }
 }
@@ -286,6 +293,8 @@ impl TreeConfig {
             sparse_trie_max_storage_tries,
             disable_sparse_trie_cache_pruning: false,
             state_root_task_timeout,
+            // Diesis overrides this to `true` via `with_skip_state_root_validation`
+            skip_state_root_validation: false,
         }
     }
 
@@ -588,6 +597,29 @@ impl TreeConfig {
     /// Setter for whether to disable V2 storage proofs.
     pub const fn with_disable_proof_v2(mut self, disable_proof_v2: bool) -> Self {
         self.disable_proof_v2 = disable_proof_v2;
+        self
+    }
+
+    /// Returns whether MPT state root re-validation is skipped.
+    ///
+    /// When `true`, the engine accepts the block header's state root without
+    /// recomputing it via MPT. This is required for chains that use an alternative
+    /// state commitment scheme (e.g. Verkle tries) where the header carries a
+    /// non-MPT root.
+    pub const fn skip_state_root_validation(&self) -> bool {
+        self.skip_state_root_validation
+    }
+
+    /// Setter for skipping MPT state root re-validation.
+    ///
+    /// Enable this for chains whose block headers carry Verkle (or other non-MPT)
+    /// state roots. The engine will trust the pipeline's state root instead of
+    /// recomputing via MPT.
+    pub const fn with_skip_state_root_validation(
+        mut self,
+        skip_state_root_validation: bool,
+    ) -> Self {
+        self.skip_state_root_validation = skip_state_root_validation;
         self
     }
 

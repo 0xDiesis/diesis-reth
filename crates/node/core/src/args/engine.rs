@@ -498,6 +498,11 @@ impl EngineArgs {
             .with_sparse_trie_max_storage_tries(self.sparse_trie_max_storage_tries)
             .with_disable_sparse_trie_cache_pruning(self.disable_sparse_trie_cache_pruning)
             .with_state_root_task_timeout(self.state_root_task_timeout.filter(|d| !d.is_zero()))
+            .with_skip_state_root_validation(
+                std::env::var("DIESIS_SKIP_STATE_ROOT_VALIDATION")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(false),  // default: validate (safe mode)
+            )
     }
 }
 

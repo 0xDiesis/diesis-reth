@@ -534,6 +534,39 @@ tables! {
         type Key = String;
         type Value = Vec<u8>;
     }
+
+    /// Stores content-addressed Verkle trie nodes.
+    ///
+    /// Key: `keccak256` hash of the serialised node bytes.
+    /// Value: serialised inner or leaf node bytes.
+    table VerkleNodes {
+        type Key = B256;
+        type Value = Vec<u8>;
+    }
+
+    /// Stores Verkle root commitments indexed by block number.
+    ///
+    /// Value is the root commitment hash that goes into the block header as `state_root`.
+    table VerkleRoots {
+        type Key = BlockNumber;
+        type Value = B256;
+    }
+
+    /// Stores the content-addressed root node hash indexed by block number.
+    ///
+    /// Used to reload the Verkle trie from [`VerkleNodes`] on restart.
+    table VerkleRootNodes {
+        type Key = BlockNumber;
+        type Value = B256;
+    }
+
+    /// Stores serialised state diff data indexed by block number.
+    ///
+    /// Used for rollback during chain reverts.
+    table VerkleStateDiffs {
+        type Key = BlockNumber;
+        type Value = Vec<u8>;
+    }
 }
 
 /// Keys for the `ChainState` table.

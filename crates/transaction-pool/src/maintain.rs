@@ -42,7 +42,7 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 /// Maximum amount of time non-executable transaction are queued.
-pub const MAX_QUEUED_TRANSACTION_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
+pub const MAX_QUEUED_TRANSACTION_LIFETIME: Duration = Duration::from_secs(30);
 
 /// Additional settings for maintaining the transaction pool
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

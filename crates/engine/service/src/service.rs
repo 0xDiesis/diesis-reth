@@ -85,6 +85,7 @@ where
         sync_metrics_tx: MetricEventsSender,
         evm_config: C,
         changeset_cache: ChangesetCache,
+        persisted_head_notifier: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self
     where
         V: EngineValidator<N::Payload>,
@@ -113,6 +114,7 @@ where
             evm_config,
             changeset_cache,
             use_hashed_state,
+            persisted_head_notifier,
         );
 
         let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
@@ -224,6 +226,7 @@ mod tests {
             sync_metrics_tx,
             evm_config,
             changeset_cache,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
     }
 }

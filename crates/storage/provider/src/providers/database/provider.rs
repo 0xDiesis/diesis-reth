@@ -678,6 +678,19 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                     self.write_trie_updates_sorted(&merged_trie)?;
                 }
                 timings.write_trie_updates += start.elapsed();
+
+                // DIESIS: Write Verkle commitment data if present.
+                // Writes are per-block so each block number maps to its own serialized
+                // VerkleBlockResult. Both MPT and Verkle data coexist during the transition.
+                for block in &blocks {
+                    if let Some(ref verkle_bytes) = block.verkle_updates {
+                        let block_number = block.recovered_block().number();
+                        self.tx.put::<tables::VerkleStateDiffs>(
+                            block_number,
+                            verkle_bytes.clone(),
+                        )?;
+                    }
+                }
             }
 
             // Full mode: update history indices
