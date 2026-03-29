@@ -345,6 +345,19 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
+    /// Optional sender for direct executed-block insertion into the engine tree,
+    /// bypassing `new_payload` re-execution. Used by the Diesis deferred execution
+    /// pipeline to eliminate double execution overhead.
+    pub executed_block_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<
+            reth_chain_state::ExecutedBlock<<Node::Types as NodeTypes>::Primitives>,
+        >,
+    >,
+    /// Shared counter tracking the highest block number confirmed as persisted
+    /// to MDBX by reth's persistence service. Updated by the engine launch loop.
+    /// Used by the Diesis pipeline to gate overlay eviction — entries are only
+    /// evicted once their state is loadable from disk.
+    pub persisted_head: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -355,6 +368,8 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             engine_events: self.engine_events.clone(),
             beacon_engine_handle: self.beacon_engine_handle.clone(),
             engine_shutdown: self.engine_shutdown.clone(),
+            executed_block_tx: self.executed_block_tx.clone(),
+            persisted_head: self.persisted_head.clone(),
         }
     }
 }
@@ -1084,6 +1099,8 @@ where
             engine_events,
             beacon_engine_handle: engine_handle,
             engine_shutdown: EngineShutdown::default(),
+            executed_block_tx: None,
+            persisted_head: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 

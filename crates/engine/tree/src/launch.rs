@@ -21,7 +21,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory,
+    ProviderFactory, StorageSettingsCache,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
@@ -65,6 +65,7 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     evm_config: C,
     changeset_cache: ChangesetCache,
     runtime: Runtime,
+    persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
 ) -> ChainOrchestrator<
     EngineHandler<
         EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
@@ -86,6 +87,7 @@ where
         PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
 
     let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
+    let use_hashed_state = blockchain_db.cached_storage_settings().use_hashed_state();
 
     let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(
         blockchain_db,
@@ -99,6 +101,8 @@ where
         evm_config,
         changeset_cache,
         runtime,
+        use_hashed_state,
+        persisted_head_notifier,
     );
 
     let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);

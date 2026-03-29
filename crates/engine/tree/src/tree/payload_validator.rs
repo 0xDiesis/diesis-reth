@@ -779,6 +779,17 @@ where
             .record_state_root_gas_bucket(block.header().gas_used(), root_elapsed.as_secs_f64());
         debug!(target: "engine::tree::payload_validator", ?root_elapsed, "Calculated state root");
 
+        // Diesis: when skip_state_root_validation is enabled, the block header carries
+        // a Verkle state root (not MPT). The MPT root we just computed will differ from
+        // the header's root, so skip the comparison to avoid rejecting valid blocks.
+        if self.config.skip_state_root_validation() {
+            debug!(
+                target: "engine::tree::payload_validator",
+                block_state_root = ?block.header().state_root(),
+                computed_mpt_root = ?state_root,
+                "Skipping state root validation — Diesis uses Verkle roots"
+            );
+        } else
         // ensure state root matches
         if state_root != block.header().state_root() {
             #[cfg(feature = "trie-debug")]

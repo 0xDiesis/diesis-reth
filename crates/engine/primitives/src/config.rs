@@ -175,6 +175,12 @@ pub struct TreeConfig {
     /// before starting a proof calculation.
     #[cfg(feature = "trie-debug")]
     proof_jitter: Option<Duration>,
+    /// Whether to skip MPT state root re-validation after block execution.
+    ///
+    /// Diesis uses Verkle state roots in block headers, not MPT roots. When enabled,
+    /// the engine accepts the header's state root without recomputing it via MPT,
+    /// avoiding the inevitable mismatch between Verkle and MPT roots.
+    skip_state_root_validation: bool,
 }
 
 impl Default for TreeConfig {
@@ -214,6 +220,7 @@ impl Default for TreeConfig {
             share_sparse_trie_with_payload_builder: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
+            skip_state_root_validation: false,
         }
     }
 }
@@ -285,6 +292,8 @@ impl TreeConfig {
             share_sparse_trie_with_payload_builder,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
+            // Diesis overrides this to `true` via `with_skip_state_root_validation`
+            skip_state_root_validation: false,
         }
     }
 
@@ -533,6 +542,28 @@ impl TreeConfig {
         self.has_enough_parallelism && !self.legacy_state_root
     }
 
+    /// Returns whether MPT state root re-validation is skipped.
+    ///
+    /// When `true`, the engine accepts the block header's state root without
+    /// recomputing it via MPT. This is required for chains that use an alternative
+    /// state commitment scheme (e.g. Verkle tries) where the header carries a
+    /// non-MPT root.
+    pub const fn skip_state_root_validation(&self) -> bool {
+        self.skip_state_root_validation
+    }
+
+    /// Setter for skipping MPT state root re-validation.
+    ///
+    /// Enable this for chains whose block headers carry Verkle (or other non-MPT)
+    /// state roots. The engine will trust the pipeline's state root instead of
+    /// recomputing via MPT.
+    pub const fn with_skip_state_root_validation(
+        mut self,
+        skip_state_root_validation: bool,
+    ) -> Self {
+        self.skip_state_root_validation = skip_state_root_validation;
+        self
+    }
     /// Returns whether cache metrics recording is disabled.
     pub const fn disable_cache_metrics(&self) -> bool {
         self.disable_cache_metrics

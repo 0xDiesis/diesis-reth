@@ -12,3 +12,4 @@ pub mod init;
 
 mod db_tool;
 pub use db_tool::*;
+pub mod commitment;

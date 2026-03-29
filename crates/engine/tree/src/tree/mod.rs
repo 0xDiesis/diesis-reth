@@ -307,6 +307,13 @@ where
     execution_timing_stats: HashMap<B256, Box<ExecutionTimingStats>>,
     /// Task runtime for spawning blocking work on named, reusable threads.
     runtime: reth_tasks::Runtime,
+    /// Whether the node uses hashed state as canonical storage (v2 mode).
+    /// Cached at construction to avoid threading `StorageSettingsCache` bounds everywhere.
+    use_hashed_state: bool,
+    /// Shared atomic for notifying external consumers of the latest persisted
+    /// block number. Written here on persistence completion, read by the
+    /// pipeline overlay eviction logic.
+    persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -334,6 +341,7 @@ where
             .field("changeset_cache", &self.changeset_cache)
             .field("execution_timing_stats", &self.execution_timing_stats.len())
             .field("runtime", &self.runtime)
+            .field("use_hashed_state", &self.use_hashed_state)
             .finish()
     }
 }
@@ -374,6 +382,8 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
+        use_hashed_state: bool,
+        persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -397,6 +407,8 @@ where
             changeset_cache,
             execution_timing_stats: HashMap::new(),
             runtime,
+            use_hashed_state,
+            persisted_head_notifier,
         }
     }
 
@@ -418,6 +430,8 @@ where
         evm_config: C,
         changeset_cache: ChangesetCache,
         runtime: reth_tasks::Runtime,
+        use_hashed_state: bool,
+        persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
     ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
     {
         let best_block_number = provider.best_block_number().unwrap_or(0);
@@ -451,6 +465,8 @@ where
             evm_config,
             changeset_cache,
             runtime,
+            use_hashed_state,
+            persisted_head_notifier,
         );
         let incoming = task.incoming_tx.clone();
         spawn_os_thread("engine", || {
@@ -1469,6 +1485,8 @@ where
 
         debug!(target: "engine::tree", ?last_persisted_block_hash, ?last_persisted_block_number, elapsed=?start_time.elapsed(), "Finished persisting, calling finish");
         self.persistence_state.finish(last_persisted_block_hash, last_persisted_block_number);
+        self.persisted_head_notifier
+            .store(last_persisted_block_number, std::sync::atomic::Ordering::Relaxed);
 
         // Evict trie changesets for blocks below the eviction threshold.
         // Keep at least CHANGESET_CACHE_RETENTION_BLOCKS from the persisted tip, and also respect
@@ -2617,7 +2635,11 @@ where
 
             self.update_reorg_metrics(old.len(), old_first);
             self.reinsert_reorged_blocks(new.clone());
-            self.reinsert_reorged_blocks(old.clone());
+            // When use_hashed_state is enabled, skip reinserting the old chain: bundle-state
+            // reverts are plain-state oriented and are not available in hashed-state mode.
+            if !self.use_hashed_state {
+                self.reinsert_reorged_blocks(old.clone());
+            }
         }
 
         // update the tracked in-memory state with the new chain

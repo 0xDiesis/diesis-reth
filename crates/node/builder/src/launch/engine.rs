@@ -220,6 +220,10 @@ impl EngineNodeLauncher {
             // during this run.
             .maybe_store_messages(node_config.debug.engine_api_store.clone());
 
+        // Shared persisted-head counter. Written by the engine tree handler on persistence
+        // completion and read by Diesis consumers to gate overlay eviction.
+        let persisted_head = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let engine_kind = if ctx.chain_spec().is_optimism() {
             EngineApiKind::OpStack
         } else {
@@ -243,6 +247,7 @@ impl EngineNodeLauncher {
             ctx.components().evm_config().clone(),
             changeset_cache,
             ctx.task_executor().clone(),
+            std::sync::Arc::clone(&persisted_head),
         );
 
         info!(target: "reth::cli", "Consensus engine initialized");
@@ -271,6 +276,8 @@ impl EngineNodeLauncher {
             engine_events,
             beacon_engine_handle,
             engine_shutdown: _,
+            executed_block_tx: _,
+            persisted_head: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -293,6 +300,15 @@ impl EngineNodeLauncher {
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;
 
+        // Channel for direct executed-block insertion from the Diesis pipeline.
+        // Created outside the async block so the sender can be exposed on RpcHandle.
+        let (executed_block_tx, executed_block_rx) =
+            tokio::sync::mpsc::unbounded_channel::<
+                reth_chain_state::ExecutedBlock<
+                    <T::Types as reth_node_api::NodeTypes>::Primitives,
+                >,
+            >();
+
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
             if let Some(initial_target) = initial_target {
@@ -305,6 +321,7 @@ impl EngineNodeLauncher {
 
             let mut res = Ok(());
             let mut shutdown_rx = shutdown_rx.fuse();
+            let mut executed_block_rx = executed_block_rx;
 
             // advance the chain and await payloads built locally to add into the engine api
             // tree handler to prevent re-execution if that block is received as payload from
@@ -364,6 +381,10 @@ impl EngineNodeLauncher {
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
                         }
                     }
+                    Some(executed_block) = executed_block_rx.recv() => {
+                        debug!(target: "reth::cli", block=?executed_block.recovered_block().num_hash(), "inserting pipeline executed block (direct insert)");
+                        orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
+                    }
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
                             debug!(target: "reth::cli", "received engine shutdown request");
@@ -409,6 +430,8 @@ impl EngineNodeLauncher {
                 engine_events,
                 beacon_engine_handle,
                 engine_shutdown,
+                executed_block_tx: Some(executed_block_tx),
+                persisted_head: std::sync::Arc::clone(&persisted_head),
             },
         };
         // Notify on node started

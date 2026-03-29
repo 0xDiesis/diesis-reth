@@ -416,6 +416,30 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         Ok(self.create_block_builder(evm, parent, ctx))
     }
 
+    /// Like [`ConfigureEvm::builder_for_next_block`] but installs a custom inspector.
+    fn builder_for_next_block_with_inspector<'a, DB, I>(
+        &'a self,
+        db: &'a mut State<DB>,
+        parent: &'a SealedHeader<<Self::Primitives as NodePrimitives>::BlockHeader>,
+        attributes: Self::NextBlockEnvCtx,
+        inspector: I,
+    ) -> Result<
+        impl BlockBuilder<
+            Primitives = Self::Primitives,
+            Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+        >,
+        Self::Error,
+    >
+    where
+        DB: Database + 'a,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        let evm_env = self.next_evm_env(parent, &attributes)?;
+        let evm = self.evm_with_env_and_inspector(db, evm_env, inspector);
+        let ctx = self.context_for_next_block(parent, attributes)?;
+        Ok(self.create_block_builder(evm, parent, ctx))
+    }
+
     /// Returns a new [`Executor`] for executing blocks.
     ///
     /// The executor processes complete blocks including:

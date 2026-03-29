@@ -223,6 +223,8 @@ impl TestHarness {
             evm_config,
             changeset_cache,
             reth_tasks::Runtime::test(),
+            provider.cached_storage_settings().use_hashed_state(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
 
         let block_builder = TestBlockBuilder::default().with_chain_spec((*chain_spec).clone());

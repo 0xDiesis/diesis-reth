@@ -588,6 +588,11 @@ impl EngineArgs {
             )
             .with_share_sparse_trie_with_payload_builder(
                 self.share_sparse_trie_with_payload_builder,
+            )
+            .with_skip_state_root_validation(
+                std::env::var("DIESIS_SKIP_STATE_ROOT_VALIDATION")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(false),
             );
         #[cfg(feature = "trie-debug")]
         let config = config.with_proof_jitter(self.proof_jitter);
