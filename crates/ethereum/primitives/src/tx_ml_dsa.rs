@@ -362,6 +362,71 @@ impl SignableTransaction<Signature> for TxMlDsa {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Arbitrary
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "arbitrary"))]
+impl<'a> arbitrary::Arbitrary<'a> for TxMlDsa {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        use alloy_primitives::Address;
+
+        // Pick a valid ML-DSA security level.
+        let ml_dsa_level = *u.choose(&[44u8, 65, 87])?;
+
+        Ok(Self {
+            chain_id: u.arbitrary()?,
+            nonce: u.arbitrary()?,
+            max_priority_fee_per_gas: u.arbitrary()?,
+            max_fee_per_gas: u.arbitrary()?,
+            gas_limit: u.arbitrary()?,
+            to: u.arbitrary()?,
+            value: u.arbitrary()?,
+            input: u.arbitrary()?,
+            access_list: u.arbitrary()?,
+            sender: Address::arbitrary(u)?,
+            ml_dsa_level,
+            pubkey: u.arbitrary()?,
+            ml_dsa_signature: u.arbitrary()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compact codec (RLP-based)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "reth-codec"))]
+impl reth_codecs::Compact for TxMlDsa {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: alloy_primitives::bytes::BufMut + AsMut<[u8]>,
+    {
+        let mut rlp_buf = alloc::vec::Vec::new();
+        let header =
+            alloy_rlp::Header { list: true, payload_length: self.rlp_encoded_fields_length() };
+        header.encode(&mut rlp_buf);
+        self.rlp_encode_fields(&mut rlp_buf);
+        buf.put_slice(&rlp_buf);
+        rlp_buf.len()
+    }
+
+    fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        let mut remainder = buf;
+        let header =
+            alloy_rlp::Header::decode(&mut remainder).expect("invalid TxMlDsa compact header");
+        let body_start = remainder;
+        let tx = Self::rlp_decode_fields(&mut remainder).expect("invalid TxMlDsa compact fields");
+        // Verify we consumed exactly `header.payload_length` bytes from the body.
+        debug_assert_eq!(
+            body_start.len() - remainder.len(),
+            header.payload_length,
+            "TxMlDsa compact decode consumed wrong number of bytes"
+        );
+        (tx, remainder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
