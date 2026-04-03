@@ -446,8 +446,8 @@ pub(super) mod serde_bincode_compat {
 mod compact {
     use super::*;
     use reth_codecs::{
-        Compact,
         __private::{modular_bitfield::prelude::*, Buf},
+        Compact,
     };
 
     impl Receipt {
@@ -563,10 +563,11 @@ mod tests {
     use super::*;
     use crate::TransactionSigned;
     use alloy_eips::eip2718::Encodable2718;
-    use alloy_primitives::{
-        address, b256, bloom, bytes, hex_literal::hex, Address, Bytes, Log, LogData,
-    };
+    #[cfg(feature = "reth-codec")]
+    use alloy_primitives::Bytes;
+    use alloy_primitives::{address, b256, bloom, bytes, hex_literal::hex, Address, Log, LogData};
     use alloy_rlp::Decodable;
+    #[cfg(feature = "reth-codec")]
     use reth_codecs::Compact;
     use reth_primitives_traits::proofs::{
         calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
@@ -647,6 +648,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "reth-codec")]
     fn gigantic_receipt() {
         let receipt = Receipt {
             cumulative_gas_used: 16747627,

@@ -14,6 +14,9 @@ extern crate alloc;
 mod receipt;
 pub use receipt::*;
 
+pub mod tx_ml_dsa;
+pub use tx_ml_dsa::{TxMlDsa, ML_DSA_TX_TYPE_ID};
+
 /// Kept for consistency tests
 #[cfg(test)]
 mod transaction;
