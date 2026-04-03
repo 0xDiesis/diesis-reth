@@ -24,6 +24,8 @@ use reth_primitives_traits::{
     InMemorySize, SignedTransaction,
 };
 
+use crate::tx_ml_dsa::{TxMlDsa, ML_DSA_TX_TYPE_ID};
+
 macro_rules! delegate {
     ($self:expr => $tx:ident.$method:ident($($arg:expr),*)) => {
         match $self {
@@ -32,6 +34,21 @@ macro_rules! delegate {
             Transaction::Eip1559($tx) => $tx.$method($($arg),*),
             Transaction::Eip4844($tx) => $tx.$method($($arg),*),
             Transaction::Eip7702($tx) => $tx.$method($($arg),*),
+            Transaction::MlDsa($tx) => $tx.$method($($arg),*),
+        }
+    };
+}
+
+/// Delegate to all ECDSA transaction variants (excludes ML-DSA).
+macro_rules! delegate_ecdsa {
+    ($self:expr => $tx:ident.$method:ident($($arg:expr),*)) => {
+        match $self {
+            Transaction::Legacy($tx) => $tx.$method($($arg),*),
+            Transaction::Eip2930($tx) => $tx.$method($($arg),*),
+            Transaction::Eip1559($tx) => $tx.$method($($arg),*),
+            Transaction::Eip4844($tx) => $tx.$method($($arg),*),
+            Transaction::Eip7702($tx) => $tx.$method($($arg),*),
+            Transaction::MlDsa(_) => unreachable!("MlDsa handled before delegate_ecdsa"),
         }
     };
 }
@@ -89,10 +106,21 @@ pub enum Transaction {
     /// until re-assigned by the same EOA. This allows for adding smart contract functionality to
     /// the EOA.
     Eip7702(TxEip7702),
+    /// ML-DSA post-quantum transaction (type `0x70`).
+    ///
+    /// Uses ML-DSA (FIPS 204) signatures instead of ECDSA. The sender address and
+    /// signature are embedded in the transaction body since ML-DSA does not support
+    /// public key recovery.
+    MlDsa(TxMlDsa),
 }
 
 impl Transaction {
     /// Returns [`TxType`] of the transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics for [`Transaction::MlDsa`] because `TxType` has no MlDsa variant.
+    /// Use [`Typed2718::ty()`] to get the `u8` type ID instead.
     pub const fn tx_type(&self) -> TxType {
         match self {
             Self::Legacy(_) => TxType::Legacy,
@@ -100,6 +128,9 @@ impl Transaction {
             Self::Eip1559(_) => TxType::Eip1559,
             Self::Eip4844(_) => TxType::Eip4844,
             Self::Eip7702(_) => TxType::Eip7702,
+            Self::MlDsa(_) => {
+                panic!("MlDsa tx_type() not available — use Typed2718::ty() for u8 type ID")
+            }
         }
     }
 
@@ -111,6 +142,7 @@ impl Transaction {
             Self::Eip1559(tx) => &mut tx.input,
             Self::Eip4844(tx) => &mut tx.input,
             Self::Eip7702(tx) => &mut tx.input,
+            Self::MlDsa(tx) => &mut tx.input,
         }
     }
 }
@@ -205,7 +237,11 @@ impl SignableTransaction<Signature> for Transaction {
     }
 
     fn into_signed(self, signature: Signature) -> Signed<Self> {
-        let tx_hash = delegate!(&self => tx.tx_hash(&signature));
+        // ML-DSA tx hash is independent of the ECDSA signature.
+        let tx_hash = match &self {
+            Self::MlDsa(tx) => tx.tx_hash(),
+            _ => delegate_ecdsa!(&self => tx.tx_hash(&signature)),
+        };
         Signed::new_unchecked(self, signature, tx_hash)
     }
 }
@@ -224,6 +260,14 @@ impl reth_codecs::Compact for Transaction {
     where
         B: alloy_rlp::bytes::BufMut + AsMut<[u8]>,
     {
+        // ML-DSA has no TxType variant — write the type byte ourselves and return the
+        // extended identifier flag.
+        if let Self::MlDsa(tx) = self {
+            buf.put_u8(ML_DSA_TX_TYPE_ID);
+            tx.to_compact(buf);
+            return reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG;
+        }
+
         let identifier = self.tx_type().to_compact(buf);
         delegate!(self => tx.to_compact(buf));
         identifier
@@ -238,6 +282,22 @@ impl reth_codecs::Compact for Transaction {
     // A panic will be triggered if an identifier larger than 3 is passed from the database. For
     // optimism an identifier with value [`DEPOSIT_TX_TYPE_ID`] is allowed.
     fn from_compact(buf: &[u8], identifier: usize) -> (Self, &[u8]) {
+        use alloy_rlp::bytes::Buf;
+
+        // Intercept the extended identifier flag to check for ML-DSA before delegating
+        // to TxType (which does not know about 0x70).
+        if identifier == reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG {
+            let mut peek = buf;
+            let type_byte = peek.get_u8();
+            if type_byte == ML_DSA_TX_TYPE_ID {
+                // Consume the type byte from the real buffer.
+                let buf = &buf[1..];
+                let (tx, buf) = TxMlDsa::from_compact(buf, buf.len());
+                return (Self::MlDsa(tx), buf);
+            }
+            // Not ML-DSA — fall through to standard TxType decoding with original buf.
+        }
+
         let (tx_type, buf) = TxType::from_compact(buf, identifier);
 
         match tx_type {
@@ -275,27 +335,51 @@ impl RlpEcdsaEncodableTx for Transaction {
     }
 
     fn eip2718_encode_with_type(&self, signature: &Signature, _ty: u8, out: &mut dyn BufMut) {
-        delegate!(self => tx.eip2718_encode_with_type(signature, tx.ty(), out))
+        // ML-DSA carries its own signature in the tx body; ignore the ECDSA signature param.
+        if let Self::MlDsa(tx) = self {
+            tx.eip2718_encode(out);
+            return;
+        }
+        delegate_ecdsa!(self => tx.eip2718_encode_with_type(signature, tx.ty(), out))
     }
 
     fn eip2718_encode(&self, signature: &Signature, out: &mut dyn BufMut) {
-        delegate!(self => tx.eip2718_encode(signature, out))
+        if let Self::MlDsa(tx) = self {
+            tx.eip2718_encode(out);
+            return;
+        }
+        delegate_ecdsa!(self => tx.eip2718_encode(signature, out))
     }
 
     fn network_encode_with_type(&self, signature: &Signature, _ty: u8, out: &mut dyn BufMut) {
-        delegate!(self => tx.network_encode_with_type(signature, tx.ty(), out))
+        if let Self::MlDsa(tx) = self {
+            tx.eip2718_encode(out);
+            return;
+        }
+        delegate_ecdsa!(self => tx.network_encode_with_type(signature, tx.ty(), out))
     }
 
     fn network_encode(&self, signature: &Signature, out: &mut dyn BufMut) {
-        delegate!(self => tx.network_encode(signature, out))
+        if let Self::MlDsa(tx) = self {
+            tx.eip2718_encode(out);
+            return;
+        }
+        delegate_ecdsa!(self => tx.network_encode(signature, out))
     }
 
     fn tx_hash_with_type(&self, signature: &Signature, _ty: u8) -> TxHash {
-        delegate!(self => tx.tx_hash_with_type(signature, tx.ty()))
+        // ML-DSA tx hash is independent of the ECDSA signature.
+        if let Self::MlDsa(tx) = self {
+            return tx.tx_hash();
+        }
+        delegate_ecdsa!(self => tx.tx_hash_with_type(signature, tx.ty()))
     }
 
     fn tx_hash(&self, signature: &Signature) -> TxHash {
-        delegate!(self => tx.tx_hash(signature))
+        if let Self::MlDsa(tx) = self {
+            return tx.tx_hash();
+        }
+        delegate_ecdsa!(self => tx.tx_hash(signature))
     }
 }
 
@@ -450,6 +534,9 @@ impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844> {
             Transaction::Eip1559(tx) => Signed::new_unchecked(tx, signature, hash).into(),
             Transaction::Eip4844(tx) => Signed::new_unchecked(tx, signature, hash).into(),
             Transaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::MlDsa(_) => {
+                panic!("MlDsa transactions cannot be converted to EthereumTxEnvelope")
+            }
         }
     }
 }
@@ -459,6 +546,15 @@ impl<'a> arbitrary::Arbitrary<'a> for TransactionSigned {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         #[expect(unused_mut)]
         let mut transaction = Transaction::arbitrary(u)?;
+
+        // ML-DSA carries its own signature in the tx body — use a dummy ECDSA signature.
+        if matches!(transaction, Transaction::MlDsa(_)) {
+            return Ok(Self {
+                transaction,
+                signature: Signature::new(U256::ZERO, U256::ZERO, false),
+                hash: Default::default(),
+            });
+        }
 
         let secp = secp256k1::Secp256k1::new();
         let key_pair = secp256k1::Keypair::new(&secp, &mut rand_08::thread_rng());
@@ -485,11 +581,18 @@ impl Encodable2718 for TransactionSigned {
     }
 
     fn encode_2718_len(&self) -> usize {
-        delegate!(&self.transaction => tx.eip2718_encoded_length(&self.signature))
+        // ML-DSA has its own encoding that doesn't take an ECDSA signature parameter.
+        match &self.transaction {
+            Transaction::MlDsa(tx) => tx.eip2718_encoded_length(),
+            _ => delegate_ecdsa!(&self.transaction => tx.eip2718_encoded_length(&self.signature)),
+        }
     }
 
     fn encode_2718(&self, out: &mut dyn alloy_rlp::BufMut) {
-        delegate!(&self.transaction => tx.eip2718_encode(&self.signature, out))
+        match &self.transaction {
+            Transaction::MlDsa(tx) => tx.eip2718_encode(out),
+            _ => delegate_ecdsa!(&self.transaction => tx.eip2718_encode(&self.signature, out)),
+        }
     }
 
     fn trie_hash(&self) -> B256 {
@@ -499,6 +602,16 @@ impl Encodable2718 for TransactionSigned {
 
 impl Decodable2718 for TransactionSigned {
     fn typed_decode(ty: u8, buf: &mut &[u8]) -> Eip2718Result<Self> {
+        // Handle ML-DSA (0x70) before TxType conversion since TxType has no MlDsa variant.
+        if ty == ML_DSA_TX_TYPE_ID {
+            let tx = TxMlDsa::eip2718_decode(buf).map_err(|_| Eip2718Error::UnexpectedType(ty))?;
+            return Ok(Self {
+                transaction: Transaction::MlDsa(tx),
+                signature: Signature::new(U256::ZERO, U256::ZERO, false),
+                hash: Default::default(),
+            });
+        }
+
         match ty.try_into().map_err(|_| Eip2718Error::UnexpectedType(ty))? {
             TxType::Legacy => Err(Eip2718Error::UnexpectedType(0)),
             TxType::Eip2930 => {
@@ -621,16 +734,26 @@ impl reth_codecs::Compact for TransactionSigned {
 
 impl SignerRecoverable for TransactionSigned {
     fn recover_signer(&self) -> Result<Address, RecoveryError> {
+        // ML-DSA carries the sender explicitly — no secp256k1 recovery needed.
+        if let Transaction::MlDsa(tx) = &self.transaction {
+            return Ok(tx.sender);
+        }
         let signature_hash = self.signature_hash();
         recover_signer(&self.signature, signature_hash)
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
+        if let Transaction::MlDsa(tx) = &self.transaction {
+            return Ok(tx.sender);
+        }
         let signature_hash = self.signature_hash();
         recover_signer_unchecked(&self.signature, signature_hash)
     }
 
     fn recover_unchecked_with_buf(&self, buf: &mut Vec<u8>) -> Result<Address, RecoveryError> {
+        if let Transaction::MlDsa(tx) = &self.transaction {
+            return Ok(tx.sender);
+        }
         self.encode_for_signing(buf);
         let signature_hash = keccak256(buf);
         recover_signer_unchecked(&self.signature, signature_hash)
@@ -645,7 +768,8 @@ impl TxHashRef for TransactionSigned {
 
 impl IsTyped2718 for TransactionSigned {
     fn is_type(type_id: u8) -> bool {
-        <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
+        type_id == ML_DSA_TX_TYPE_ID ||
+            <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
     }
 }
 
@@ -662,6 +786,9 @@ mod tests {
     proptest! {
         #[test]
         fn test_roundtrip_compact_encode_envelope(reth_tx in arb::<TransactionSigned>()) {
+            // MlDsa cannot be converted to EthereumTxEnvelope.
+            proptest::prop_assume!(!matches!(reth_tx.transaction, Transaction::MlDsa(_)));
+
             let mut expected_buf = Vec::<u8>::new();
             let expected_len = reth_tx.to_compact(&mut expected_buf);
 
@@ -675,6 +802,8 @@ mod tests {
 
         #[test]
         fn test_roundtrip_compact_decode_envelope(reth_tx in arb::<TransactionSigned>()) {
+            proptest::prop_assume!(!matches!(reth_tx.transaction, Transaction::MlDsa(_)));
+
             let mut buf = Vec::<u8>::new();
             let len = reth_tx.to_compact(&mut buf);
 
@@ -686,6 +815,7 @@ mod tests {
 
         #[test]
         fn test_roundtrip_compact_encode_envelope_zstd(mut reth_tx in arb::<TransactionSigned>()) {
+            proptest::prop_assume!(!matches!(reth_tx.transaction, Transaction::MlDsa(_)));
                // zstd only kicks in if the input is large enough
             *reth_tx.transaction.input_mut() = vec![0;33].into();
 
@@ -702,6 +832,7 @@ mod tests {
 
         #[test]
         fn test_roundtrip_compact_decode_envelope_zstd(mut reth_tx in arb::<TransactionSigned>()) {
+            proptest::prop_assume!(!matches!(reth_tx.transaction, Transaction::MlDsa(_)));
             // zstd only kicks in if the input is large enough
             *reth_tx.transaction.input_mut() = vec![0;33].into();
 
