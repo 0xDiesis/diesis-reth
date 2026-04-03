@@ -115,6 +115,11 @@ impl TxMlDsa {
     /// Decodes all fields from RLP bytes (assumes the RLP list header has
     /// already been consumed).
     pub fn rlp_decode_fields(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        // TODO: validate ml_dsa_level is one of 44, 65, or 87 — deferred to the transaction pool
+        // validation layer.
+        //
+        // TODO: validate pubkey/signature byte lengths match the declared ml_dsa_level — deferred
+        // to the transaction pool validation layer.
         Ok(Self {
             chain_id: Decodable::decode(buf)?,
             nonce: Decodable::decode(buf)?,
@@ -350,6 +355,8 @@ impl SignableTransaction<Signature> for TxMlDsa {
     }
 
     fn into_signed(self, signature: Signature) -> Signed<Self, Signature> {
+        // `signature` is intentionally unused — the real ML-DSA signature is carried in
+        // `self.ml_dsa_signature`.
         let hash = self.tx_hash();
         Signed::new_unchecked(self, signature, hash)
     }
