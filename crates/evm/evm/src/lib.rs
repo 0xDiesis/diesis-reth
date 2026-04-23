@@ -426,7 +426,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     ) -> Result<
         impl BlockBuilder<
             Primitives = Self::Primitives,
-            Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+            Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
         >,
         Self::Error,
     >

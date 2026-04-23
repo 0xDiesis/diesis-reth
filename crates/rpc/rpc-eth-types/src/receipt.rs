@@ -1,12 +1,12 @@
 //! RPC receipt response builder, extends a layer one receipt with layer two data.
 
 use crate::EthApiError;
-use alloy_consensus::{ReceiptEnvelope, Transaction};
+use alloy_consensus::{ReceiptEnvelope, Transaction, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, TxKind};
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
 use reth_chainspec::EthChainSpec;
-use reth_ethereum_primitives::Receipt;
+use reth_ethereum_primitives::{DiesisTxType, Receipt};
 use reth_primitives_traits::{NodePrimitives, TransactionMeta};
 use reth_rpc_convert::transaction::{ConvertReceiptInput, ReceiptConverter};
 use std::sync::Arc;
@@ -80,7 +80,8 @@ impl<ChainSpec> EthReceiptConverter<ChainSpec> {
             chain_spec,
             build_rpc_receipt: |receipt: Receipt, next_log_index, meta: TransactionMeta| {
                 let mut log_index = next_log_index;
-                receipt
+                let tx_type = receipt.tx_type;
+                let receipt = receipt
                     .map_logs(|log| {
                         let idx = log_index;
                         log_index += 1;
@@ -95,7 +96,20 @@ impl<ChainSpec> EthReceiptConverter<ChainSpec> {
                             removed: false,
                         }
                     })
-                    .into()
+                    .into_with_bloom()
+                    .map_receipt(Into::into);
+
+                match tx_type {
+                    DiesisTxType::Legacy => ReceiptEnvelope::Legacy(receipt),
+                    DiesisTxType::Eip2930 => ReceiptEnvelope::Eip2930(receipt),
+                    DiesisTxType::Eip1559 => ReceiptEnvelope::Eip1559(receipt),
+                    DiesisTxType::Eip4844 => ReceiptEnvelope::Eip4844(receipt),
+                    DiesisTxType::Eip7702 => ReceiptEnvelope::Eip7702(receipt),
+                    // The stock Ethereum network response cannot encode custom receipt envelopes.
+                    // Consensus receipts and receipt roots retain type 0x70 via DiesisTxType; a
+                    // Diesis-specific RPC network type should expose 0x70 without this fallback.
+                    DiesisTxType::MlDsa => ReceiptEnvelope::Eip1559(receipt),
+                }
             },
         }
     }

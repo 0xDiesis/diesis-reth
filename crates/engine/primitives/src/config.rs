@@ -177,9 +177,9 @@ pub struct TreeConfig {
     proof_jitter: Option<Duration>,
     /// Whether to skip MPT state root re-validation after block execution.
     ///
-    /// Diesis uses Verkle state roots in block headers, not MPT roots. When enabled,
-    /// the engine accepts the header's state root without recomputing it via MPT,
-    /// avoiding the inevitable mismatch between Verkle and MPT roots.
+    /// This is an unsafe debug/testing switch. It must not be used as a
+    /// substitute for consensus validation of an alternative state commitment
+    /// such as a Verkle root.
     skip_state_root_validation: bool,
 }
 
@@ -292,7 +292,7 @@ impl TreeConfig {
             share_sparse_trie_with_payload_builder,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
-            // Diesis overrides this to `true` via `with_skip_state_root_validation`
+            // Unsafe debug/testing escape hatch; off by default.
             skip_state_root_validation: false,
         }
     }
@@ -545,18 +545,17 @@ impl TreeConfig {
     /// Returns whether MPT state root re-validation is skipped.
     ///
     /// When `true`, the engine accepts the block header's state root without
-    /// recomputing it via MPT. This is required for chains that use an alternative
-    /// state commitment scheme (e.g. Verkle tries) where the header carries a
-    /// non-MPT root.
+    /// comparing it to the computed MPT root. This is unsafe outside local
+    /// debugging because it removes the engine-level state-root check.
     pub const fn skip_state_root_validation(&self) -> bool {
         self.skip_state_root_validation
     }
 
     /// Setter for skipping MPT state root re-validation.
     ///
-    /// Enable this for chains whose block headers carry Verkle (or other non-MPT)
-    /// state roots. The engine will trust the pipeline's state root instead of
-    /// recomputing via MPT.
+    /// Enable only for local debugging. Chains whose block headers carry Verkle
+    /// or another non-MPT commitment need a replacement import-time verifier,
+    /// not this bypass.
     pub const fn with_skip_state_root_validation(
         mut self,
         skip_state_root_validation: bool,
