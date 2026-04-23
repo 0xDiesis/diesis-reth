@@ -15,6 +15,16 @@ use crate::node_config::{
 /// Global static engine defaults
 static ENGINE_DEFAULTS: OnceLock<DefaultEngineValues> = OnceLock::new();
 
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "on" | "ON")
+}
+
+fn unsafe_skip_state_root_validation_enabled() -> bool {
+    std::env::var("DIESIS_UNSAFE_SKIP_STATE_ROOT_VALIDATION")
+        .map(|value| env_flag_enabled(&value))
+        .unwrap_or(false)
+}
+
 /// Default values for engine that can be customized
 ///
 /// Global defaults can be set via [`DefaultEngineValues::try_init`].
@@ -498,11 +508,7 @@ impl EngineArgs {
             .with_sparse_trie_max_storage_tries(self.sparse_trie_max_storage_tries)
             .with_disable_sparse_trie_cache_pruning(self.disable_sparse_trie_cache_pruning)
             .with_state_root_task_timeout(self.state_root_task_timeout.filter(|d| !d.is_zero()))
-            .with_skip_state_root_validation(
-                std::env::var("DIESIS_SKIP_STATE_ROOT_VALIDATION")
-                    .map(|v| v != "false" && v != "0")
-                    .unwrap_or(false),  // default: validate (safe mode)
-            )
+            .with_skip_state_root_validation(unsafe_skip_state_root_validation_enabled())
     }
 }
 
@@ -523,6 +529,17 @@ mod tests {
         let default_args = EngineArgs::default();
         let args = CommandParser::<EngineArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
+    }
+
+    #[test]
+    fn unsafe_state_root_skip_flag_truth_table() {
+        for value in ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"] {
+            assert!(env_flag_enabled(value), "{value} should enable the flag");
+        }
+
+        for value in ["", "0", "false", "FALSE", "no", "off", "random"] {
+            assert!(!env_flag_enabled(value), "{value} should not enable the flag");
+        }
     }
 
     #[test]

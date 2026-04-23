@@ -115,22 +115,19 @@ pub enum Transaction {
 }
 
 impl Transaction {
-    /// Returns [`TxType`] of the transaction.
+    /// Returns the standard Ethereum [`TxType`] for non-Diesis transactions.
     ///
-    /// # Panics
-    ///
-    /// Panics for [`Transaction::MlDsa`] because `TxType` has no MlDsa variant.
-    /// Use [`Typed2718::ty()`] to get the `u8` type ID instead.
-    pub const fn tx_type(&self) -> TxType {
+    /// Returns `None` for [`Transaction::MlDsa`] because `TxType` has no
+    /// representation for Diesis type `0x70`. Use [`Typed2718::ty()`] when the
+    /// raw EIP-2718 type byte is required.
+    pub const fn standard_tx_type(&self) -> Option<TxType> {
         match self {
-            Self::Legacy(_) => TxType::Legacy,
-            Self::Eip2930(_) => TxType::Eip2930,
-            Self::Eip1559(_) => TxType::Eip1559,
-            Self::Eip4844(_) => TxType::Eip4844,
-            Self::Eip7702(_) => TxType::Eip7702,
-            Self::MlDsa(_) => {
-                panic!("MlDsa tx_type() not available — use Typed2718::ty() for u8 type ID")
-            }
+            Self::Legacy(_) => Some(TxType::Legacy),
+            Self::Eip2930(_) => Some(TxType::Eip2930),
+            Self::Eip1559(_) => Some(TxType::Eip1559),
+            Self::Eip4844(_) => Some(TxType::Eip4844),
+            Self::Eip7702(_) => Some(TxType::Eip7702),
+            Self::MlDsa(_) => None,
         }
     }
 
@@ -268,7 +265,10 @@ impl reth_codecs::Compact for Transaction {
             return reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG;
         }
 
-        let identifier = self.tx_type().to_compact(buf);
+        let identifier = self
+            .standard_tx_type()
+            .expect("ML-DSA transactions return before standard TxType encoding")
+            .to_compact(buf);
         delegate!(self => tx.to_compact(buf));
         identifier
     }
@@ -417,9 +417,9 @@ impl Hash for TransactionSigned {
 
 impl PartialEq for TransactionSigned {
     fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature &&
-            self.transaction == other.transaction &&
-            self.tx_hash() == other.tx_hash()
+        self.signature == other.signature
+            && self.transaction == other.transaction
+            && self.tx_hash() == other.tx_hash()
     }
 }
 
@@ -768,8 +768,8 @@ impl TxHashRef for TransactionSigned {
 
 impl IsTyped2718 for TransactionSigned {
     fn is_type(type_id: u8) -> bool {
-        type_id == ML_DSA_TX_TYPE_ID ||
-            <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
+        type_id == ML_DSA_TX_TYPE_ID
+            || <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
     }
 }
 
@@ -782,6 +782,32 @@ mod tests {
     use proptest::proptest;
     use proptest_arbitrary_interop::arb;
     use reth_codecs::Compact;
+
+    fn empty_ml_dsa_transaction() -> TxMlDsa {
+        TxMlDsa {
+            chain_id: 1,
+            nonce: 0,
+            max_priority_fee_per_gas: 0,
+            max_fee_per_gas: 0,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            access_list: AccessList::default(),
+            sender: Address::ZERO,
+            ml_dsa_level: 44,
+            pubkey: Bytes::new(),
+            ml_dsa_signature: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn ml_dsa_transaction_has_raw_type_without_standard_txtype() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+
+        assert_eq!(tx.standard_tx_type(), None);
+        assert_eq!(tx.ty(), ML_DSA_TX_TYPE_ID);
+    }
 
     proptest! {
         #[test]
