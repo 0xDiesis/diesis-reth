@@ -26,8 +26,10 @@ pub use transaction::{PooledTransactionVariant, Transaction, TransactionSigned};
 
 mod tx_type;
 pub use tx_type::DiesisTxType;
+/// Diesis-aware transaction type used by receipts and execution paths.
+pub type TxType = DiesisTxType;
 
-pub use alloy_consensus::{transaction::PooledTransaction, TxType};
+pub use alloy_consensus::transaction::PooledTransaction;
 
 /// Type alias for the ethereum block
 pub type Block = alloy_consensus::Block<TransactionSigned>;

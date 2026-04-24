@@ -429,6 +429,11 @@ impl TransactionSigned {
         Self { hash: hash.into(), signature, transaction }
     }
 
+    /// Creates a new signed transaction and lazily computes the hash on first access.
+    pub fn new_unhashed(transaction: Transaction, signature: Signature) -> Self {
+        Self { hash: OnceLock::new(), signature, transaction }
+    }
+
     /// Returns the transaction hash.
     #[inline]
     pub fn hash(&self) -> &B256 {
@@ -637,10 +642,38 @@ impl From<Signed<Transaction>> for TransactionSigned {
     }
 }
 
+impl From<Signed<TxLegacy>> for TransactionSigned {
+    fn from(value: Signed<TxLegacy>) -> Self {
+        let (tx, sig, hash) = value.into_parts();
+        Self::new(Transaction::Legacy(tx), sig, hash)
+    }
+}
+
+impl From<Signed<TxEip2930>> for TransactionSigned {
+    fn from(value: Signed<TxEip2930>) -> Self {
+        let (tx, sig, hash) = value.into_parts();
+        Self::new(Transaction::Eip2930(tx), sig, hash)
+    }
+}
+
+impl From<Signed<TxEip1559>> for TransactionSigned {
+    fn from(value: Signed<TxEip1559>) -> Self {
+        let (tx, sig, hash) = value.into_parts();
+        Self::new(Transaction::Eip1559(tx), sig, hash)
+    }
+}
+
 impl From<Signed<TxEip4844>> for TransactionSigned {
     fn from(value: Signed<TxEip4844>) -> Self {
         let (tx, sig, hash) = value.into_parts();
         Self::new(Transaction::Eip4844(tx), sig, hash)
+    }
+}
+
+impl From<Signed<TxEip7702>> for TransactionSigned {
+    fn from(value: Signed<TxEip7702>) -> Self {
+        let (tx, sig, hash) = value.into_parts();
+        Self::new(Transaction::Eip7702(tx), sig, hash)
     }
 }
 
