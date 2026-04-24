@@ -153,8 +153,7 @@ impl reth_codecs::Compact for DiesisTxType {
             reth_codecs::txtype::COMPACT_IDENTIFIER_EIP1559 => (Self::Eip1559, buf),
             reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG => {
                 let ty = buf.get_u8();
-                let tx_type =
-                    Self::try_from(ty).expect("invalid extended Diesis transaction type");
+                let tx_type = Self::try_from(ty).expect("invalid extended Diesis transaction type");
                 (tx_type, buf)
             }
             _ => panic!("invalid compact Diesis transaction type identifier {identifier}"),

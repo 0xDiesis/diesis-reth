@@ -41,7 +41,7 @@ Here's what that looks like in practice, measured with [reth-bench](https://gith
 
 Reth is production ready, and suitable for usage in mission-critical environments such as staking or high-uptime services. We also actively recommend professional node operators to switch to Reth in production for performance and cost reasons in use cases where high performance with great margins is required such as RPC, MEV, Indexing, Simulations, and P2P activities.
 
-- We released **Reth 2.0** in April 2026. See the [release notes](https://github.com/paradigmxyz/reth/releases/tag/v2.0.0) and [blog post](https://www.paradigm.xyz/2026/04/releasing-reth-2-0).
+- We released **Reth 2.1** in April 2026. See the [2.1 release notes](https://github.com/paradigmxyz/reth/releases/tag/v2.1.0), [2.0 release notes](https://github.com/paradigmxyz/reth/releases/tag/v2.0.0), and [2.0 blog post](https://www.paradigm.xyz/2026/04/releasing-reth-2-0).
 - We released 1.0 "production-ready" stable Reth in June 2024.
   - Reth completed an audit with [Sigma Prime](https://sigmaprime.io/), the developers of [Lighthouse](https://github.com/sigp/lighthouse), the Rust Consensus Layer implementation. Find it [here](./audit/sigma_prime_audit_v2.pdf).
   - Revm (the EVM used in Reth) underwent an audit with [Guido Vranken](https://x.com/guidovranken) (#1 [Ethereum Bug Bounty](https://ethereum.org/en/bug-bounty)).
@@ -52,7 +52,7 @@ Reth is production ready, and suitable for usage in mission-critical environment
 
 ### Storage compatibility
 
-Storage V2 is the default for new nodes in Reth 2.0. Existing V1 nodes continue to work, but V1 support will be removed in a future release — all users are encouraged to migrate. V2 snapshots are available at [snapshots.reth.rs](https://snapshots.reth.rs/).
+Storage V2 is the default for new nodes in Reth 2.x. Existing V1 nodes continue to work, but V1 support will be removed in a future release — all users are encouraged to migrate. V2 snapshots are available at [snapshots.reth.rs](https://snapshots.reth.rs/).
 
 ![](./assets/reth-storage.png)
 

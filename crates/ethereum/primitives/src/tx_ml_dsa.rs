@@ -83,17 +83,17 @@ impl TxMlDsa {
 
     /// Returns the RLP-encoded length of the signing fields (no RLP header).
     pub fn rlp_signing_fields_length(&self) -> usize {
-        self.chain_id.length() +
-            self.nonce.length() +
-            self.max_priority_fee_per_gas.length() +
-            self.max_fee_per_gas.length() +
-            self.gas_limit.length() +
-            self.to.length() +
-            self.value.length() +
-            self.input.0.length() +
-            self.access_list.length() +
-            self.sender.length() +
-            self.ml_dsa_level.length()
+        self.chain_id.length()
+            + self.nonce.length()
+            + self.max_priority_fee_per_gas.length()
+            + self.max_fee_per_gas.length()
+            + self.gas_limit.length()
+            + self.to.length()
+            + self.value.length()
+            + self.input.0.length()
+            + self.access_list.length()
+            + self.sender.length()
+            + self.ml_dsa_level.length()
     }
 
     // -----------------------------------------------------------------------
@@ -115,11 +115,9 @@ impl TxMlDsa {
     /// Decodes all fields from RLP bytes (assumes the RLP list header has
     /// already been consumed).
     pub fn rlp_decode_fields(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        // TODO: validate ml_dsa_level is one of 44, 65, or 87 — deferred to the transaction pool
-        // validation layer.
-        //
-        // TODO: validate pubkey/signature byte lengths match the declared ml_dsa_level — deferred
-        // to the transaction pool validation layer.
+        // Decode stays structural. Semantic checks for level, public-key length, signature
+        // length, registry state, and signature validity run in the transaction validator and
+        // executor hook, where chain state and the active admission policy are available.
         Ok(Self {
             chain_id: Decodable::decode(buf)?,
             nonce: Decodable::decode(buf)?,
@@ -206,11 +204,11 @@ impl TxMlDsa {
 
     /// Returns a heuristic for the in-memory size of this transaction.
     pub fn size(&self) -> usize {
-        mem::size_of::<Self>() +
-            self.access_list.size() +
-            self.input.len() +
-            self.pubkey.len() +
-            self.ml_dsa_signature.len()
+        mem::size_of::<Self>()
+            + self.access_list.size()
+            + self.input.len()
+            + self.pubkey.len()
+            + self.ml_dsa_signature.len()
     }
 
     // -----------------------------------------------------------------------

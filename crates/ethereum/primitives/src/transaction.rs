@@ -1,5 +1,10 @@
-//! This file contains the legacy reth `TransactionSigned` type that has been replaced with
-//! alloy's TxEnvelope To test for consistency this is kept
+//! Diesis transaction primitives.
+//!
+//! This module keeps Reth's typed Ethereum transaction envelope API and extends it with
+//! Diesis-only transaction type `0x70` for ML-DSA signatures. Ethereum-only callers can
+//! convert supported variants into Alloy envelopes; consensus, receipt, and network paths use
+//! [`DiesisTxType`] or [`Typed2718::ty`] so custom type bytes do not collapse into
+//! [`TxType`].
 
 use alloc::vec::Vec;
 use alloy_consensus::{
@@ -993,7 +998,8 @@ impl reth_codecs::Compact for TransactionSigned {
         let zstd_bit = bitflags >> 3;
         let (transaction, buf) = if zstd_bit != 0 {
             reth_zstd_compressors::with_tx_decompressor(|decompressor| {
-                // TODO: enforce that zstd is only present at a "top" level type
+                // Compact decoding keeps zstd at the envelope boundary; the
+                // decompressed payload is decoded as an uncompressed transaction.
                 let transaction_type = (bitflags & 0b110) >> 1;
                 let (transaction, _) =
                     Transaction::from_compact(decompressor.decompress(buf), transaction_type);
