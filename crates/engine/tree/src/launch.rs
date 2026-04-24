@@ -82,12 +82,12 @@ where
     C: ConfigureEvm<Primitives = N::Primitives> + 'static,
 {
     let downloader = BasicBlockDownloader::new(client, consensus.clone());
+    let use_hashed_state = provider.cached_storage_settings().use_hashed_state();
 
     let persistence_handle =
         PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
 
     let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
-    let use_hashed_state = blockchain_db.cached_storage_settings().use_hashed_state();
 
     let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(
         blockchain_db,
