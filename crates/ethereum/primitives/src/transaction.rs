@@ -6,7 +6,7 @@ use alloy_consensus::{
     error::ValueError,
     transaction::{RlpEcdsaDecodableTx, RlpEcdsaEncodableTx, SignerRecoverable, TxHashRef},
     EthereumTxEnvelope, SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930,
-    TxEip4844, TxEip4844WithSidecar, TxEip7702, TxLegacy, TxType, Typed2718,
+    TxEip4844, TxEip4844Variant, TxEip4844WithSidecar, TxEip7702, TxLegacy, TxType, Typed2718,
 };
 use alloy_eips::{
     eip2718::{Decodable2718, Eip2718Error, Eip2718Result, Encodable2718, IsTyped2718},
@@ -14,11 +14,11 @@ use alloy_eips::{
     eip7594::BlobTransactionSidecarVariant,
     eip7702::SignedAuthorization,
 };
-#[cfg(feature = "reth-codec")]
-use alloy_rlp::bytes;
 use alloy_primitives::{
     bytes::BufMut, keccak256, Address, Bytes, ChainId, Signature, TxHash, TxKind, B256, U256,
 };
+#[cfg(feature = "reth-codec")]
+use alloy_rlp::bytes;
 use alloy_rlp::{Decodable, Encodable};
 use core::hash::{Hash, Hasher};
 use reth_primitives_traits::{
@@ -458,13 +458,11 @@ impl TransactionSigned {
     ) -> Result<EthereumTxEnvelope<TxEip4844WithSidecar<T>>, ValueError<Self>> {
         let (tx, signature, hash) = self.into_parts();
         match tx {
-            Transaction::Eip4844(tx) => {
-                Ok(EthereumTxEnvelope::Eip4844(Signed::new_unchecked(
-                    tx.with_sidecar(sidecar),
-                    signature,
-                    hash,
-                )))
-            }
+            Transaction::Eip4844(tx) => Ok(EthereumTxEnvelope::Eip4844(Signed::new_unchecked(
+                tx.with_sidecar(sidecar),
+                signature,
+                hash,
+            ))),
             tx => Err(ValueError::new_static(
                 Self::new(tx, signature, hash),
                 "Expected 4844 transaction",
@@ -690,6 +688,64 @@ impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844> {
                 panic!("MlDsa transactions cannot be converted to EthereumTxEnvelope")
             }
         }
+    }
+}
+
+impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844Variant> {
+    fn from(value: TransactionSigned) -> Self {
+        let (tx, signature, hash) = value.into_parts();
+        match tx {
+            Transaction::Legacy(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::Eip2930(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::Eip1559(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::Eip4844(tx) => {
+                let signed = Signed::new_unchecked(tx, signature, hash);
+                let signed: Signed<TxEip4844Variant> = signed.into();
+                signed.into()
+            }
+            Transaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::MlDsa(tx) => {
+                // Ethereum's stock RPC transaction envelope has no custom 0x70 variant yet.
+                // Keep RPC reads non-panicking by exposing ML-DSA transactions through the
+                // closest EIP-1559 shape while consensus/storage keep the raw 0x70 bytes.
+                let tx = TxEip1559 {
+                    chain_id: tx.chain_id,
+                    nonce: tx.nonce,
+                    gas_limit: tx.gas_limit,
+                    max_fee_per_gas: tx.max_fee_per_gas,
+                    max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+                    to: tx.to,
+                    value: tx.value,
+                    access_list: tx.access_list,
+                    input: tx.input,
+                };
+                Signed::new_unchecked(tx, signature, hash).into()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rpc")]
+impl reth_rpc_traits::SignableTxRequest<TransactionSigned>
+    for alloy_rpc_types_eth::TransactionRequest
+{
+    async fn try_build_and_sign(
+        self,
+        signer: impl alloy_network::TxSigner<Signature> + Send,
+    ) -> Result<TransactionSigned, reth_rpc_traits::SignTxRequestError> {
+        let mut tx = self
+            .build_typed_tx()
+            .map_err(|_| reth_rpc_traits::SignTxRequestError::InvalidTransactionRequest)?;
+        let signature = signer.sign_transaction(&mut tx).await?;
+        let envelope: EthereumTxEnvelope<TxEip4844> = tx.into_signed(signature).into();
+        Ok(TransactionSigned::from(envelope))
+    }
+}
+
+#[cfg(feature = "rpc")]
+impl reth_rpc_traits::TryIntoSimTx<TransactionSigned> for alloy_rpc_types_eth::TransactionRequest {
+    fn try_into_sim_tx(self) -> Result<TransactionSigned, ValueError<Self>> {
+        self.build_typed_simulate_transaction().map(TransactionSigned::from)
     }
 }
 

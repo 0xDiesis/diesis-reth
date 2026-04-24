@@ -15,9 +15,11 @@ workspace = true
 # reth
 reth-codecs = { workspace = true, optional = true, features = ["alloy"] }
 reth-primitives-traits.workspace = true
+reth-rpc-traits = { workspace = true, optional = true }
 
 # ethereum
 alloy-eips = { workspace = true, features = ["k256"] }
+alloy-network = { workspace = true, optional = true }
 alloy-primitives.workspace = true
 alloy-evm.workspace = true
 alloy-consensus = { workspace = true, features = ["serde"] }
@@ -94,5 +96,7 @@ serde = [
 ]
 rpc = [
     "dep:alloy-rpc-types-eth",
+    "dep:alloy-network",
+    "dep:reth-rpc-traits",
     "alloy-rpc-types-eth?/serde",
 ]
