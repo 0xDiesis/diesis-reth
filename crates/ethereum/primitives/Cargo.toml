@@ -19,9 +19,11 @@ reth-primitives-traits.workspace = true
 # ethereum
 alloy-eips = { workspace = true, features = ["k256"] }
 alloy-primitives.workspace = true
+alloy-evm.workspace = true
 alloy-consensus = { workspace = true, features = ["serde"] }
 alloy-rpc-types-eth = { workspace = true, optional = true }
 alloy-rlp.workspace = true
+revm.workspace = true
 
 # misc
 arbitrary = { workspace = true, optional = true }

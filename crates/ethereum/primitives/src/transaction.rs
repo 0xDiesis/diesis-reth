@@ -557,6 +557,81 @@ impl alloy_consensus::Transaction for TransactionSigned {
     }
 }
 
+impl alloy_evm::FromRecoveredTx<TransactionSigned> for revm::context::TxEnv {
+    fn from_recovered_tx(tx: &TransactionSigned, caller: Address) -> Self {
+        match &tx.transaction {
+            Transaction::Legacy(tx) => {
+                <Self as alloy_evm::FromRecoveredTx<TxLegacy>>::from_recovered_tx(tx, caller)
+            }
+            Transaction::Eip2930(tx) => {
+                <Self as alloy_evm::FromRecoveredTx<TxEip2930>>::from_recovered_tx(tx, caller)
+            }
+            Transaction::Eip1559(tx) => {
+                <Self as alloy_evm::FromRecoveredTx<TxEip1559>>::from_recovered_tx(tx, caller)
+            }
+            Transaction::Eip4844(tx) => {
+                <Self as alloy_evm::FromRecoveredTx<TxEip4844>>::from_recovered_tx(tx, caller)
+            }
+            Transaction::Eip7702(tx) => {
+                <Self as alloy_evm::FromRecoveredTx<TxEip7702>>::from_recovered_tx(tx, caller)
+            }
+            Transaction::MlDsa(tx) => Self {
+                tx_type: ML_DSA_TX_TYPE_ID,
+                caller,
+                gas_limit: tx.gas_limit,
+                gas_price: tx.max_fee_per_gas,
+                kind: tx.to,
+                value: tx.value,
+                data: tx.input.clone(),
+                nonce: tx.nonce,
+                chain_id: Some(tx.chain_id),
+                access_list: tx.access_list.clone(),
+                gas_priority_fee: Some(tx.max_priority_fee_per_gas),
+                blob_hashes: Vec::new(),
+                max_fee_per_blob_gas: 0,
+                authorization_list: Vec::new(),
+            },
+        }
+    }
+}
+
+impl alloy_evm::FromTxWithEncoded<TransactionSigned> for revm::context::TxEnv {
+    fn from_encoded_tx(tx: &TransactionSigned, caller: Address, encoded: Bytes) -> Self {
+        match &tx.transaction {
+            Transaction::Legacy(tx) => {
+                <Self as alloy_evm::FromTxWithEncoded<TxLegacy>>::from_encoded_tx(
+                    tx, caller, encoded,
+                )
+            }
+            Transaction::Eip2930(tx) => {
+                <Self as alloy_evm::FromTxWithEncoded<TxEip2930>>::from_encoded_tx(
+                    tx, caller, encoded,
+                )
+            }
+            Transaction::Eip1559(tx) => {
+                <Self as alloy_evm::FromTxWithEncoded<TxEip1559>>::from_encoded_tx(
+                    tx, caller, encoded,
+                )
+            }
+            Transaction::Eip4844(tx) => {
+                <Self as alloy_evm::FromTxWithEncoded<TxEip4844>>::from_encoded_tx(
+                    tx, caller, encoded,
+                )
+            }
+            Transaction::Eip7702(tx) => {
+                <Self as alloy_evm::FromTxWithEncoded<TxEip7702>>::from_encoded_tx(
+                    tx, caller, encoded,
+                )
+            }
+            Transaction::MlDsa(_) => {
+                <Self as alloy_evm::FromRecoveredTx<TransactionSigned>>::from_recovered_tx(
+                    tx, caller,
+                )
+            }
+        }
+    }
+}
+
 impl From<Signed<Transaction>> for TransactionSigned {
     fn from(value: Signed<Transaction>) -> Self {
         let (tx, sig, hash) = value.into_parts();
