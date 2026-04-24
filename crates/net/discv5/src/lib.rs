@@ -248,7 +248,7 @@ impl Discv5 {
             discv5::Event::SocketUpdated(_) | discv5::Event::TalkRequest(_) |
             // `Discovered` not unique discovered peers
             discv5::Event::Discovered(_) => None,
-            discv5::Event::NodeInserted { replaced: _, .. } => {
+            discv5::Event::NodeInserted { .. } => {
 
                 // node has been inserted into kbuckets
 
@@ -580,7 +580,7 @@ pub fn spawn_populate_kbuckets_bg(
     let metrics = metrics.discovered_peers;
     let mut kbucket_index = MAX_KBUCKET_INDEX;
     let pulse_lookup_interval = Duration::from_secs(bootstrap_lookup_interval);
-    task::spawn(Box::pin(async move {
+    task::spawn(async move {
         // make many fast lookup queries at bootstrap, trying to fill kbuckets at furthest
         // log2distance from local node
         for i in (0..bootstrap_lookup_countdown).rev() {
@@ -622,7 +622,7 @@ pub fn spawn_populate_kbuckets_bg(
 
             tokio::time::sleep(lookup_interval).await;
         }
-    }));
+    });
 }
 
 /// Gets the next lookup target, based on which bucket is currently being targeted.

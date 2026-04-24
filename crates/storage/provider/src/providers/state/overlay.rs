@@ -1,7 +1,7 @@
 use alloy_primitives::{BlockNumber, B256};
 use metrics::{Counter, Histogram};
 use reth_chain_state::LazyOverlay;
-use reth_db_api::DatabaseError;
+use reth_db_api::{tables, transaction::DbTx, DatabaseError};
 use reth_errors::{ProviderError, ProviderResult};
 use reth_metrics::Metrics;
 use reth_primitives_traits::dashmap::{self, DashMap};
@@ -14,11 +14,15 @@ use reth_storage_api::{
 };
 use reth_trie::{
     hashed_cursor::{HashedCursorFactory, HashedPostStateCursorFactory},
-    trie_cursor::{InMemoryTrieCursorFactory, TrieCursorFactory},
+    trie_cursor::{InMemoryTrieCursor, TrieCursor, TrieCursorFactory, TrieStorageCursor},
     updates::TrieUpdatesSorted,
     HashedPostStateSorted,
 };
-use reth_trie_db::{ChangesetCache, DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
+use reth_trie_db::{
+    ChangesetCache, DatabaseAccountTrieCursor, DatabaseHashedCursorFactory,
+    DatabaseStorageTrieCursor, LegacyKeyAdapter, PackedAccountsTrie, PackedKeyAdapter,
+    PackedStoragesTrie,
+};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -282,7 +286,7 @@ where
         level = "debug",
         target = "providers::state::overlay",
         skip_all,
-        fields(db_tip_block)
+        fields(%db_tip_block)
     )]
     fn calculate_overlay(
         &self,
@@ -315,7 +319,7 @@ where
             // Collect trie reverts using changeset cache
             let mut trie_reverts = {
                 let _guard =
-                    debug_span!(target: "providers::state::overlay", "Retrieving trie reverts")
+                    debug_span!(target: "providers::state::overlay", "retrieving_trie_reverts")
                         .entered();
 
                 let start = Instant::now();
@@ -332,7 +336,7 @@ where
 
             // Collect state reverts
             let mut hashed_state_reverts = {
-                let _guard = debug_span!(target: "providers::state::overlay", "Retrieving hashed state reverts").entered();
+                let _guard = debug_span!(target: "providers::state::overlay", "retrieving_hashed_state_reverts").entered();
 
                 let start = Instant::now();
                 let res = reth_trie_db::from_reverts_auto(provider, from_block + 1..)?;
@@ -404,8 +408,7 @@ where
     /// cached value then this calculates the [`Overlay`] and populates the cache.
     #[instrument(level = "debug", target = "providers::state::overlay", skip_all)]
     fn get_overlay(&self, provider: &F::Provider) -> ProviderResult<Overlay> {
-        // If we have no anchor block configured then we will never need to get trie reverts, just
-        // return the in-memory overlay (resolving lazy overlay if set).
+        // No anchor block — just resolve the in-memory overlay directly.
         if self.block_hash.is_none() {
             let (trie_updates, hashed_post_state) = self.resolve_overlays();
             return Ok(Overlay { trie_updates, hashed_post_state })
@@ -413,27 +416,15 @@ where
 
         let db_tip_block = self.get_db_tip_block_number(provider)?;
 
-        // If the overlay is present in the cache then return it directly.
-        if let Some(entry) = self.overlay_cache.get(&db_tip_block) {
-            return Ok(entry.value().clone());
-        }
-
-        // If the overlay is not present then we need to calculate a new one.
-        // DashMap's entry API handles the race condition internally.
-        let mut cache_miss = false;
         let overlay = match self.overlay_cache.entry(db_tip_block) {
             dashmap::Entry::Occupied(entry) => entry.get().clone(),
             dashmap::Entry::Vacant(entry) => {
-                cache_miss = true;
+                self.metrics.overlay_cache_misses.increment(1);
                 let overlay = self.calculate_overlay(provider, db_tip_block)?;
                 entry.insert(overlay.clone());
                 overlay
             }
         };
-
-        if cache_miss {
-            self.metrics.overlay_cache_misses.increment(1);
-        }
 
         Ok(overlay)
     }
@@ -458,9 +449,6 @@ where
 
         // Get a read-only provider
         let provider = {
-            let _guard =
-                debug_span!(target: "providers::state::overlay", "Creating db provider").entered();
-
             let start = Instant::now();
             let res = self.factory.database_provider_ro()?;
             self.metrics.create_provider_duration.record(start.elapsed());
@@ -469,8 +457,9 @@ where
 
         let Overlay { trie_updates, hashed_post_state } = self.get_overlay(&provider)?;
 
+        let is_v2 = provider.cached_storage_settings().is_v2();
         self.metrics.database_provider_ro_duration.record(overall_start.elapsed());
-        Ok(OverlayStateProvider::new(provider, trie_updates, hashed_post_state))
+        Ok(OverlayStateProvider::new(provider, trie_updates, hashed_post_state, is_v2))
     }
 }
 
@@ -484,6 +473,7 @@ pub struct OverlayStateProvider<Provider: DBProvider> {
     provider: Provider,
     trie_updates: Arc<TrieUpdatesSorted>,
     hashed_post_state: Arc<HashedPostStateSorted>,
+    is_v2: bool,
 }
 
 impl<Provider> OverlayStateProvider<Provider>
@@ -496,46 +486,60 @@ where
         provider: Provider,
         trie_updates: Arc<TrieUpdatesSorted>,
         hashed_post_state: Arc<HashedPostStateSorted>,
+        is_v2: bool,
     ) -> Self {
-        Self { provider, trie_updates, hashed_post_state }
+        Self { provider, trie_updates, hashed_post_state, is_v2 }
     }
 }
 
 impl<Provider> TrieCursorFactory for OverlayStateProvider<Provider>
 where
     Provider: DBProvider,
+    Provider::Tx: DbTx,
 {
     type AccountTrieCursor<'a>
-        = <InMemoryTrieCursorFactory<
-        DatabaseTrieCursorFactory<&'a Provider::Tx>,
-        &'a TrieUpdatesSorted,
-    > as TrieCursorFactory>::AccountTrieCursor<'a>
+        = InMemoryTrieCursor<'a, Box<dyn TrieCursor + Send + 'a>>
     where
         Self: 'a;
 
     type StorageTrieCursor<'a>
-        = <InMemoryTrieCursorFactory<
-        DatabaseTrieCursorFactory<&'a Provider::Tx>,
-        &'a TrieUpdatesSorted,
-    > as TrieCursorFactory>::StorageTrieCursor<'a>
+        = InMemoryTrieCursor<'a, Box<dyn TrieStorageCursor + Send + 'a>>
     where
         Self: 'a;
 
     fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor<'_>, DatabaseError> {
-        let db_trie_cursor_factory = DatabaseTrieCursorFactory::new(self.provider.tx_ref());
-        let trie_cursor_factory =
-            InMemoryTrieCursorFactory::new(db_trie_cursor_factory, self.trie_updates.as_ref());
-        trie_cursor_factory.account_trie_cursor()
+        let tx = self.provider.tx_ref();
+        let trie_updates = self.trie_updates.as_ref();
+        let cursor: Box<dyn TrieCursor + Send> = if self.is_v2 {
+            Box::new(DatabaseAccountTrieCursor::<_, PackedKeyAdapter>::new(
+                tx.cursor_read::<PackedAccountsTrie>()?,
+            ))
+        } else {
+            Box::new(DatabaseAccountTrieCursor::<_, LegacyKeyAdapter>::new(
+                tx.cursor_read::<tables::AccountsTrie>()?,
+            ))
+        };
+        Ok(InMemoryTrieCursor::new_account(cursor, trie_updates))
     }
 
     fn storage_trie_cursor(
         &self,
         hashed_address: B256,
     ) -> Result<Self::StorageTrieCursor<'_>, DatabaseError> {
-        let db_trie_cursor_factory = DatabaseTrieCursorFactory::new(self.provider.tx_ref());
-        let trie_cursor_factory =
-            InMemoryTrieCursorFactory::new(db_trie_cursor_factory, self.trie_updates.as_ref());
-        trie_cursor_factory.storage_trie_cursor(hashed_address)
+        let tx = self.provider.tx_ref();
+        let trie_updates = self.trie_updates.as_ref();
+        let cursor: Box<dyn TrieStorageCursor + Send> = if self.is_v2 {
+            Box::new(DatabaseStorageTrieCursor::<_, PackedKeyAdapter>::new(
+                tx.cursor_dup_read::<PackedStoragesTrie>()?,
+                hashed_address,
+            ))
+        } else {
+            Box::new(DatabaseStorageTrieCursor::<_, LegacyKeyAdapter>::new(
+                tx.cursor_dup_read::<tables::StoragesTrie>()?,
+                hashed_address,
+            ))
+        };
+        Ok(InMemoryTrieCursor::new_storage(cursor, trie_updates, hashed_address))
     }
 }
 

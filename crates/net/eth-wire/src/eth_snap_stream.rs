@@ -74,6 +74,18 @@ where
         Self { eth_snap: EthSnapStreamInner::new(eth_version), inner: stream }
     }
 
+    /// Create a new eth and snap protocol stream with a custom max message size.
+    pub const fn with_max_message_size(
+        stream: S,
+        eth_version: EthVersion,
+        max_message_size: usize,
+    ) -> Self {
+        Self {
+            eth_snap: EthSnapStreamInner::with_max_message_size(eth_version, max_message_size),
+            inner: stream,
+        }
+    }
+
     /// Returns the eth version
     #[inline]
     pub const fn eth_version(&self) -> EthVersion {
@@ -188,6 +200,8 @@ where
 struct EthSnapStreamInner<N> {
     /// Eth protocol version
     eth_version: EthVersion,
+    /// Maximum allowed ETH/Snap message size.
+    max_message_size: usize,
     /// Type marker
     _pd: PhantomData<N>,
 }
@@ -198,7 +212,12 @@ where
 {
     /// Create a new eth and snap protocol stream
     const fn new(eth_version: EthVersion) -> Self {
-        Self { eth_version, _pd: PhantomData }
+        Self::with_max_message_size(eth_version, MAX_MESSAGE_SIZE)
+    }
+
+    /// Create a new eth and snap protocol stream with a custom max message size.
+    const fn with_max_message_size(eth_version: EthVersion, max_message_size: usize) -> Self {
+        Self { eth_version, max_message_size, _pd: PhantomData }
     }
 
     #[inline]
@@ -208,8 +227,8 @@ where
 
     /// Decode a message from the stream
     fn decode_message(&self, bytes: BytesMut) -> Result<EthSnapMessage<N>, EthSnapStreamError> {
-        if bytes.len() > MAX_MESSAGE_SIZE {
-            return Err(EthSnapStreamError::MessageTooLarge(bytes.len(), MAX_MESSAGE_SIZE));
+        if bytes.len() > self.max_message_size {
+            return Err(EthSnapStreamError::MessageTooLarge(bytes.len(), self.max_message_size));
         }
 
         if bytes.is_empty() {
@@ -294,7 +313,8 @@ mod tests {
     use alloy_primitives::B256;
     use alloy_rlp::Encodable;
     use reth_eth_wire_types::{
-        message::RequestPair, GetAccountRangeMessage, GetBlockHeaders, HeadersDirection,
+        message::RequestPair, GetAccountRangeMessage, GetBlockAccessLists, GetBlockHeaders,
+        HeadersDirection,
     };
 
     // Helper to create eth message and its bytes
@@ -418,5 +438,41 @@ mod tests {
         // Not a valid snap message yet, only snap id --> error
         let snap_boundary_result = inner.decode_message(snap_boundary_bytes);
         assert!(snap_boundary_result.is_err());
+    }
+
+    #[test]
+    fn test_eth70_message_id_0x12_is_snap() {
+        let inner = EthSnapStreamInner::<EthNetworkPrimitives>::new(EthVersion::Eth70);
+        let snap_msg = SnapProtocolMessage::GetAccountRange(GetAccountRangeMessage {
+            request_id: 1,
+            root_hash: B256::default(),
+            starting_hash: B256::default(),
+            limit_hash: B256::default(),
+            response_bytes: 1000,
+        });
+
+        let encoded = inner.encode_snap_message(snap_msg);
+        assert_eq!(encoded[0], EthMessageID::message_count(EthVersion::Eth70));
+
+        let decoded = inner.decode_message(BytesMut::from(&encoded[..])).unwrap();
+        assert!(matches!(decoded, EthSnapMessage::Snap(_)));
+    }
+
+    #[test]
+    fn test_eth71_message_id_0x12_is_eth() {
+        let inner = EthSnapStreamInner::<EthNetworkPrimitives>::new(EthVersion::Eth71);
+        let eth_msg = EthMessage::<EthNetworkPrimitives>::GetBlockAccessLists(RequestPair {
+            request_id: 1,
+            message: GetBlockAccessLists(vec![B256::ZERO]),
+        });
+        let protocol_msg = ProtocolMessage::from(eth_msg.clone());
+        let mut buf = Vec::new();
+        protocol_msg.encode(&mut buf);
+
+        let decoded = inner.decode_message(BytesMut::from(&buf[..])).unwrap();
+        let EthSnapMessage::Eth(decoded_eth) = decoded else {
+            panic!("expected eth message");
+        };
+        assert_eq!(decoded_eth, eth_msg);
     }
 }

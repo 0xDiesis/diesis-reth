@@ -15,7 +15,7 @@ workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-payload-builder.workspace = true
 reth-ethereum-consensus.workspace = true
-reth-ethereum-primitives.workspace = true
+reth-ethereum-primitives = { workspace = true, features = ["rpc"] }
 ## ensure secp256k1 recovery with rayon support is activated
 reth-primitives-traits = { workspace = true, features = ["secp256k1", "rayon"] }
 reth-node-builder.workspace = true
@@ -37,7 +37,6 @@ reth-rpc-eth-types.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives = { workspace = true, features = ["std"] }
 reth-payload-primitives.workspace = true
-
 # ethereum
 alloy-eips.workspace = true
 alloy-network.workspace = true

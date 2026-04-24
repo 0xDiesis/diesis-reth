@@ -28,12 +28,12 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::{
     Account, Block, BlockBody, Bytecode, GotExpected, NodePrimitives, RecoveredBlock, SealedHeader,
-    SignerRecoverable,
+    SignerRecoverable, StorageEntry,
 };
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BytecodeReader, ChangesetEntry, DBProvider, DatabaseProviderFactory,
+    BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
     HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
     StorageChangeSetReader, StorageRootProvider, StorageSettingsCache,
 };
@@ -857,7 +857,12 @@ where
         Ok(MultiProof::default())
     }
 
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: reth_trie::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         Ok(Vec::default())
     }
 }
@@ -882,14 +887,6 @@ where
     ) -> ProviderResult<Option<StorageValue>> {
         let lock = self.accounts.lock();
         Ok(lock.get(&account).and_then(|account| account.storage.get(&storage_key)).copied())
-    }
-
-    fn storage_by_hashed_key(
-        &self,
-        _address: Address,
-        _hashed_storage_key: StorageKey,
-    ) -> ProviderResult<Option<StorageValue>> {
-        Ok(None)
     }
 }
 
@@ -1017,10 +1014,6 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> ChangeSetReader for MockEthProvi
     ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
         Ok(Vec::default())
     }
-
-    fn account_changeset_count(&self) -> ProviderResult<usize> {
-        Ok(0)
-    }
 }
 
 impl<T: NodePrimitives, ChainSpec: Send + Sync> StorageChangeSetReader
@@ -1029,7 +1022,7 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> StorageChangeSetReader
     fn storage_changeset(
         &self,
         _block_number: BlockNumber,
-    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, ChangesetEntry)>> {
+    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, StorageEntry)>> {
         Ok(Vec::default())
     }
 
@@ -1038,19 +1031,15 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> StorageChangeSetReader
         _block_number: BlockNumber,
         _address: Address,
         _storage_key: B256,
-    ) -> ProviderResult<Option<ChangesetEntry>> {
+    ) -> ProviderResult<Option<StorageEntry>> {
         Ok(None)
     }
 
     fn storage_changesets_range(
         &self,
         _range: impl RangeBounds<BlockNumber>,
-    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, ChangesetEntry)>> {
+    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, StorageEntry)>> {
         Ok(Vec::default())
-    }
-
-    fn storage_changeset_count(&self) -> ProviderResult<usize> {
-        Ok(0)
     }
 }
 

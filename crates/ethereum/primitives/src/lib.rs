@@ -11,36 +11,25 @@
 
 extern crate alloc;
 
+// Feature-only dep: activated by `reth-codec` feature for downstream consumers.
+#[cfg(feature = "reth-codec")]
+use reth_codecs as _;
+
 mod receipt;
 pub use receipt::*;
 
 pub mod tx_ml_dsa;
 pub use tx_ml_dsa::{TxMlDsa, ML_DSA_TX_TYPE_ID};
 
-/// Kept for consistency tests
-#[cfg(test)]
 mod transaction;
+pub use transaction::{PooledTransactionVariant, Transaction, TransactionSigned};
 
-pub use alloy_consensus::{transaction::PooledTransaction, TxType};
-use alloy_consensus::{TxEip4844, TxEip4844WithSidecar};
-use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+mod tx_type;
+pub use tx_type::DiesisTxType;
+/// Diesis-aware transaction type used by receipts and execution paths.
+pub type TxType = DiesisTxType;
 
-/// Typed Transaction type without a signature
-pub type Transaction = alloy_consensus::EthereumTypedTransaction<TxEip4844>;
-
-/// Signed transaction.
-pub type TransactionSigned = alloy_consensus::EthereumTxEnvelope<TxEip4844>;
-
-/// A type alias for [`PooledTransaction`] that's also generic over blob sidecar.
-pub type PooledTransactionVariant =
-    alloy_consensus::EthereumTxEnvelope<TxEip4844WithSidecar<BlobTransactionSidecarVariant>>;
-
-/// Bincode-compatible serde implementations.
-#[cfg(all(feature = "serde", feature = "serde-bincode-compat"))]
-pub mod serde_bincode_compat {
-    pub use super::receipt::serde_bincode_compat::*;
-    pub use alloy_consensus::serde_bincode_compat::transaction::*;
-}
+pub use alloy_consensus::transaction::PooledTransaction;
 
 /// Type alias for the ethereum block
 pub type Block = alloy_consensus::Block<TransactionSigned>;
