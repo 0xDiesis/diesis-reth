@@ -726,6 +726,13 @@ impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844Variant> {
 }
 
 #[cfg(feature = "rpc")]
+impl From<alloy_rpc_types_eth::Transaction> for TransactionSigned {
+    fn from(value: alloy_rpc_types_eth::Transaction) -> Self {
+        value.into_inner().into()
+    }
+}
+
+#[cfg(feature = "rpc")]
 impl reth_rpc_traits::SignableTxRequest<TransactionSigned>
     for alloy_rpc_types_eth::TransactionRequest
 {
