@@ -1,26 +1,13 @@
-# Scheduled regression benchmarks (nightly + hourly + release).
+# Manual regression benchmarks (nightly + hourly + release modes).
 #
-# Three modes:
-#   nightly — Compares the previous nightly Docker build against the current one.
-#             Runs daily after docker.yml produces a new nightly image.
-#   hourly  — Compares main HEAD against the last benchmarked commit to catch
-#             regressions quickly. Falls back to HEAD~1 on first run.
-#             Skips if no new commits or if a previous run is still in progress.
-#   release — Compares the latest GitHub release tag against the current nightly
-#             Docker build. Runs daily to track nightly vs release performance.
+# Automatic schedules are disabled in this fork. Run via workflow_dispatch when
+# needed and choose the benchmark mode from the workflow inputs.
 #
 # State is persisted between runs via the decofe/reth-bench-charts repo: each
 # successful run saves the feature commit SHA so the next run knows what to
 # compare against.
 
 on:
-  schedule:
-    # Nightly: compares previous vs current nightly Docker build
-    - cron: "30 5 * * *"
-    # Hourly: compares main HEAD vs last benchmarked commit, skips if no new commits
-    - cron: "0 * * * *"
-    # Release: compares latest GitHub release tag vs current nightly Docker build
-    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -85,16 +72,7 @@ jobs:
       - name: Detect mode
         id: mode
         run: |
-          # Maps cron schedules to modes (must match the schedule entries above)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ inputs.mode || 'nightly' }}"
-          elif [ "${{ github.event.schedule }}" = "30 5 * * *" ]; then
-            MODE="nightly"
-          elif [ "${{ github.event.schedule }}" = "0 9 * * *" ]; then
-            MODE="release"
-          else
-            MODE="hourly"
-          fi
+          MODE="${{ inputs.mode || 'nightly' }}"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "Detected mode: $MODE"
 
