@@ -38,6 +38,10 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Build docs
         run: cd docs/vocs && bash scripts/build-cargo-docs.sh
 
