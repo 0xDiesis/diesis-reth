@@ -26,7 +26,20 @@ jobs:
   doublcov:
     name: Doublcov
     runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.pages-gate.outputs.enabled }}
     steps:
+      - name: Gate Pages publish
+        id: pages-gate
+        run: |
+          if [ "${{ env.ENABLE_PAGES_PUBLISH }}" = "true" ] \
+            && [ "${{ github.event_name }}" != "pull_request" ] \
+            && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -140,7 +153,7 @@ jobs:
   pages:
     name: Publish coverage page
     needs: doublcov
-    if: env.ENABLE_PAGES_PUBLISH == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: needs.doublcov.outputs.pages_enabled == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
