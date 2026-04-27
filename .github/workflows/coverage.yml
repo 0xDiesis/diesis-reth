@@ -19,6 +19,8 @@ env:
   CARGO_TERM_COLOR: always
   SEED: rustethereumethereumrust
   RUSTC_WRAPPER: sccache
+  # Enable once the repository is public or the GitHub plan supports Pages publish.
+  ENABLE_PAGES_PUBLISH: "false"
 
 jobs:
   doublcov:
@@ -101,7 +103,7 @@ jobs:
           include-hidden-files: true
 
       - name: Prepare Pages artifact
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && hashFiles('coverage/report/index.html') != ''
+        if: env.ENABLE_PAGES_PUBLISH == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && hashFiles('coverage/report/index.html') != ''
         run: |
           mkdir -p pages/coverage
           cp -R coverage/report/. pages/coverage/
@@ -115,7 +117,7 @@ jobs:
           HTML
 
       - name: Upload Pages artifact
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && hashFiles('pages/coverage/index.html') != ''
+        if: env.ENABLE_PAGES_PUBLISH == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && hashFiles('pages/coverage/index.html') != ''
         uses: actions/upload-pages-artifact@v3
         with:
           path: pages
@@ -128,7 +130,7 @@ jobs:
             echo
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               echo "Download and extract the \`doublcov-report\` artifact, then preview it with \`doublcov open coverage/report\`."
-            elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            elif [ "${{ env.ENABLE_PAGES_PUBLISH }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
               echo "This run also publishes the report to GitHub Pages."
             fi
             echo
@@ -138,7 +140,7 @@ jobs:
   pages:
     name: Publish coverage page
     needs: doublcov
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: env.ENABLE_PAGES_PUBLISH == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
