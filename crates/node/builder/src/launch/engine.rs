@@ -42,6 +42,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+const DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY: usize = 64;
+
 /// The engine node launcher.
 #[derive(Debug)]
 pub struct EngineNodeLauncher {
@@ -51,6 +53,21 @@ pub struct EngineNodeLauncher {
     /// Temporary configuration for engine tree.
     /// After engine is stabilized, this should be configured through node builder.
     pub engine_tree_config: TreeConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY;
+
+    #[test]
+    fn diesis_executed_block_channel_capacity_is_bounded() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<reth_chain_state::ExecutedBlock>(
+            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        );
+
+        assert_eq!(tx.max_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        assert_eq!(tx.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+    }
 }
 
 impl EngineNodeLauncher {
@@ -303,11 +320,11 @@ impl EngineNodeLauncher {
         // Channel for direct executed-block insertion from the Diesis pipeline.
         // Created outside the async block so the sender can be exposed on RpcHandle.
         let (executed_block_tx, executed_block_rx) =
-            tokio::sync::mpsc::unbounded_channel::<
+            tokio::sync::mpsc::channel::<
                 reth_chain_state::ExecutedBlock<
                     <T::Types as reth_node_api::NodeTypes>::Primitives,
                 >,
-            >();
+            >(DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {

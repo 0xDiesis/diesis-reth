@@ -349,7 +349,7 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     /// bypassing `new_payload` re-execution. Used by the Diesis deferred execution
     /// pipeline to eliminate double execution overhead.
     pub executed_block_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<
+        tokio::sync::mpsc::Sender<
             reth_chain_state::ExecutedBlock<<Node::Types as NodeTypes>::Primitives>,
         >,
     >,

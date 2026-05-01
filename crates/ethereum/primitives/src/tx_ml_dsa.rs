@@ -21,6 +21,38 @@ use core::mem;
 
 /// Type identifier for ML-DSA post-quantum transactions.
 pub const ML_DSA_TX_TYPE_ID: u8 = 0x70;
+/// ML-DSA-44 public key length in bytes.
+pub const ML_DSA_44_PUBKEY_LEN: usize = 1312;
+/// ML-DSA-65 public key length in bytes.
+pub const ML_DSA_65_PUBKEY_LEN: usize = 1952;
+/// ML-DSA-87 public key length in bytes.
+pub const ML_DSA_87_PUBKEY_LEN: usize = 2592;
+/// ML-DSA-44 signature length in bytes.
+pub const ML_DSA_44_SIGNATURE_LEN: usize = 2420;
+/// ML-DSA-65 signature length in bytes.
+pub const ML_DSA_65_SIGNATURE_LEN: usize = 3309;
+/// ML-DSA-87 signature length in bytes.
+pub const ML_DSA_87_SIGNATURE_LEN: usize = 4627;
+
+/// Returns the expected public key length for an ML-DSA security level.
+pub const fn expected_pubkey_len(level: u8) -> Option<usize> {
+    match level {
+        44 => Some(ML_DSA_44_PUBKEY_LEN),
+        65 => Some(ML_DSA_65_PUBKEY_LEN),
+        87 => Some(ML_DSA_87_PUBKEY_LEN),
+        _ => None,
+    }
+}
+
+/// Returns the expected signature length for an ML-DSA security level.
+pub const fn expected_signature_len(level: u8) -> Option<usize> {
+    match level {
+        44 => Some(ML_DSA_44_SIGNATURE_LEN),
+        65 => Some(ML_DSA_65_SIGNATURE_LEN),
+        87 => Some(ML_DSA_87_SIGNATURE_LEN),
+        _ => None,
+    }
+}
 
 /// An ML-DSA (FIPS 204) post-quantum transaction.
 ///
@@ -115,23 +147,34 @@ impl TxMlDsa {
     /// Decodes all fields from RLP bytes (assumes the RLP list header has
     /// already been consumed).
     pub fn rlp_decode_fields(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        // Decode stays structural. Semantic checks for level, public-key length, signature
-        // length, registry state, and signature validity run in the transaction validator and
-        // executor hook, where chain state and the active admission policy are available.
+        let chain_id = Decodable::decode(buf)?;
+        let nonce = Decodable::decode(buf)?;
+        let max_priority_fee_per_gas = Decodable::decode(buf)?;
+        let max_fee_per_gas = Decodable::decode(buf)?;
+        let gas_limit = Decodable::decode(buf)?;
+        let to = Decodable::decode(buf)?;
+        let value = Decodable::decode(buf)?;
+        let input = Decodable::decode(buf)?;
+        let access_list = Decodable::decode(buf)?;
+        let sender = Decodable::decode(buf)?;
+        let ml_dsa_level = Decodable::decode(buf)?;
+        let pubkey = decode_pubkey_field(buf, ml_dsa_level)?;
+        let ml_dsa_signature = decode_signature_field(buf, ml_dsa_level)?;
+
         Ok(Self {
-            chain_id: Decodable::decode(buf)?,
-            nonce: Decodable::decode(buf)?,
-            max_priority_fee_per_gas: Decodable::decode(buf)?,
-            max_fee_per_gas: Decodable::decode(buf)?,
-            gas_limit: Decodable::decode(buf)?,
-            to: Decodable::decode(buf)?,
-            value: Decodable::decode(buf)?,
-            input: Decodable::decode(buf)?,
-            access_list: Decodable::decode(buf)?,
-            sender: Decodable::decode(buf)?,
-            ml_dsa_level: Decodable::decode(buf)?,
-            pubkey: Decodable::decode(buf)?,
-            ml_dsa_signature: Decodable::decode(buf)?,
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            to,
+            value,
+            input,
+            access_list,
+            sender,
+            ml_dsa_level,
+            pubkey,
+            ml_dsa_signature,
         })
     }
 
@@ -221,6 +264,26 @@ impl TxMlDsa {
         let header = Header { list: true, payload_length: fields_len };
         header.length() + fields_len
     }
+}
+
+fn decode_pubkey_field(buf: &mut &[u8], level: u8) -> alloy_rlp::Result<Bytes> {
+    let expected_len = expected_pubkey_len(level)
+        .ok_or(alloy_rlp::Error::Custom("unsupported ML-DSA security level"))?;
+    let bytes = Header::decode_bytes(buf, false)?;
+    if !bytes.is_empty() && bytes.len() != expected_len {
+        return Err(alloy_rlp::Error::Custom("invalid ML-DSA public key length"));
+    }
+    Ok(Bytes::copy_from_slice(bytes))
+}
+
+fn decode_signature_field(buf: &mut &[u8], level: u8) -> alloy_rlp::Result<Bytes> {
+    let expected_len = expected_signature_len(level)
+        .ok_or(alloy_rlp::Error::Custom("unsupported ML-DSA security level"))?;
+    let bytes = Header::decode_bytes(buf, false)?;
+    if bytes.len() != expected_len {
+        return Err(alloy_rlp::Error::Custom("invalid ML-DSA signature length"));
+    }
+    Ok(Bytes::copy_from_slice(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +434,13 @@ impl<'a> arbitrary::Arbitrary<'a> for TxMlDsa {
 
         // Pick a valid ML-DSA security level.
         let ml_dsa_level = *u.choose(&[44u8, 65, 87])?;
+        let pubkey_len = expected_pubkey_len(ml_dsa_level).expect("valid ML-DSA level");
+        let signature_len = expected_signature_len(ml_dsa_level).expect("valid ML-DSA level");
+        let pubkey = if u.arbitrary()? {
+            arbitrary_bytes(u, pubkey_len)?
+        } else {
+            Bytes::new()
+        };
 
         Ok(Self {
             chain_id: u.arbitrary()?,
@@ -384,10 +454,19 @@ impl<'a> arbitrary::Arbitrary<'a> for TxMlDsa {
             access_list: u.arbitrary()?,
             sender: Address::arbitrary(u)?,
             ml_dsa_level,
-            pubkey: u.arbitrary()?,
-            ml_dsa_signature: u.arbitrary()?,
+            pubkey,
+            ml_dsa_signature: arbitrary_bytes(u, signature_len)?,
         })
     }
+}
+
+#[cfg(any(test, feature = "arbitrary"))]
+fn arbitrary_bytes<'a>(
+    u: &mut arbitrary::Unstructured<'a>,
+    len: usize,
+) -> arbitrary::Result<Bytes> {
+    let fill = u.arbitrary()?;
+    Ok(Bytes::from(alloc::vec![fill; len]))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,9 +524,16 @@ mod tests {
             access_list: AccessList::default(),
             sender: Address::with_last_byte(0x01),
             ml_dsa_level: 65,
-            pubkey: Bytes::from(vec![0xaa; 32]),
-            ml_dsa_signature: Bytes::from(vec![0xbb; 64]),
+            pubkey: Bytes::from(vec![0xaa; ML_DSA_65_PUBKEY_LEN]),
+            ml_dsa_signature: Bytes::from(vec![0xbb; ML_DSA_65_SIGNATURE_LEN]),
         }
+    }
+
+    fn decode_encoded_body(tx: &TxMlDsa) -> alloy_rlp::Result<TxMlDsa> {
+        let mut buf = alloc::vec::Vec::new();
+        tx.eip2718_encode(&mut buf);
+        let mut body = &buf[1..];
+        TxMlDsa::eip2718_decode(&mut body)
     }
 
     #[test]
@@ -496,6 +582,44 @@ mod tests {
         let decoded = TxMlDsa::eip2718_decode(&mut slice).expect("decode should succeed");
         assert!(slice.is_empty(), "all bytes should be consumed");
         assert_eq!(decoded, tx, "roundtrip should produce identical transaction");
+    }
+
+    #[test]
+    fn eip2718_rejects_unsupported_ml_dsa_level_before_signature_decode() {
+        let mut tx = sample_tx();
+        tx.ml_dsa_level = 99;
+        tx.pubkey = Bytes::new();
+
+        let err = decode_encoded_body(&tx).expect_err("unsupported level must be rejected");
+        assert!(matches!(err, alloy_rlp::Error::Custom("unsupported ML-DSA security level")));
+    }
+
+    #[test]
+    fn eip2718_rejects_invalid_ml_dsa_pubkey_length() {
+        let mut tx = sample_tx();
+        tx.pubkey = Bytes::from(vec![0xaa; ML_DSA_65_PUBKEY_LEN - 1]);
+
+        let err = decode_encoded_body(&tx).expect_err("bad pubkey length must be rejected");
+        assert!(matches!(err, alloy_rlp::Error::Custom("invalid ML-DSA public key length")));
+    }
+
+    #[test]
+    fn eip2718_rejects_invalid_ml_dsa_signature_length() {
+        let mut tx = sample_tx();
+        tx.ml_dsa_signature = Bytes::from(vec![0xbb; ML_DSA_65_SIGNATURE_LEN - 1]);
+
+        let err = decode_encoded_body(&tx).expect_err("bad signature length must be rejected");
+        assert!(matches!(err, alloy_rlp::Error::Custom("invalid ML-DSA signature length")));
+    }
+
+    #[test]
+    fn eip2718_accepts_cached_key_transaction_with_empty_pubkey() {
+        let mut tx = sample_tx();
+        tx.pubkey = Bytes::new();
+
+        let decoded = decode_encoded_body(&tx).expect("empty pubkey is valid for cached-key txs");
+        assert_eq!(decoded.pubkey.len(), 0);
+        assert_eq!(decoded.ml_dsa_signature.len(), ML_DSA_65_SIGNATURE_LEN);
     }
 
     #[test]

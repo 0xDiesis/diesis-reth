@@ -1080,7 +1080,7 @@ mod tests {
             sender: Address::ZERO,
             ml_dsa_level: 44,
             pubkey: Bytes::new(),
-            ml_dsa_signature: Bytes::new(),
+            ml_dsa_signature: Bytes::from(vec![0u8; crate::tx_ml_dsa::ML_DSA_44_SIGNATURE_LEN]),
         }
     }
 

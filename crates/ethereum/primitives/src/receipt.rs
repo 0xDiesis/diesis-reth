@@ -25,7 +25,7 @@ pub fn calculate_receipt_root_no_memo<T: TxTy>(receipts: &[Receipt<T>]) -> B256 
 mod tests {
     use super::*;
     use crate::TransactionSigned;
-    use alloy_consensus::{ReceiptWithBloom, TxReceipt, TxType};
+    use alloy_consensus::{ReceiptWithBloom, TxType};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{
         address, b256, bloom, bytes, hex_literal::hex, Address, Bloom, Bytes, Log, LogData,
