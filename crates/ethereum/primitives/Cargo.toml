@@ -40,6 +40,8 @@ arbitrary.workspace = true
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 rand.workspace = true
+rand_08.workspace = true
+secp256k1 = { workspace = true, features = ["rand"] }
 alloy-rlp.workspace = true
 reth-codecs = { workspace = true, features = ["test-utils"] }
 reth-zstd-compressors.workspace = true

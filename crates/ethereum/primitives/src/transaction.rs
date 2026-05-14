@@ -742,22 +742,8 @@ impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844Variant> {
                 signed.into()
             }
             Transaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::MlDsa(tx) => {
-                // Ethereum's stock RPC transaction envelope has no custom 0x70 variant yet.
-                // Keep RPC reads non-panicking by exposing ML-DSA transactions through the
-                // closest EIP-1559 shape while consensus/storage keep the raw 0x70 bytes.
-                let tx = TxEip1559 {
-                    chain_id: tx.chain_id,
-                    nonce: tx.nonce,
-                    gas_limit: tx.gas_limit,
-                    max_fee_per_gas: tx.max_fee_per_gas,
-                    max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
-                    to: tx.to,
-                    value: tx.value,
-                    access_list: tx.access_list,
-                    input: tx.input,
-                };
-                Signed::new_unchecked(tx, signature, hash).into()
+            Transaction::MlDsa(_) => {
+                panic!("MlDsa transactions cannot be converted to EthereumTxEnvelope")
             }
         }
     }
@@ -1090,6 +1076,15 @@ mod tests {
 
         assert_eq!(tx.standard_tx_type(), None);
         assert_eq!(tx.ty(), ML_DSA_TX_TYPE_ID);
+    }
+
+    #[test]
+    #[should_panic(expected = "MlDsa transactions cannot be converted to EthereumTxEnvelope")]
+    fn ml_dsa_transaction_cannot_be_converted_to_ethereum_variant_envelope() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new(tx, Signature::test_signature(), B256::ZERO);
+
+        let _ = EthereumTxEnvelope::<TxEip4844Variant>::from(signed);
     }
 
     proptest! {

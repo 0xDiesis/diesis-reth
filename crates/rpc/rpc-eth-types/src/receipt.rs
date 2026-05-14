@@ -105,10 +105,9 @@ impl<ChainSpec> EthReceiptConverter<ChainSpec> {
                     DiesisTxType::Eip1559 => ReceiptEnvelope::Eip1559(receipt),
                     DiesisTxType::Eip4844 => ReceiptEnvelope::Eip4844(receipt),
                     DiesisTxType::Eip7702 => ReceiptEnvelope::Eip7702(receipt),
-                    // The stock Ethereum network response cannot encode custom receipt envelopes.
-                    // Consensus receipts and receipt roots retain type 0x70 via DiesisTxType; a
-                    // Diesis-specific RPC network type should expose 0x70 without this fallback.
-                    DiesisTxType::MlDsa => ReceiptEnvelope::Eip1559(receipt),
+                    DiesisTxType::MlDsa => {
+                        panic!("MlDsa receipts cannot be converted to Ethereum receipt envelopes")
+                    }
                 }
             },
         }
