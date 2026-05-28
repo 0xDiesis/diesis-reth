@@ -205,8 +205,8 @@ where
                 None => return Ok(()),
             };
 
-            if plan.next_segment >= plan.segments.len() ||
-                plan.tx_counter != plan.segments[plan.next_segment].start_tx
+            if plan.next_segment >= plan.segments.len()
+                || plan.tx_counter != plan.segments[plan.next_segment].start_tx
             {
                 return Ok(());
             }
@@ -399,8 +399,8 @@ where
         // the receipt root task (which reads receipts incrementally) sees
         // globally-correct values across all segments.
         let offset = self.gas_used_offset;
-        if offset > 0 &&
-            let Some(receipt) = self.inner_mut().receipts.last_mut()
+        if offset > 0
+            && let Some(receipt) = self.inner_mut().receipts.last_mut()
         {
             receipt.cumulative_gas_used += offset;
         }
@@ -524,8 +524,13 @@ impl<Spec> BbBlockExecutorFactory<Spec> {
         &self.receipt_builder
     }
 
-    pub(crate) fn stage_plan(&self, plan: BbEvmPlan) {
-        *self.staged_plan.lock().unwrap() = Some(plan);
+    pub(crate) fn stage_plan(&self, plan: BbEvmPlan) -> Result<(), BbEvmPlan> {
+        let mut staged = self.staged_plan.lock().unwrap();
+        if staged.is_some() {
+            return Err(plan);
+        }
+        *staged = Some(plan);
+        Ok(())
     }
 
     fn take_plan(&self) -> Option<BbEvmPlan> {
@@ -573,5 +578,30 @@ where
     {
         let plan = self.take_plan();
         BbBlockExecutor::new(evm, ctx, &self.spec, self.receipt_builder, plan, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_factory() -> BbBlockExecutorFactory<()> {
+        BbBlockExecutorFactory {
+            receipt_builder: RethReceiptBuilder::default(),
+            spec: (),
+            evm_factory: EthEvmFactory::default(),
+            staged_plan: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn stage_plan_refuses_to_overwrite_existing_plan() {
+        let factory = test_factory();
+
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_ok());
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_err());
+
+        assert!(factory.take_plan().is_some());
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_ok());
     }
 }
