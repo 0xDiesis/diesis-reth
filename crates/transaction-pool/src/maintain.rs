@@ -42,6 +42,11 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 
 /// Maximum amount of time non-executable transaction are queued.
+///
+/// Diesis fork divergence: upstream reth uses 3 hours. Diesis produces blocks
+/// with sub-second finality, so a transaction that stays non-executable
+/// (e.g. behind a nonce gap) for 30 seconds already spans tens of blocks;
+/// holding it for hours would only bloat the queued subpool.
 pub const MAX_QUEUED_TRANSACTION_LIFETIME: Duration = Duration::from_secs(30);
 
 /// Additional settings for maintaining the transaction pool

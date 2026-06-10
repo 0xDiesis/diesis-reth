@@ -12,11 +12,16 @@ use reth_rpc_convert::transaction::{ConvertReceiptInput, ReceiptConverter};
 use std::sync::Arc;
 
 /// Builds an [`TransactionReceipt`] obtaining the inner receipt envelope from the given closure.
+///
+/// The closure is fallible so chain-specific receipt types without an
+/// Ethereum envelope representation (e.g. Diesis ML-DSA `0x70` receipts) can
+/// surface a typed RPC error instead of panicking on data that legitimately
+/// appears in canonical blocks.
 pub fn build_receipt<N, E>(
     input: ConvertReceiptInput<'_, N>,
     blob_params: Option<BlobParams>,
-    build_rpc_receipt: impl FnOnce(N::Receipt, usize, TransactionMeta) -> E,
-) -> TransactionReceipt<E>
+    build_rpc_receipt: impl FnOnce(N::Receipt, usize, TransactionMeta) -> Result<E, EthApiError>,
+) -> Result<TransactionReceipt<E>, EthApiError>
 where
     N: NodePrimitives,
 {
@@ -33,8 +38,8 @@ where
         TxKind::Call(addr) => (None, Some(Address(*addr))),
     };
 
-    TransactionReceipt {
-        inner: build_rpc_receipt(receipt, next_log_index, meta),
+    Ok(TransactionReceipt {
+        inner: build_rpc_receipt(receipt, next_log_index, meta)?,
         transaction_hash: meta.tx_hash,
         transaction_index: Some(meta.index),
         block_hash: Some(meta.block_hash),
@@ -47,14 +52,14 @@ where
         // EIP-4844 fields
         blob_gas_price,
         blob_gas_used,
-    }
+    })
 }
 
 /// Converter for Ethereum receipts.
 #[derive(derive_more::Debug)]
 pub struct EthReceiptConverter<
     ChainSpec,
-    Builder = fn(Receipt, usize, TransactionMeta) -> ReceiptEnvelope<Log>,
+    Builder = fn(Receipt, usize, TransactionMeta) -> Result<ReceiptEnvelope<Log>, EthApiError>,
 > {
     chain_spec: Arc<ChainSpec>,
     #[debug(skip)]
@@ -100,14 +105,18 @@ impl<ChainSpec> EthReceiptConverter<ChainSpec> {
                     .map_receipt(Into::into);
 
                 match tx_type {
-                    DiesisTxType::Legacy => ReceiptEnvelope::Legacy(receipt),
-                    DiesisTxType::Eip2930 => ReceiptEnvelope::Eip2930(receipt),
-                    DiesisTxType::Eip1559 => ReceiptEnvelope::Eip1559(receipt),
-                    DiesisTxType::Eip4844 => ReceiptEnvelope::Eip4844(receipt),
-                    DiesisTxType::Eip7702 => ReceiptEnvelope::Eip7702(receipt),
-                    DiesisTxType::MlDsa => {
-                        panic!("MlDsa receipts cannot be converted to Ethereum receipt envelopes")
-                    }
+                    DiesisTxType::Legacy => Ok(ReceiptEnvelope::Legacy(receipt)),
+                    DiesisTxType::Eip2930 => Ok(ReceiptEnvelope::Eip2930(receipt)),
+                    DiesisTxType::Eip1559 => Ok(ReceiptEnvelope::Eip1559(receipt)),
+                    DiesisTxType::Eip4844 => Ok(ReceiptEnvelope::Eip4844(receipt)),
+                    DiesisTxType::Eip7702 => Ok(ReceiptEnvelope::Eip7702(receipt)),
+                    // ML-DSA receipts have no Ethereum envelope representation;
+                    // return a typed error instead of panicking — a panic here
+                    // is remotely triggerable by querying the receipt of any
+                    // 0x70 transaction included in a canonical block.
+                    DiesisTxType::MlDsa => Err(EthApiError::Unsupported(
+                        "MlDsa receipts cannot be converted to Ethereum receipt envelopes",
+                    )),
                 }
             },
         }
@@ -126,7 +135,7 @@ impl<N, ChainSpec, Builder, Rpc> ReceiptConverter<N> for EthReceiptConverter<Cha
 where
     N: NodePrimitives,
     ChainSpec: EthChainSpec + 'static,
-    Builder: Fn(N::Receipt, usize, TransactionMeta) -> Rpc + 'static,
+    Builder: Fn(N::Receipt, usize, TransactionMeta) -> Result<Rpc, EthApiError> + 'static,
 {
     type RpcReceipt = TransactionReceipt<Rpc>;
     type Error = EthApiError;
@@ -139,7 +148,7 @@ where
 
         for input in inputs {
             let blob_params = self.chain_spec.blob_params_at_timestamp(input.meta.timestamp);
-            receipts.push(build_receipt(input, blob_params, &self.build_rpc_receipt));
+            receipts.push(build_receipt(input, blob_params, &self.build_rpc_receipt)?);
         }
 
         Ok(receipts)
