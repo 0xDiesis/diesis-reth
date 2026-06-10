@@ -4,7 +4,7 @@ use alloy_primitives::{keccak256, Address, B256};
 use reth_ethereum::{
     chainspec::ChainSpecBuilder,
     node::EthereumNode,
-    primitives::{AlloyBlockHeader, SealedBlock, SealedHeader},
+    primitives::{transaction::TxHashRef, AlloyBlockHeader, SealedBlock, SealedHeader},
     provider::{
         providers::ReadOnlyConfig, AccountReader, BlockNumReader, BlockReader, BlockSource,
         HeaderProvider, ReceiptProvider, StateProvider, TransactionVariant, TransactionsProvider,

@@ -205,8 +205,8 @@ where
                 None => return Ok(()),
             };
 
-            if plan.next_segment >= plan.segments.len()
-                || plan.tx_counter != plan.segments[plan.next_segment].start_tx
+            if plan.next_segment >= plan.segments.len() ||
+                plan.tx_counter != plan.segments[plan.next_segment].start_tx
             {
                 return Ok(());
             }
@@ -346,7 +346,9 @@ where
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
     type Evm = EthEvm<DB, I, P>;
-    type Result = EthTxResult<HaltReason, alloy_consensus::TxType>;
+    // Must match the inner `EthBlockExecutor`'s result type, which is keyed on the Diesis
+    // transaction type so ML-DSA (0x70) receipts keep their raw type byte.
+    type Result = EthTxResult<HaltReason, reth_ethereum_primitives::DiesisTxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // Swap the EVM's block_env and executor ctx to the first segment's
@@ -399,8 +401,8 @@ where
         // the receipt root task (which reads receipts incrementally) sees
         // globally-correct values across all segments.
         let offset = self.gas_used_offset;
-        if offset > 0
-            && let Some(receipt) = self.inner_mut().receipts.last_mut()
+        if offset > 0 &&
+            let Some(receipt) = self.inner_mut().receipts.last_mut()
         {
             receipt.cumulative_gas_used += offset;
         }

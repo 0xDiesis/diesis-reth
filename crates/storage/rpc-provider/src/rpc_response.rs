@@ -70,6 +70,13 @@ impl RpcResponseConverter<alloy_network::Ethereum> for EthRpcConverter {
         &self,
         response: TransactionReceipt,
     ) -> Result<Self::Receipt, RpcResponseConverterError> {
-        Ok(response.into_inner().into())
+        // RPC receipt envelopes only carry standard Ethereum types, so convert through alloy's
+        // `TxType` receipt and widen the type byte into `DiesisTxType` (a strict superset).
+        // ML-DSA (0x70) receipts are not representable as `ReceiptEnvelope` and thus cannot
+        // appear in `N::ReceiptResponse` for the Ethereum network.
+        let receipt: alloy_consensus::EthereumReceipt = response.into_inner().into();
+        let alloy_consensus::EthereumReceipt { tx_type, success, cumulative_gas_used, logs } =
+            receipt;
+        Ok(Receipt { tx_type: tx_type.into(), success, cumulative_gas_used, logs })
     }
 }
