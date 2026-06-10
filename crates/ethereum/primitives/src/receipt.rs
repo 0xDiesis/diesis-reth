@@ -25,7 +25,7 @@ pub fn calculate_receipt_root_no_memo<T: TxTy>(receipts: &[Receipt<T>]) -> B256 
 mod tests {
     use super::*;
     use crate::TransactionSigned;
-    use alloy_consensus::{ReceiptWithBloom, TxReceipt, TxType};
+    use alloy_consensus::{ReceiptWithBloom, TxType};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{
         address, b256, bloom, bytes, hex_literal::hex, Address, Bloom, Bytes, Log, LogData,
@@ -248,7 +248,10 @@ mod tests {
     #[test]
     #[cfg(feature = "rpc")]
     fn test_receipt_serde() {
-        use alloy_consensus::ReceiptEnvelope;
+        // `TxReceipt` provides `into_with_bloom`; it is not otherwise in scope
+        // under the feature set selected when this crate is built alongside
+        // `reth-rpc-eth-types` (feature unification).
+        use alloy_consensus::{ReceiptEnvelope, TxReceipt};
 
         let input = r#"{"status":"0x1","cumulativeGasUsed":"0x175cc0e","logs":[{"address":"0xa18b9ca2a78660d44ab38ae72e72b18792ffe413","topics":["0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0x000000000000000000000000e7e7d8006cbff47bc6ac2dabf592c98e97502708","0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d"],"data":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","blockHash":"0xbf9e6a368a399f996a0f0b27cab4191c028c3c99f5f76ea08a5b70b961475fcb","blockNumber":"0x164b59f","blockTimestamp":"0x68c9a713","transactionHash":"0x533aa9e57865675bb94f41aa2895c0ac81eee69686c77af16149c301e19805f1","transactionIndex":"0x14d","logIndex":"0x238","removed":false}],"logsBloom":"0x00000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000400000040000000000000004000000000000000000000000000000000000000000000020000000000000000000000000080000000000000000000000000200000020000000000000000000000000000000000000000000000000000000000000020000010000000000000000000000000000000000000000000000000000000000000","type":"0x2","transactionHash":"0x533aa9e57865675bb94f41aa2895c0ac81eee69686c77af16149c301e19805f1","transactionIndex":"0x14d","blockHash":"0xbf9e6a368a399f996a0f0b27cab4191c028c3c99f5f76ea08a5b70b961475fcb","blockNumber":"0x164b59f","gasUsed":"0xb607","effectiveGasPrice":"0x4a3ee768","from":"0xe7e7d8006cbff47bc6ac2dabf592c98e97502708","to":"0xa18b9ca2a78660d44ab38ae72e72b18792ffe413","contractAddress":null}"#;
         let receipt: RpcReceipt<TxType> = serde_json::from_str(input).unwrap();

@@ -75,6 +75,17 @@ impl<N: NodePrimitives> Clone for EthStateCache<N> {
 }
 
 impl<N: NodePrimitives> EthStateCache<N> {
+    fn send_provider_action(
+        &self,
+        action: CacheAction<N::Block, N::Receipt>,
+    ) -> ProviderResult<()> {
+        self.to_service.send(action).map_err(|_| CacheServiceUnavailable.into())
+    }
+
+    fn send_optional_action(&self, action: CacheAction<N::Block, N::Receipt>) -> Option<()> {
+        self.to_service.send(action).ok()
+    }
+
     /// Creates and returns both [`EthStateCache`] frontend and the memory bound service.
     fn create<Provider>(
         provider: Provider,
@@ -145,7 +156,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
         block_hash: B256,
     ) -> ProviderResult<Option<Arc<RecoveredBlock<N::Block>>>> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetBlockWithSenders { block_hash, response_tx });
+        self.send_provider_action(CacheAction::GetBlockWithSenders { block_hash, response_tx })?;
         rx.await.map_err(|_| CacheServiceUnavailable)?
     }
 
@@ -157,7 +168,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
         block_hash: B256,
     ) -> ProviderResult<Option<Arc<Vec<N::Receipt>>>> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetReceipts { block_hash, response_tx });
+        self.send_provider_action(CacheAction::GetReceipts { block_hash, response_tx })?;
         rx.await.map_err(|_| CacheServiceUnavailable)?
     }
 
@@ -180,7 +191,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
         block_hash: B256,
     ) -> ProviderResult<Option<(Arc<Vec<N::Receipt>>, Option<Arc<RecoveredBlock<N::Block>>>)>> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetCachedBlock { block_hash, response_tx });
+        self.send_provider_action(CacheAction::GetCachedBlock { block_hash, response_tx })?;
 
         let receipts = self.get_receipts(block_hash);
 
@@ -196,9 +207,10 @@ impl<N: NodePrimitives> EthStateCache<N> {
         block_hash: B256,
     ) -> ProviderResult<(Option<Arc<RecoveredBlock<N::Block>>>, Option<Arc<Vec<N::Receipt>>>)> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self
-            .to_service
-            .send(CacheAction::GetCachedBlockAndReceipts { block_hash, response_tx });
+        self.send_provider_action(CacheAction::GetCachedBlockAndReceipts {
+            block_hash,
+            response_tx,
+        })?;
         rx.await.map_err(|_| CacheServiceUnavailable.into())
     }
 
@@ -222,7 +234,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
     /// Returns an error if the header is not found.
     pub async fn get_header(&self, block_hash: B256) -> ProviderResult<N::BlockHeader> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetHeader { block_hash, response_tx });
+        self.send_provider_action(CacheAction::GetHeader { block_hash, response_tx })?;
         rx.await.map_err(|_| CacheServiceUnavailable)?
     }
 
@@ -239,11 +251,11 @@ impl<N: NodePrimitives> EthStateCache<N> {
         max_blocks: usize,
     ) -> Option<Vec<Arc<RecoveredBlock<N::Block>>>> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetCachedParentBlocks {
+        self.send_optional_action(CacheAction::GetCachedParentBlocks {
             block_hash,
             max_blocks,
             response_tx,
-        });
+        })?;
 
         let blocks = rx.await.unwrap_or_default();
         if blocks.is_empty() {
@@ -262,7 +274,7 @@ impl<N: NodePrimitives> EthStateCache<N> {
         tx_hash: TxHash,
     ) -> Option<CachedTransaction<N::Block, N::Receipt>> {
         let (response_tx, rx) = oneshot::channel();
-        let _ = self.to_service.send(CacheAction::GetTransactionByHash { tx_hash, response_tx });
+        self.send_optional_action(CacheAction::GetTransactionByHash { tx_hash, response_tx })?;
         rx.await.ok()?
     }
 }
@@ -470,7 +482,7 @@ where
                         CacheAction::GetBlockWithSenders { block_hash, response_tx } => {
                             if let Some(block) = this.full_block_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(Some(block)));
-                                continue
+                                continue;
                             }
 
                             // block is not in the cache, request it if this is the first consumer
@@ -499,7 +511,7 @@ where
                             // check if block is cached
                             if let Some(receipts) = this.receipts_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(Some(receipts)));
-                                continue
+                                continue;
                             }
 
                             // block is not in the cache, request it if this is the first consumer
@@ -524,13 +536,13 @@ where
                             // check if the header is cached
                             if let Some(header) = this.headers_cache.get(&block_hash).cloned() {
                                 let _ = response_tx.send(Ok(header));
-                                continue
+                                continue;
                             }
 
                             // it's possible we have the entire block cached
                             if let Some(block) = this.full_block_cache.get(&block_hash) {
                                 let _ = response_tx.send(Ok(block.clone_header()));
-                                continue
+                                continue;
                             }
 
                             // header is not in the cache, request it if this is the first
@@ -815,13 +827,23 @@ pub async fn cache_new_blocks_task<St, N: NodePrimitives>(
         if let Some(reverted) = event.reverted() {
             let chain_change = ChainChange::new(reverted);
 
-            let _ =
-                eth_state_cache.to_service.send(CacheAction::RemoveReorgedChain { chain_change });
+            if eth_state_cache
+                .to_service
+                .send(CacheAction::RemoveReorgedChain { chain_change })
+                .is_err()
+            {
+                return;
+            }
         }
 
         let chain_change = ChainChange::new(event.committed());
 
-        let _ =
-            eth_state_cache.to_service.send(CacheAction::CacheNewCanonicalChain { chain_change });
+        if eth_state_cache
+            .to_service
+            .send(CacheAction::CacheNewCanonicalChain { chain_change })
+            .is_err()
+        {
+            return;
+        }
     }
 }

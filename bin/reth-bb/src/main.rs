@@ -46,6 +46,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, trace};
 
 /// Shared map for big block data, keyed by payload hash.
@@ -80,6 +81,7 @@ pub trait BbRethEngineApi {
 #[derive(Debug)]
 struct BbRethEngineApiHandler {
     pending: BigBlockMap,
+    new_payload_gate: Arc<AsyncMutex<()>>,
     engine: ConsensusEngineHandle<EthEngineTypes>,
 }
 
@@ -101,6 +103,7 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             has_big_block_data = big_block_data.is_some(),
             "Serving bb reth_newPayload"
         );
+        let _new_payload_guard = self.new_payload_gate.lock().await;
 
         let payload = match input {
             RethNewPayloadInput::ExecutionData(data) => data,
@@ -111,16 +114,23 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             }
         };
 
-        if let Some(data) = big_block_data {
+        let big_block_hash = if let Some(data) = big_block_data {
             let hash = ExecutionPayload::block_hash(&payload);
             self.pending.lock().unwrap().insert(hash, data);
-        }
+            Some(hash)
+        } else {
+            None
+        };
 
-        let (status, timings) = self
+        let result = self
             .engine
             .reth_new_payload(payload, wait_for_persistence, wait_for_caches)
             .await
-            .map_err(EngineApiError::from)?;
+            .map_err(EngineApiError::from);
+        if let Some(hash) = big_block_hash {
+            self.pending.lock().unwrap().remove(&hash);
+        }
+        let (status, timings) = result?;
 
         Ok(RethPayloadStatus {
             status,
@@ -151,11 +161,12 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
 #[derive(Debug)]
 pub struct BbAddOns {
     pending: BigBlockMap,
+    new_payload_gate: Arc<AsyncMutex<()>>,
 }
 
 impl BbAddOns {
-    const fn new(pending: BigBlockMap) -> Self {
-        Self { pending }
+    fn new(pending: BigBlockMap) -> Self {
+        Self { pending, new_payload_gate: Arc::new(AsyncMutex::new(())) }
     }
 
     fn make_rpc_add_ons<N: FullNodeComponents>(
@@ -201,11 +212,13 @@ where
     async fn launch_add_ons(self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
         let engine_handle = ctx.beacon_engine_handle.clone();
         let pending = self.pending.clone();
+        let new_payload_gate = self.new_payload_gate.clone();
         let rpc_add_ons = self.make_rpc_add_ons::<N>();
 
         rpc_add_ons
             .launch_add_ons_with(ctx, move |container| {
-                let handler = BbRethEngineApiHandler { pending, engine: engine_handle };
+                let handler =
+                    BbRethEngineApiHandler { pending, new_payload_gate, engine: engine_handle };
                 let bb_module = BbRethEngineApiServer::into_rpc(handler);
                 container.auth_module.replace_auth_methods(bb_module.remove_context())?;
                 Ok(())

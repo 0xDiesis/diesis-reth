@@ -287,6 +287,12 @@ where
 
         plan.block_hashes_to_seed.sort_unstable_by_key(|(n, _)| *n);
 
-        self.executor_factory.stage_plan(plan);
+        if self.executor_factory.stage_plan(plan).is_err() {
+            tracing::error!(
+                target: "engine::bb",
+                ?payload_hash,
+                "refusing to overwrite staged big-block execution plan"
+            );
+        }
     }
 }

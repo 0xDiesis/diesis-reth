@@ -15,7 +15,9 @@ workspace = true
 # reth
 reth-storage-api.workspace = true
 reth-chainspec.workspace = true
-reth-ethereum-primitives.workspace = true
+# `rpc` enables the RPC-response -> primitive transaction conversions this crate relies on, so
+# it compiles standalone instead of only under workspace feature unification.
+reth-ethereum-primitives = { workspace = true, features = ["rpc"] }
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-errors.workspace = true

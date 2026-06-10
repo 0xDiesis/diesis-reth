@@ -4,8 +4,6 @@ name: hive
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +15,9 @@ concurrency:
 jobs:
   build-reth:
     uses: ./.github/workflows/docker-test.yml
+    permissions:
+      id-token: write
+      contents: read
     with:
       hive_target: hive
       artifact_name: "reth"

@@ -4,12 +4,6 @@ name: kurtosis
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"
-
-  push:
-    tags:
-      - "*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +16,9 @@ jobs:
   build-reth:
     if: github.repository == 'paradigmxyz/reth'
     uses: ./.github/workflows/docker-test.yml
+    permissions:
+      id-token: write
+      contents: read
     with:
       hive_target: kurtosis
     secrets: inherit

@@ -422,9 +422,9 @@ impl Hash for TransactionSigned {
 
 impl PartialEq for TransactionSigned {
     fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
-            && self.transaction == other.transaction
-            && self.tx_hash() == other.tx_hash()
+        self.signature == other.signature &&
+            self.transaction == other.transaction &&
+            self.tx_hash() == other.tx_hash()
     }
 }
 
@@ -713,53 +713,75 @@ where
     }
 }
 
-impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844> {
-    fn from(value: TransactionSigned) -> Self {
+/// Error message returned when an ML-DSA transaction is converted to an Ethereum-only
+/// representation.
+const ML_DSA_NOT_AN_ETHEREUM_ENVELOPE: &str =
+    "ML-DSA transactions are not representable as Ethereum transaction envelopes";
+
+// NOTE: these conversions are fallible (unlike upstream reth where `TransactionSigned` is the
+// envelope itself) because the Diesis ML-DSA transaction (0x70) has no `EthereumTxEnvelope`
+// variant. Infallible `From` impls here would have to panic on ML-DSA transactions read from the
+// database or received over the network, which is not acceptable on RPC serving paths.
+impl TryFrom<TransactionSigned> for EthereumTxEnvelope<TxEip4844> {
+    type Error = ValueError<TransactionSigned>;
+
+    fn try_from(value: TransactionSigned) -> Result<Self, Self::Error> {
         let (tx, signature, hash) = value.into_parts();
         match tx {
-            Transaction::Legacy(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip2930(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip1559(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip4844(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::MlDsa(_) => {
-                panic!("MlDsa transactions cannot be converted to EthereumTxEnvelope")
+            Transaction::Legacy(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip2930(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip1559(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip4844(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip7702(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::MlDsa(tx) => {
+                let value = TransactionSigned::new(Transaction::MlDsa(tx), signature, hash);
+                Err(ValueError::new_static(value, ML_DSA_NOT_AN_ETHEREUM_ENVELOPE))
             }
         }
     }
 }
 
-impl From<TransactionSigned> for EthereumTxEnvelope<TxEip4844Variant> {
-    fn from(value: TransactionSigned) -> Self {
+impl TryFrom<TransactionSigned> for EthereumTxEnvelope<TxEip4844Variant> {
+    type Error = ValueError<TransactionSigned>;
+
+    fn try_from(value: TransactionSigned) -> Result<Self, Self::Error> {
         let (tx, signature, hash) = value.into_parts();
         match tx {
-            Transaction::Legacy(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip2930(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            Transaction::Eip1559(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::Legacy(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip2930(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
+            Transaction::Eip1559(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
             Transaction::Eip4844(tx) => {
                 let signed = Signed::new_unchecked(tx, signature, hash);
                 let signed: Signed<TxEip4844Variant> = signed.into();
-                signed.into()
+                Ok(signed.into())
             }
-            Transaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
+            Transaction::Eip7702(tx) => Ok(Signed::new_unchecked(tx, signature, hash).into()),
             Transaction::MlDsa(tx) => {
-                // Ethereum's stock RPC transaction envelope has no custom 0x70 variant yet.
-                // Keep RPC reads non-panicking by exposing ML-DSA transactions through the
-                // closest EIP-1559 shape while consensus/storage keep the raw 0x70 bytes.
-                let tx = TxEip1559 {
-                    chain_id: tx.chain_id,
-                    nonce: tx.nonce,
-                    gas_limit: tx.gas_limit,
-                    max_fee_per_gas: tx.max_fee_per_gas,
-                    max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
-                    to: tx.to,
-                    value: tx.value,
-                    access_list: tx.access_list,
-                    input: tx.input,
-                };
-                Signed::new_unchecked(tx, signature, hash).into()
+                let value = TransactionSigned::new(Transaction::MlDsa(tx), signature, hash);
+                Err(ValueError::new_static(value, ML_DSA_NOT_AN_ETHEREUM_ENVELOPE))
             }
         }
+    }
+}
+
+#[cfg(feature = "rpc")]
+impl reth_rpc_traits::FromConsensusTx<TransactionSigned> for alloy_rpc_types_eth::Transaction {
+    type TxInfo = alloy_rpc_types_eth::TransactionInfo;
+    type Err = ValueError<TransactionSigned>;
+
+    fn from_consensus_tx(
+        tx: TransactionSigned,
+        signer: Address,
+        tx_info: Self::TxInfo,
+    ) -> Result<Self, Self::Err> {
+        // This replaces the blanket impl in `reth-rpc-traits` (which requires an infallible
+        // `From` conversion into the Ethereum envelope) so that ML-DSA transactions read from
+        // the database yield a typed error instead of panicking when served over RPC.
+        let envelope = EthereumTxEnvelope::<TxEip4844Variant>::try_from(tx)?;
+        Ok(Self::from_transaction(
+            alloy_consensus::transaction::Recovered::new_unchecked(envelope, signer),
+            tx_info,
+        ))
     }
 }
 
@@ -1053,8 +1075,8 @@ impl TxHashRef for TransactionSigned {
 
 impl IsTyped2718 for TransactionSigned {
     fn is_type(type_id: u8) -> bool {
-        type_id == ML_DSA_TX_TYPE_ID
-            || <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
+        type_id == ML_DSA_TX_TYPE_ID ||
+            <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
     }
 }
 
@@ -1080,7 +1102,7 @@ mod tests {
             sender: Address::ZERO,
             ml_dsa_level: 44,
             pubkey: Bytes::new(),
-            ml_dsa_signature: Bytes::new(),
+            ml_dsa_signature: Bytes::from(vec![0u8; crate::tx_ml_dsa::ML_DSA_44_SIGNATURE_LEN]),
         }
     }
 
@@ -1090,6 +1112,33 @@ mod tests {
 
         assert_eq!(tx.standard_tx_type(), None);
         assert_eq!(tx.ty(), ML_DSA_TX_TYPE_ID);
+    }
+
+    #[test]
+    fn ml_dsa_transaction_envelope_conversion_errors_instead_of_panicking() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new(tx, Signature::test_signature(), B256::ZERO);
+
+        // Both Ethereum envelope conversions must surface a typed error so RPC/network paths
+        // never panic on ML-DSA transactions.
+        let err = EthereumTxEnvelope::<TxEip4844Variant>::try_from(signed.clone()).unwrap_err();
+        assert_eq!(err.to_string(), ML_DSA_NOT_AN_ETHEREUM_ENVELOPE);
+        // The original transaction is returned in the error value.
+        assert!(matches!(err.value().transaction, Transaction::MlDsa(_)));
+
+        let err = EthereumTxEnvelope::<TxEip4844>::try_from(signed).unwrap_err();
+        assert_eq!(err.to_string(), ML_DSA_NOT_AN_ETHEREUM_ENVELOPE);
+        assert!(matches!(err.value().transaction, Transaction::MlDsa(_)));
+    }
+
+    #[test]
+    fn ml_dsa_transaction_is_not_poolable() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new(tx, Signature::test_signature(), B256::ZERO);
+
+        // ML-DSA transactions must be rejected (not panic) when converted for tx-pool gossip.
+        let err = PooledTransactionVariant::try_from(signed).unwrap_err();
+        assert!(matches!(err.value().transaction, Transaction::MlDsa(_)));
     }
 
     proptest! {
@@ -1102,7 +1151,7 @@ mod tests {
             let expected_len = reth_tx.to_compact(&mut expected_buf);
 
             let mut actual_but  = Vec::<u8>::new();
-            let alloy_tx = EthereumTxEnvelope::<TxEip4844>::from(reth_tx);
+            let alloy_tx = EthereumTxEnvelope::<TxEip4844>::try_from(reth_tx).unwrap();
             let actual_len = alloy_tx.to_compact(&mut actual_but);
 
             assert_eq!(actual_but, expected_buf);
@@ -1117,7 +1166,7 @@ mod tests {
             let len = reth_tx.to_compact(&mut buf);
 
             let (actual_tx, _) = EthereumTxEnvelope::<TxEip4844>::from_compact(&buf, len);
-            let expected_tx = EthereumTxEnvelope::<TxEip4844>::from(reth_tx);
+            let expected_tx = EthereumTxEnvelope::<TxEip4844>::try_from(reth_tx).unwrap();
 
             assert_eq!(actual_tx, expected_tx);
         }
@@ -1132,7 +1181,7 @@ mod tests {
             let expected_len = reth_tx.to_compact(&mut expected_buf);
 
             let mut actual_but  = Vec::<u8>::new();
-            let alloy_tx = EthereumTxEnvelope::<TxEip4844>::from(reth_tx);
+            let alloy_tx = EthereumTxEnvelope::<TxEip4844>::try_from(reth_tx).unwrap();
             let actual_len = alloy_tx.to_compact(&mut actual_but);
 
             assert_eq!(actual_but, expected_buf);
@@ -1149,7 +1198,7 @@ mod tests {
             let len = reth_tx.to_compact(&mut buf);
 
             let (actual_tx, _) = EthereumTxEnvelope::<TxEip4844>::from_compact(&buf, len);
-            let expected_tx = EthereumTxEnvelope::<TxEip4844>::from(reth_tx);
+            let expected_tx = EthereumTxEnvelope::<TxEip4844>::try_from(reth_tx).unwrap();
 
             assert_eq!(actual_tx, expected_tx);
         }

@@ -346,7 +346,9 @@ where
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
     type Evm = EthEvm<DB, I, P>;
-    type Result = EthTxResult<HaltReason, alloy_consensus::TxType>;
+    // Must match the inner `EthBlockExecutor`'s result type, which is keyed on the Diesis
+    // transaction type so ML-DSA (0x70) receipts keep their raw type byte.
+    type Result = EthTxResult<HaltReason, reth_ethereum_primitives::DiesisTxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // Swap the EVM's block_env and executor ctx to the first segment's
@@ -524,8 +526,13 @@ impl<Spec> BbBlockExecutorFactory<Spec> {
         &self.receipt_builder
     }
 
-    pub(crate) fn stage_plan(&self, plan: BbEvmPlan) {
-        *self.staged_plan.lock().unwrap() = Some(plan);
+    pub(crate) fn stage_plan(&self, plan: BbEvmPlan) -> Result<(), BbEvmPlan> {
+        let mut staged = self.staged_plan.lock().unwrap();
+        if staged.is_some() {
+            return Err(plan);
+        }
+        *staged = Some(plan);
+        Ok(())
     }
 
     fn take_plan(&self) -> Option<BbEvmPlan> {
@@ -573,5 +580,30 @@ where
     {
         let plan = self.take_plan();
         BbBlockExecutor::new(evm, ctx, &self.spec, self.receipt_builder, plan, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_factory() -> BbBlockExecutorFactory<()> {
+        BbBlockExecutorFactory {
+            receipt_builder: RethReceiptBuilder::default(),
+            spec: (),
+            evm_factory: EthEvmFactory::default(),
+            staged_plan: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn stage_plan_refuses_to_overwrite_existing_plan() {
+        let factory = test_factory();
+
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_ok());
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_err());
+
+        assert!(factory.take_plan().is_some());
+        assert!(factory.stage_plan(BbEvmPlan::new(Vec::new())).is_ok());
     }
 }

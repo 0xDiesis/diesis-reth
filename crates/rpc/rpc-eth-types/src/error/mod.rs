@@ -576,6 +576,18 @@ impl From<Infallible> for EthApiError {
     }
 }
 
+impl From<alloy_consensus::error::ValueError<reth_ethereum_primitives::TransactionSigned>>
+    for EthApiError
+{
+    fn from(
+        _: alloy_consensus::error::ValueError<reth_ethereum_primitives::TransactionSigned>,
+    ) -> Self {
+        // Only produced when a transaction without an Ethereum envelope representation (Diesis
+        // ML-DSA, type 0x70) is converted into an Ethereum RPC response object.
+        Self::Unsupported("transaction type is not representable as an Ethereum transaction")
+    }
+}
+
 /// An error due to invalid transaction.
 ///
 /// The only reason this exists is to maintain compatibility with other clients de-facto standard

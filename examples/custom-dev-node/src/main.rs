@@ -15,6 +15,7 @@ use reth_ethereum::{
         core::{args::RpcServerArgs, node_config::NodeConfig},
         EthereumNode,
     },
+    primitives::transaction::TxHashRef,
     provider::CanonStateSubscriptions,
     rpc::api::eth::helpers::EthTransactions,
     tasks::Runtime,
