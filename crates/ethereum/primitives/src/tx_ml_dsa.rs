@@ -8,8 +8,8 @@
 //!   transaction body.
 //! - The ML-DSA signature lives inside the transaction struct (`ml_dsa_signature`), not in the
 //!   outer `TransactionSigned::signature` field.
-//! - The full public key is carried on the first transaction for registry, then omitted on
-//!   subsequent transactions.
+//! - The full public key can be carried on first-use transactions, then omitted on subsequent
+//!   transactions once registry verification can use the cached key.
 
 use alloy_consensus::{SignableTransaction, Signed, Transaction, Typed2718};
 use alloy_eips::eip2930::AccessList;
@@ -33,6 +33,15 @@ pub const ML_DSA_44_SIGNATURE_LEN: usize = 2420;
 pub const ML_DSA_65_SIGNATURE_LEN: usize = 3309;
 /// ML-DSA-87 signature length in bytes.
 pub const ML_DSA_87_SIGNATURE_LEN: usize = 4627;
+
+/// How an ML-DSA transaction supplies the public key needed for verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MlDsaPublicKeyMode {
+    /// The transaction carries the full public key and can be used for first-use registration.
+    Inline,
+    /// The transaction omits the public key and expects a previously registered key for `sender`.
+    Cached,
+}
 
 /// Returns the expected public key length for an ML-DSA security level.
 pub const fn expected_pubkey_len(level: u8) -> Option<usize> {
@@ -95,10 +104,10 @@ impl TxMlDsa {
     // RLP helpers – signing fields (the subset that gets hashed)
     // -----------------------------------------------------------------------
 
-    /// RLP-encodes only the signing fields (no pubkey or `ml_dsa_signature`).
+    /// RLP-encodes only the signing fields (no `ml_dsa_signature`).
     ///
     /// Signing fields: `chain_id`, nonce, `max_priority_fee_per_gas`, `max_fee_per_gas`,
-    /// `gas_limit`, to, value, input, `access_list`, sender, `ml_dsa_level`.
+    /// `gas_limit`, to, value, input, `access_list`, sender, `ml_dsa_level`, `pubkey`.
     pub fn rlp_encode_signing_fields(&self, out: &mut dyn BufMut) {
         self.chain_id.encode(out);
         self.nonce.encode(out);
@@ -111,6 +120,7 @@ impl TxMlDsa {
         self.access_list.encode(out);
         self.sender.encode(out);
         self.ml_dsa_level.encode(out);
+        self.pubkey.0.encode(out);
     }
 
     /// Returns the RLP-encoded length of the signing fields (no RLP header).
@@ -126,21 +136,45 @@ impl TxMlDsa {
             + self.access_list.length()
             + self.sender.length()
             + self.ml_dsa_level.length()
+            + self.pubkey.0.length()
     }
 
     // -----------------------------------------------------------------------
-    // RLP helpers – all fields (signing fields + pubkey + ml_dsa_signature)
+    // RLP helpers – all fields (signing fields + ml_dsa_signature)
     // -----------------------------------------------------------------------
 
     /// Returns the RLP-encoded length of all fields (no RLP header).
     pub fn rlp_encoded_fields_length(&self) -> usize {
-        self.rlp_signing_fields_length() + self.pubkey.0.length() + self.ml_dsa_signature.0.length()
+        self.rlp_signing_fields_length() + self.ml_dsa_signature.0.length()
     }
 
-    /// RLP-encodes all fields (signing fields + pubkey + `ml_dsa_signature`).
+    /// Returns whether this transaction carries inline public key material or
+    /// expects key lookup from the sender registry.
+    pub fn public_key_mode(&self) -> MlDsaPublicKeyMode {
+        if self.pubkey.is_empty() {
+            MlDsaPublicKeyMode::Cached
+        } else {
+            MlDsaPublicKeyMode::Inline
+        }
+    }
+
+    /// Returns true when this transaction carries the full public key bytes.
+    pub fn has_inline_pubkey(&self) -> bool {
+        self.public_key_mode() == MlDsaPublicKeyMode::Inline
+    }
+
+    /// Validates only the deterministic shape of ML-DSA key material.
+    ///
+    /// This does not verify the ML-DSA signature or bind `sender` to a key registry.
+    /// Higher layers must do that with `signature_hash()`, `pubkey`, and registry state.
+    pub fn validate_key_material_shape(&self) -> alloy_rlp::Result<()> {
+        validate_pubkey_len(&self.pubkey, self.ml_dsa_level)?;
+        validate_signature_len(&self.ml_dsa_signature, self.ml_dsa_level)
+    }
+
+    /// RLP-encodes all fields (signing fields + `ml_dsa_signature`).
     pub fn rlp_encode_fields(&self, out: &mut dyn BufMut) {
         self.rlp_encode_signing_fields(out);
-        self.pubkey.0.encode(out);
         self.ml_dsa_signature.0.encode(out);
     }
 
@@ -183,6 +217,9 @@ impl TxMlDsa {
     // -----------------------------------------------------------------------
 
     /// Computes the signing hash: `keccak256(0x70 || rlp_list([signing_fields]))`.
+    ///
+    /// The inline public key bytes are signed because their presence can affect
+    /// first-use key registration semantics. The ML-DSA signature bytes are not signed.
     pub fn signature_hash(&self) -> B256 {
         let mut buf = alloc::vec::Vec::with_capacity(1 + self.rlp_signing_payload_length());
         buf.put_u8(ML_DSA_TX_TYPE_ID);
@@ -267,23 +304,33 @@ impl TxMlDsa {
 }
 
 fn decode_pubkey_field(buf: &mut &[u8], level: u8) -> alloy_rlp::Result<Bytes> {
-    let expected_len = expected_pubkey_len(level)
-        .ok_or(alloy_rlp::Error::Custom("unsupported ML-DSA security level"))?;
     let bytes = Header::decode_bytes(buf, false)?;
-    if !bytes.is_empty() && bytes.len() != expected_len {
-        return Err(alloy_rlp::Error::Custom("invalid ML-DSA public key length"));
-    }
+    validate_pubkey_len(bytes, level)?;
     Ok(Bytes::copy_from_slice(bytes))
 }
 
 fn decode_signature_field(buf: &mut &[u8], level: u8) -> alloy_rlp::Result<Bytes> {
+    let bytes = Header::decode_bytes(buf, false)?;
+    validate_signature_len(bytes, level)?;
+    Ok(Bytes::copy_from_slice(bytes))
+}
+
+fn validate_pubkey_len(bytes: &[u8], level: u8) -> alloy_rlp::Result<()> {
+    let expected_len = expected_pubkey_len(level)
+        .ok_or(alloy_rlp::Error::Custom("unsupported ML-DSA security level"))?;
+    if !bytes.is_empty() && bytes.len() != expected_len {
+        return Err(alloy_rlp::Error::Custom("invalid ML-DSA public key length"));
+    }
+    Ok(())
+}
+
+fn validate_signature_len(bytes: &[u8], level: u8) -> alloy_rlp::Result<()> {
     let expected_len = expected_signature_len(level)
         .ok_or(alloy_rlp::Error::Custom("unsupported ML-DSA security level"))?;
-    let bytes = Header::decode_bytes(buf, false)?;
     if bytes.len() != expected_len {
         return Err(alloy_rlp::Error::Custom("invalid ML-DSA signature length"));
     }
-    Ok(Bytes::copy_from_slice(bytes))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -415,11 +462,11 @@ impl SignableTransaction<Signature> for TxMlDsa {
         1 + self.rlp_signing_payload_length()
     }
 
-    fn into_signed(self, signature: Signature) -> Signed<Self, Signature> {
-        // `signature` is intentionally unused — the real ML-DSA signature is carried in
-        // `self.ml_dsa_signature`.
+    fn into_signed(self, _signature: Signature) -> Signed<Self, Signature> {
+        // The outer ECDSA signature is intentionally unused — the real ML-DSA
+        // signature is carried in `self.ml_dsa_signature`.
         let hash = self.tx_hash();
-        Signed::new_unchecked(self, signature, hash)
+        Signed::new_unchecked(self, Signature::new(U256::ZERO, U256::ZERO, false), hash)
     }
 }
 
@@ -436,11 +483,7 @@ impl<'a> arbitrary::Arbitrary<'a> for TxMlDsa {
         let ml_dsa_level = *u.choose(&[44u8, 65, 87])?;
         let pubkey_len = expected_pubkey_len(ml_dsa_level).expect("valid ML-DSA level");
         let signature_len = expected_signature_len(ml_dsa_level).expect("valid ML-DSA level");
-        let pubkey = if u.arbitrary()? {
-            arbitrary_bytes(u, pubkey_len)?
-        } else {
-            Bytes::new()
-        };
+        let pubkey = if u.arbitrary()? { arbitrary_bytes(u, pubkey_len)? } else { Bytes::new() };
 
         Ok(Self {
             chain_id: u.arbitrary()?,
@@ -492,15 +535,12 @@ impl reth_codecs::Compact for TxMlDsa {
         let mut remainder = buf;
         let header =
             alloy_rlp::Header::decode(&mut remainder).expect("invalid TxMlDsa compact header");
-        let body_start = remainder;
-        let tx = Self::rlp_decode_fields(&mut remainder).expect("invalid TxMlDsa compact fields");
-        // Verify we consumed exactly `header.payload_length` bytes from the body.
-        debug_assert_eq!(
-            body_start.len() - remainder.len(),
-            header.payload_length,
-            "TxMlDsa compact decode consumed wrong number of bytes"
-        );
-        (tx, remainder)
+        assert!(header.list, "invalid TxMlDsa compact payload header");
+        assert!(remainder.len() >= header.payload_length, "truncated TxMlDsa compact payload");
+        let (mut body, rest) = remainder.split_at(header.payload_length);
+        let tx = Self::rlp_decode_fields(&mut body).expect("invalid TxMlDsa compact fields");
+        assert!(body.is_empty(), "TxMlDsa compact decode left trailing field bytes");
+        (tx, rest)
     }
 }
 
@@ -620,6 +660,93 @@ mod tests {
         let decoded = decode_encoded_body(&tx).expect("empty pubkey is valid for cached-key txs");
         assert_eq!(decoded.pubkey.len(), 0);
         assert_eq!(decoded.ml_dsa_signature.len(), ML_DSA_65_SIGNATURE_LEN);
+    }
+
+    #[test]
+    fn public_key_mode_names_registration_shape() {
+        let mut tx = sample_tx();
+        assert_eq!(tx.public_key_mode(), MlDsaPublicKeyMode::Inline);
+        assert!(tx.has_inline_pubkey());
+
+        tx.pubkey = Bytes::new();
+        assert_eq!(tx.public_key_mode(), MlDsaPublicKeyMode::Cached);
+        assert!(!tx.has_inline_pubkey());
+    }
+
+    #[test]
+    fn validate_key_material_shape_accepts_all_supported_levels() {
+        for (level, pubkey_len, signature_len) in [
+            (44, ML_DSA_44_PUBKEY_LEN, ML_DSA_44_SIGNATURE_LEN),
+            (65, ML_DSA_65_PUBKEY_LEN, ML_DSA_65_SIGNATURE_LEN),
+            (87, ML_DSA_87_PUBKEY_LEN, ML_DSA_87_SIGNATURE_LEN),
+        ] {
+            let mut tx = sample_tx();
+            tx.ml_dsa_level = level;
+            tx.pubkey = Bytes::from(vec![0xaa; pubkey_len]);
+            tx.ml_dsa_signature = Bytes::from(vec![0xbb; signature_len]);
+
+            tx.validate_key_material_shape().expect("supported level with exact lengths is valid");
+
+            tx.pubkey = Bytes::new();
+            tx.validate_key_material_shape()
+                .expect("cached-key transaction may omit inline public key");
+        }
+    }
+
+    #[test]
+    fn validate_key_material_shape_rejects_malformed_direct_construction() {
+        let mut tx = sample_tx();
+        tx.pubkey = Bytes::from(vec![0xaa; ML_DSA_65_PUBKEY_LEN - 1]);
+        let err = tx.validate_key_material_shape().expect_err("bad public key must fail");
+        assert!(matches!(err, alloy_rlp::Error::Custom("invalid ML-DSA public key length")));
+
+        let mut tx = sample_tx();
+        tx.ml_dsa_signature = Bytes::from(vec![0xbb; ML_DSA_65_SIGNATURE_LEN - 1]);
+        let err = tx.validate_key_material_shape().expect_err("bad signature must fail");
+        assert!(matches!(err, alloy_rlp::Error::Custom("invalid ML-DSA signature length")));
+
+        let mut tx = sample_tx();
+        tx.ml_dsa_level = 99;
+        let err = tx.validate_key_material_shape().expect_err("unsupported level must fail");
+        assert!(matches!(err, alloy_rlp::Error::Custom("unsupported ML-DSA security level")));
+    }
+
+    #[test]
+    fn signature_hash_binds_inline_key_material() {
+        let inline = sample_tx();
+        let mut cached = inline.clone();
+        cached.pubkey = Bytes::new();
+        assert_ne!(
+            inline.signature_hash(),
+            cached.signature_hash(),
+            "public key registration bytes are part of the signed payload"
+        );
+    }
+
+    #[test]
+    fn signature_hash_is_independent_of_signature_bytes() {
+        let mut tx = sample_tx();
+        let original = tx.signature_hash();
+        tx.ml_dsa_signature = Bytes::from(vec![0x11; ML_DSA_65_SIGNATURE_LEN]);
+        assert_eq!(
+            tx.signature_hash(),
+            original,
+            "ML-DSA signature bytes are not part of the signed payload"
+        );
+    }
+
+    #[test]
+    fn compact_decode_returns_outer_remainder_after_exact_payload() {
+        use reth_codecs::Compact;
+
+        let tx = sample_tx();
+        let mut encoded = Vec::new();
+        tx.to_compact(&mut encoded);
+        encoded.extend_from_slice(&[0xde, 0xad]);
+
+        let (decoded, rest) = TxMlDsa::from_compact(&encoded, encoded.len());
+        assert_eq!(decoded, tx);
+        assert_eq!(rest, &[0xde, 0xad]);
     }
 
     #[test]

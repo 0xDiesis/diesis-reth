@@ -263,9 +263,9 @@ impl SignableTransaction<Signature> for Transaction {
 
     fn into_signed(self, signature: Signature) -> Signed<Self> {
         // ML-DSA tx hash is independent of the ECDSA signature.
-        let tx_hash = match &self {
-            Self::MlDsa(tx) => tx.tx_hash(),
-            _ => delegate_ecdsa!(&self => tx.tx_hash(&signature)),
+        let (signature, tx_hash) = match &self {
+            Self::MlDsa(tx) => (ml_dsa_dummy_signature(), tx.tx_hash()),
+            _ => (signature, delegate_ecdsa!(&self => tx.tx_hash(&signature))),
         };
         Signed::new_unchecked(self, signature, tx_hash)
     }
@@ -411,31 +411,50 @@ impl TransactionSigned {
     fn recalculate_hash(&self) -> B256 {
         keccak256(self.encoded_2718())
     }
+
+    fn canonical_signature(transaction: &Transaction, signature: Signature) -> Signature {
+        if matches!(transaction, Transaction::MlDsa(_)) {
+            ml_dsa_dummy_signature()
+        } else {
+            signature
+        }
+    }
+
+    fn canonical_hash(transaction: &Transaction, hash: B256) -> B256 {
+        match transaction {
+            Transaction::MlDsa(tx) => tx.tx_hash(),
+            _ => hash,
+        }
+    }
 }
 
 impl Hash for TransactionSigned {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.signature.hash(state);
+        Self::canonical_signature(&self.transaction, self.signature).hash(state);
         self.transaction.hash(state);
     }
 }
 
 impl PartialEq for TransactionSigned {
     fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature &&
-            self.transaction == other.transaction &&
-            self.tx_hash() == other.tx_hash()
+        Self::canonical_signature(&self.transaction, self.signature)
+            == Self::canonical_signature(&other.transaction, other.signature)
+            && self.transaction == other.transaction
+            && self.tx_hash() == other.tx_hash()
     }
 }
 
 impl TransactionSigned {
     /// Creates a new signed transaction from the given transaction, signature and hash.
     pub fn new(transaction: Transaction, signature: Signature, hash: B256) -> Self {
+        let signature = Self::canonical_signature(&transaction, signature);
+        let hash = Self::canonical_hash(&transaction, hash);
         Self { hash: hash.into(), signature, transaction }
     }
 
     /// Creates a new signed transaction and lazily computes the hash on first access.
     pub fn new_unhashed(transaction: Transaction, signature: Signature) -> Self {
+        let signature = Self::canonical_signature(&transaction, signature);
         Self { hash: OnceLock::new(), signature, transaction }
     }
 
@@ -903,6 +922,10 @@ impl Encodable2718 for TransactionSigned {
     }
 }
 
+fn ml_dsa_dummy_signature() -> Signature {
+    Signature::new(U256::ZERO, U256::ZERO, false)
+}
+
 impl Decodable2718 for TransactionSigned {
     fn typed_decode(ty: u8, buf: &mut &[u8]) -> Eip2718Result<Self> {
         // Handle ML-DSA (0x70) before TxType conversion since TxType has no MlDsa variant.
@@ -910,7 +933,7 @@ impl Decodable2718 for TransactionSigned {
             let tx = TxMlDsa::eip2718_decode(buf).map_err(|_| Eip2718Error::UnexpectedType(ty))?;
             return Ok(Self {
                 transaction: Transaction::MlDsa(tx),
-                signature: Signature::new(U256::ZERO, U256::ZERO, false),
+                signature: ml_dsa_dummy_signature(),
                 hash: Default::default(),
             });
         }
@@ -988,7 +1011,8 @@ impl reth_codecs::Compact for TransactionSigned {
         // The first byte uses 4 bits as flags: IsCompressed[1bit], TxType[2bits], Signature[1bit]
         buf.put_u8(0);
 
-        let sig_bit = self.signature.to_compact(buf) as u8;
+        let signature = Self::canonical_signature(&self.transaction, self.signature);
+        let sig_bit = signature.to_compact(buf) as u8;
         let zstd_bit = self.transaction.input().len() >= 32;
 
         let tx_bits = if zstd_bit {
@@ -1032,6 +1056,7 @@ impl reth_codecs::Compact for TransactionSigned {
             Transaction::from_compact(buf, transaction_type)
         };
 
+        let signature = Self::canonical_signature(&transaction, signature);
         (Self { signature, transaction, hash: Default::default() }, buf)
     }
 }
@@ -1041,25 +1066,25 @@ reth_codecs::impl_compression_for_compact!(TransactionSigned);
 
 impl SignerRecoverable for TransactionSigned {
     fn recover_signer(&self) -> Result<Address, RecoveryError> {
-        // ML-DSA carries the sender explicitly — no secp256k1 recovery needed.
         if let Transaction::MlDsa(tx) = &self.transaction {
-            return Ok(tx.sender);
+            tx.validate_key_material_shape().map_err(RecoveryError::from_source)?;
+            return Err(RecoveryError::new());
         }
         let signature_hash = self.transaction.signature_hash();
         recover_signer(&self.signature, signature_hash)
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, RecoveryError> {
-        if let Transaction::MlDsa(tx) = &self.transaction {
-            return Ok(tx.sender);
+        if matches!(&self.transaction, Transaction::MlDsa(_)) {
+            return Err(RecoveryError::new());
         }
         let signature_hash = self.transaction.signature_hash();
         recover_signer_unchecked(&self.signature, signature_hash)
     }
 
     fn recover_unchecked_with_buf(&self, buf: &mut Vec<u8>) -> Result<Address, RecoveryError> {
-        if let Transaction::MlDsa(tx) = &self.transaction {
-            return Ok(tx.sender);
+        if matches!(&self.transaction, Transaction::MlDsa(_)) {
+            return Err(RecoveryError::new());
         }
         self.transaction.encode_for_signing(buf);
         let signature_hash = keccak256(buf);
@@ -1075,18 +1100,22 @@ impl TxHashRef for TransactionSigned {
 
 impl IsTyped2718 for TransactionSigned {
     fn is_type(type_id: u8) -> bool {
-        type_id == ML_DSA_TX_TYPE_ID ||
-            <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
+        type_id == ML_DSA_TX_TYPE_ID
+            || <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::EthereumTxEnvelope;
+    use alloy_consensus::{transaction::SignerRecoverable, EthereumTxEnvelope};
     use proptest::proptest;
     use proptest_arbitrary_interop::arb;
     use reth_codecs::Compact;
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
 
     fn empty_ml_dsa_transaction() -> TxMlDsa {
         TxMlDsa {
@@ -1139,6 +1168,73 @@ mod tests {
         // ML-DSA transactions must be rejected (not panic) when converted for tx-pool gossip.
         let err = PooledTransactionVariant::try_from(signed).unwrap_err();
         assert!(matches!(err.value().transaction, Transaction::MlDsa(_)));
+    }
+
+    #[test]
+    fn ml_dsa_transaction_into_signed_canonicalizes_outer_signature() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = tx.into_signed(Signature::test_signature());
+        let (_, signature, _) = signed.into_parts();
+
+        assert_eq!(signature, ml_dsa_dummy_signature());
+    }
+
+    #[test]
+    fn ml_dsa_outer_signature_is_canonicalized() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let with_dummy = TransactionSigned::new_unhashed(tx.clone(), ml_dsa_dummy_signature());
+        let with_nonzero = TransactionSigned::new_unhashed(tx, Signature::test_signature());
+
+        assert_eq!(with_dummy.signature, ml_dsa_dummy_signature());
+        assert_eq!(with_nonzero.signature, ml_dsa_dummy_signature());
+        assert_eq!(with_dummy, with_nonzero);
+        assert_eq!(with_dummy.tx_hash(), with_nonzero.tx_hash());
+
+        let mut dummy_hash = DefaultHasher::new();
+        Hash::hash(&with_dummy, &mut dummy_hash);
+        let mut nonzero_hash = DefaultHasher::new();
+        Hash::hash(&with_nonzero, &mut nonzero_hash);
+        assert_eq!(dummy_hash.finish(), nonzero_hash.finish());
+    }
+
+    #[test]
+    fn ml_dsa_network_roundtrip_ignores_nonzero_dummy_signature() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new_unhashed(tx, Signature::test_signature());
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+
+        let mut payload = &encoded[1..];
+        let decoded = TransactionSigned::typed_decode(ML_DSA_TX_TYPE_ID, &mut payload)
+            .expect("valid ML-DSA transaction should decode");
+
+        assert!(payload.is_empty());
+        assert_eq!(signed, decoded);
+        assert_eq!(decoded.signature, ml_dsa_dummy_signature());
+    }
+
+    #[test]
+    fn ml_dsa_compact_roundtrip_ignores_nonzero_dummy_signature() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new_unhashed(tx, Signature::test_signature());
+        let mut encoded = Vec::new();
+        let len = signed.to_compact(&mut encoded);
+
+        let (decoded, rest) = TransactionSigned::from_compact(&encoded, len);
+
+        assert!(rest.is_empty());
+        assert_eq!(signed, decoded);
+        assert_eq!(decoded.signature, ml_dsa_dummy_signature());
+    }
+
+    #[test]
+    fn ml_dsa_signer_recovery_requires_verified_path() {
+        let tx = Transaction::MlDsa(empty_ml_dsa_transaction());
+        let signed = TransactionSigned::new_unhashed(tx, Signature::test_signature());
+
+        assert!(signed.recover_signer().is_err());
+        assert!(signed.recover_signer_unchecked().is_err());
+        assert!(signed.recover_unchecked_with_buf(&mut Vec::new()).is_err());
     }
 
     proptest! {
