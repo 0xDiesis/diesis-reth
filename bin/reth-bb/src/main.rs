@@ -52,6 +52,40 @@ use tracing::{info, trace};
 /// Shared map for big block data, keyed by payload hash.
 pub type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
 
+fn invalid_big_block_data(message: impl Into<String>) -> EngineApiError {
+    EngineApiError::other(jsonrpsee::types::ErrorObject::owned(
+        jsonrpsee::types::error::INVALID_PARAMS_CODE,
+        jsonrpsee::types::error::INVALID_PARAMS_MSG,
+        Some(message.into()),
+    ))
+}
+
+fn validate_big_block_data<T>(data: &BigBlockData<T>) -> Result<(), EngineApiError> {
+    let Some((first_start_tx, _)) = data.env_switches.first() else {
+        return Err(invalid_big_block_data(
+            "big_block_data.env_switches must include the base segment at transaction index 0",
+        ));
+    };
+
+    if *first_start_tx != 0 {
+        return Err(invalid_big_block_data(
+            "big_block_data.env_switches[0] must start at transaction index 0",
+        ));
+    }
+
+    for window in data.env_switches.windows(2) {
+        let previous = window[0].0;
+        let current = window[1].0;
+        if current <= previous {
+            return Err(invalid_big_block_data(
+                "big_block_data.env_switches must be strictly ordered by transaction index",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Custom RPC trait for big-block payloads
 // ---------------------------------------------------------------------------
@@ -115,6 +149,7 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
         };
 
         let big_block_hash = if let Some(data) = big_block_data {
+            validate_big_block_data(&data)?;
             let hash = ExecutionPayload::block_hash(&payload);
             self.pending.lock().unwrap().insert(hash, data);
             Some(hash)
@@ -150,6 +185,42 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             .fork_choice_updated(forkchoice_state, None)
             .await
             .map_err(|e| EngineApiError::from(e).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn big_block_data(env_switches: Vec<(usize, ())>) -> BigBlockData<()> {
+        BigBlockData { env_switches, prior_block_hashes: Vec::new() }
+    }
+
+    #[test]
+    fn rejects_empty_big_block_env_switches() {
+        let err = validate_big_block_data(&big_block_data(Vec::new())).unwrap_err();
+
+        assert!(err.to_string().contains("include the base segment"));
+    }
+
+    #[test]
+    fn rejects_big_block_env_switches_that_do_not_start_at_zero() {
+        let err = validate_big_block_data(&big_block_data(vec![(1, ())])).unwrap_err();
+
+        assert!(err.to_string().contains("transaction index 0"));
+    }
+
+    #[test]
+    fn rejects_unordered_big_block_env_switches() {
+        let err =
+            validate_big_block_data(&big_block_data(vec![(0, ()), (3, ()), (3, ())])).unwrap_err();
+
+        assert!(err.to_string().contains("strictly ordered"));
+    }
+
+    #[test]
+    fn accepts_ordered_big_block_env_switches() {
+        validate_big_block_data(&big_block_data(vec![(0, ()), (3, ()), (5, ())])).unwrap();
     }
 }
 
