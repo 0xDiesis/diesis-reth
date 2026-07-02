@@ -206,11 +206,14 @@ install-reth-bench: ## Build and install the reth binary under `$(CARGO_HOME)/bi
 
 ##@ Other
 
-.PHONY: clean
+.PHONY: clean clean-rust
 clean: ## Perform a `cargo` clean and remove the binary and test vectors directories.
 	cargo clean
 	rm -rf $(BIN_DIR)
 	rm -rf $(EF_TESTS_DIR)
+
+clean-rust: ## Remove generated Rust build artifacts without touching downloaded test vectors
+	rm -rf target
 
 .PHONY: db-tools
 db-tools: ## Compile MDBX debugging tools.
