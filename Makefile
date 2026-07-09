@@ -213,7 +213,7 @@ clean: ## Perform a `cargo` clean and remove the binary and test vectors directo
 	rm -rf $(EF_TESTS_DIR)
 
 clean-rust: ## Remove generated Rust build artifacts without touching downloaded test vectors
-	rm -rf target
+	rm -rf $(CARGO_TARGET_DIR)
 
 .PHONY: db-tools
 db-tools: ## Compile MDBX debugging tools.
