@@ -3,7 +3,10 @@
 use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
-    rpc::{EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, RethRpcAddOns, RpcHandle},
+    rpc::{
+        EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, ExecutedBlockInsertRequest,
+        RethRpcAddOns, RpcHandle,
+    },
     setup::build_networked_pipeline,
     AddOns, AddOnsContext, FullNode, LaunchContext, LaunchNode, NodeAdapter,
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
@@ -53,21 +56,6 @@ pub struct EngineNodeLauncher {
     /// Temporary configuration for engine tree.
     /// After engine is stabilized, this should be configured through node builder.
     pub engine_tree_config: TreeConfig,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY;
-
-    #[test]
-    fn diesis_executed_block_channel_capacity_is_bounded() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<reth_chain_state::ExecutedBlock>(
-            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
-        );
-
-        assert_eq!(tx.max_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
-        assert_eq!(tx.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
-    }
 }
 
 impl EngineNodeLauncher {
@@ -321,9 +309,7 @@ impl EngineNodeLauncher {
         // Created outside the async block so the sender can be exposed on RpcHandle.
         let (executed_block_tx, executed_block_rx) =
             tokio::sync::mpsc::channel::<
-                reth_chain_state::ExecutedBlock<
-                    <T::Types as reth_node_api::NodeTypes>::Primitives,
-                >,
+                ExecutedBlockInsertRequest<<T::Types as reth_node_api::NodeTypes>::Primitives>,
             >(DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
 
         info!(target: "reth::cli", "Starting consensus engine");
@@ -398,9 +384,16 @@ impl EngineNodeLauncher {
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
                         }
                     }
-                    Some(executed_block) = executed_block_rx.recv() => {
-                        debug!(target: "reth::cli", block=?executed_block.recovered_block().num_hash(), "inserting pipeline executed block (direct insert)");
-                        orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
+                    Some(request) = executed_block_rx.recv() => {
+                        debug!(
+                            target: "reth::cli",
+                            expected_head=?request.expected_canonical_head(),
+                            block=?request.block().recovered_block().num_hash(),
+                            "conditionally inserting pipeline executed block (direct insert)"
+                        );
+                        orchestrator.handler_mut().handler_mut().on_event(
+                            EngineApiRequest::InsertExecutedBlockIfCanonical(request).into()
+                        );
                     }
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
@@ -483,5 +476,20 @@ where
 
     fn launch_node(self, target: NodeBuilderWithComponents<T, CB, AO>) -> Self::Future {
         Box::pin(self.launch_node(target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutedBlockInsertRequest, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY};
+
+    #[test]
+    fn diesis_executed_block_channel_capacity_is_bounded() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecutedBlockInsertRequest>(
+            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        );
+
+        assert_eq!(tx.max_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        assert_eq!(tx.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
     }
 }

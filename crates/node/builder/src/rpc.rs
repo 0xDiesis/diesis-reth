@@ -5,7 +5,10 @@ pub use jsonrpsee::{
     server::middleware::rpc::{RpcService, RpcServiceBuilder},
 };
 use reth_engine_tree::tree::WaitForCaches;
-pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
+pub use reth_engine_tree::{
+    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest},
+    tree::{BasicEngineValidator, EngineValidator},
+};
 pub use reth_rpc_builder::{
     middleware::{RethAuthHttpMiddleware, RethRpcMiddleware},
     Identity, Stack,
@@ -345,12 +348,12 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
-    /// Optional sender for direct executed-block insertion into the engine tree,
-    /// bypassing `new_payload` re-execution. Used by the Diesis deferred execution
-    /// pipeline to eliminate double execution overhead.
+    /// Optional sender for conditional direct executed-block insertion into the engine tree,
+    /// bypassing `new_payload` re-execution. The request must name the exact canonical parent and
+    /// carries an acknowledgement receiver so callers can distinguish acceptance from a reorg.
     pub executed_block_tx: Option<
         tokio::sync::mpsc::Sender<
-            reth_chain_state::ExecutedBlock<<Node::Types as NodeTypes>::Primitives>,
+            ExecutedBlockInsertRequest<<Node::Types as NodeTypes>::Primitives>,
         >,
     >,
     /// Shared counter tracking the highest block number confirmed as persisted

@@ -1,7 +1,10 @@
 use crate::{
     backfill::{BackfillAction, BackfillSyncState},
     chain::FromOrchestrator,
-    engine::{DownloadRequest, EngineApiEvent, EngineApiKind, EngineApiRequest, FromEngine},
+    engine::{
+        DownloadRequest, EngineApiEvent, EngineApiKind, EngineApiRequest, ExecutedBlockInsertError,
+        FromEngine,
+    },
     persistence::PersistenceHandle,
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
 };
@@ -87,6 +90,39 @@ pub mod state;
 /// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
 /// backfill this gap.
 pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
+
+fn validate_executed_block_child(
+    expected_head: BlockNumHash,
+    actual_head: BlockNumHash,
+    block: BlockNumHash,
+    parent_hash: B256,
+) -> Result<(), ExecutedBlockInsertError> {
+    if expected_head != actual_head {
+        return Err(ExecutedBlockInsertError::CanonicalHeadMismatch {
+            expected: expected_head,
+            actual: actual_head,
+        })
+    }
+
+    let expected_number = actual_head
+        .number
+        .checked_add(1)
+        .ok_or(ExecutedBlockInsertError::CanonicalHeadNumberOverflow { head: actual_head })?;
+    if block.number != expected_number {
+        return Err(ExecutedBlockInsertError::BlockNumberMismatch {
+            expected: expected_number,
+            actual: block.number,
+        })
+    }
+    if parent_hash != actual_head.hash {
+        return Err(ExecutedBlockInsertError::ParentHashMismatch {
+            expected: actual_head.hash,
+            actual: parent_hash,
+        })
+    }
+
+    Ok(())
+}
 
 /// The minimum number of blocks to retain in the changeset cache after eviction.
 ///
@@ -1556,30 +1592,22 @@ where
             FromEngine::Request(request) => {
                 match request {
                     EngineApiRequest::InsertExecutedBlock(block) => {
-                        let block_num_hash = block.recovered_block().num_hash();
-                        if block_num_hash.number <= self.state.tree_state.canonical_block_number() {
-                            // outdated block that can be skipped
-                            return Ok(ops::ControlFlow::Continue(()))
+                        self.insert_executed_block(block);
+                    }
+                    EngineApiRequest::InsertExecutedBlockIfCanonical(request) => {
+                        let (expected_head, block, response) = request.into_parts();
+                        let actual_head = *self.state.tree_state.canonical_head();
+                        let result = validate_executed_block_child(
+                            expected_head,
+                            actual_head,
+                            block.recovered_block().num_hash(),
+                            block.recovered_block().parent_hash(),
+                        );
+
+                        if result.is_ok() {
+                            self.insert_executed_block(block);
                         }
-
-                        debug!(target: "engine::tree", block=?block_num_hash, "inserting already executed block");
-                        let now = Instant::now();
-
-                        // if the parent is the canonical head, we can insert the block as the
-                        // pending block
-                        if self.state.tree_state.canonical_block_hash() ==
-                            block.recovered_block().parent_hash()
-                        {
-                            debug!(target: "engine::tree", pending=?block_num_hash, "updating pending block");
-                            self.canonical_in_memory_state.set_pending_block(block.clone());
-                        }
-
-                        self.state.tree_state.insert_executed(block.clone());
-                        self.payload_validator.on_inserted_executed_block(block.clone());
-                        self.metrics.engine.inserted_already_executed_blocks.increment(1);
-                        self.emit_event(EngineApiEvent::BeaconConsensus(
-                            ConsensusEngineEvent::CanonicalBlockAdded(block, now.elapsed()),
-                        ));
+                        let _ = response.send(result);
                     }
                     EngineApiRequest::Beacon(request) => {
                         match request {
@@ -1754,6 +1782,28 @@ where
             }
         }
         Ok(ops::ControlFlow::Continue(()))
+    }
+
+    fn insert_executed_block(&mut self, block: ExecutedBlock<N>) {
+        let block_num_hash = block.recovered_block().num_hash();
+        if block_num_hash.number <= self.state.tree_state.canonical_block_number() {
+            return
+        }
+
+        debug!(target: "engine::tree", block=?block_num_hash, "inserting already executed block");
+        let now = Instant::now();
+
+        if self.state.tree_state.canonical_block_hash() == block.recovered_block().parent_hash() {
+            debug!(target: "engine::tree", pending=?block_num_hash, "updating pending block");
+            self.canonical_in_memory_state.set_pending_block(block.clone());
+        }
+
+        self.state.tree_state.insert_executed(block.clone());
+        self.payload_validator.on_inserted_executed_block(block.clone());
+        self.metrics.engine.inserted_already_executed_blocks.increment(1);
+        self.emit_event(EngineApiEvent::BeaconConsensus(
+            ConsensusEngineEvent::CanonicalBlockAdded(block, now.elapsed()),
+        ));
     }
 
     /// Invoked if the backfill sync has finished to target.

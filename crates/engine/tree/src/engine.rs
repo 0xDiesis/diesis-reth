@@ -5,6 +5,7 @@ use crate::{
     chain::{ChainHandler, FromOrchestrator, HandlerEvent},
     download::{BlockDownloader, DownloadAction, DownloadOutcome},
 };
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{map::B256Set, B256};
 use crossbeam_channel::Sender;
 use futures::{Stream, StreamExt};
@@ -17,7 +18,7 @@ use std::{
     fmt::Display,
     task::{ready, Context, Poll},
 };
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 
 /// A [`ChainHandler`] that advances the chain based on incoming requests (CL engine API).
 ///
@@ -246,6 +247,9 @@ pub enum EngineApiRequest<T: PayloadTypes, N: NodePrimitives> {
     Beacon(BeaconEngineMessage<T>),
     /// Request to insert an already executed block, e.g. via payload building.
     InsertExecutedBlock(ExecutedBlock<N>),
+    /// Request to insert an already executed block only if it is the direct child of the expected
+    /// canonical head.
+    InsertExecutedBlockIfCanonical(ExecutedBlockInsertRequest<N>),
 }
 
 impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
@@ -255,8 +259,85 @@ impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
             Self::InsertExecutedBlock(block) => {
                 write!(f, "InsertExecutedBlock({:?})", block.recovered_block().num_hash())
             }
+            Self::InsertExecutedBlockIfCanonical(request) => write!(
+                f,
+                "InsertExecutedBlockIfCanonical(expected={:?}, block={:?})",
+                request.expected_canonical_head(),
+                request.block().recovered_block().num_hash()
+            ),
         }
     }
+}
+
+/// An executed block whose admission is conditional on an exact canonical head.
+#[derive(Debug)]
+pub struct ExecutedBlockInsertRequest<N: NodePrimitives = EthPrimitives> {
+    expected_canonical_head: BlockNumHash,
+    block: ExecutedBlock<N>,
+    response: oneshot::Sender<Result<(), ExecutedBlockInsertError>>,
+}
+
+impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
+    /// Creates a conditional insertion request and its acknowledgement receiver.
+    pub fn new(
+        expected_canonical_head: BlockNumHash,
+        block: ExecutedBlock<N>,
+    ) -> (Self, oneshot::Receiver<Result<(), ExecutedBlockInsertError>>) {
+        let (response, receiver) = oneshot::channel();
+        (Self { expected_canonical_head, block, response }, receiver)
+    }
+
+    /// Returns the canonical head that must still be current when the request is handled.
+    pub const fn expected_canonical_head(&self) -> BlockNumHash {
+        self.expected_canonical_head
+    }
+
+    /// Returns the executed block awaiting admission.
+    pub const fn block(&self) -> &ExecutedBlock<N> {
+        &self.block
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (BlockNumHash, ExecutedBlock<N>, oneshot::Sender<Result<(), ExecutedBlockInsertError>>)
+    {
+        (self.expected_canonical_head, self.block, self.response)
+    }
+}
+
+/// Reason a conditional executed-block insertion was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutedBlockInsertError {
+    /// The canonical head changed before the engine tree handled the request.
+    #[error("canonical head mismatch: expected {expected:?}, actual {actual:?}")]
+    CanonicalHeadMismatch {
+        /// Head supplied by the caller.
+        expected: BlockNumHash,
+        /// Head observed by the engine tree.
+        actual: BlockNumHash,
+    },
+    /// The expected canonical head cannot have a child because its number is already maximal.
+    #[error("canonical head block number cannot be incremented: {head:?}")]
+    CanonicalHeadNumberOverflow {
+        /// Canonical head whose number overflowed.
+        head: BlockNumHash,
+    },
+    /// The submitted block number is not exactly one greater than the canonical head.
+    #[error("block number mismatch: expected {expected}, actual {actual}")]
+    BlockNumberMismatch {
+        /// Required child block number.
+        expected: u64,
+        /// Submitted block number.
+        actual: u64,
+    },
+    /// The submitted block does not name the canonical head as its parent.
+    #[error("parent hash mismatch: expected {expected}, actual {actual}")]
+    ParentHashMismatch {
+        /// Required parent hash.
+        expected: B256,
+        /// Submitted parent hash.
+        actual: B256,
+    },
 }
 
 impl<T: PayloadTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest},
     persistence::PersistenceAction,
     tree::{
         payload_validator::{BasicEngineValidator, TreeCtx, ValidationOutcome},
@@ -39,6 +40,105 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+
+#[tokio::test]
+async fn direct_executed_block_requires_expected_canonical_head() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let child = test_harness
+        .block_builder
+        .get_executed_block_with_number(2, blocks[1].recovered_block().hash());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let stale_head = BlockNumHash::new(actual_head.number, B256::random());
+    let child_hash = child.recovered_block().hash();
+    let (request, response) = ExecutedBlockInsertRequest::new(stale_head, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::CanonicalHeadMismatch {
+            expected: stale_head,
+            actual: actual_head,
+        })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
+}
+
+#[tokio::test]
+async fn direct_executed_block_requires_direct_child_number() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(3, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::BlockNumberMismatch { expected: 2, actual: 3 })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
+}
+
+#[tokio::test]
+async fn direct_executed_block_requires_canonical_parent_hash() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let wrong_parent = B256::random();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, wrong_parent);
+    let child_hash = child.recovered_block().hash();
+    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::ParentHashMismatch {
+            expected: actual_head.hash,
+            actual: wrong_parent,
+        })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
+}
+
+#[tokio::test]
+async fn direct_executed_block_acknowledges_valid_child_after_insertion() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(response.await.unwrap(), Ok(()));
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_some());
+}
 
 /// Mock engine validator for tests
 #[derive(Debug, Clone)]
