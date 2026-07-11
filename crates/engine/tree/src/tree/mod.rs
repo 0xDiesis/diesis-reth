@@ -1595,7 +1595,7 @@ where
                         self.insert_executed_block(block);
                     }
                     EngineApiRequest::InsertExecutedBlockIfCanonical(request) => {
-                        let (expected_head, block, response) = request.into_parts();
+                        let (expected_head, block, response, permit) = request.into_parts();
                         let actual_head = *self.state.tree_state.canonical_head();
                         let result = validate_executed_block_child(
                             expected_head,
@@ -1607,6 +1607,9 @@ where
                         if result.is_ok() {
                             self.insert_executed_block(block);
                         }
+                        // Capacity becomes available as soon as tree processing completes; it
+                        // must not depend on when the caller happens to poll the acknowledgement.
+                        drop(permit);
                         let _ = response.send(result);
                     }
                     EngineApiRequest::Beacon(request) => {

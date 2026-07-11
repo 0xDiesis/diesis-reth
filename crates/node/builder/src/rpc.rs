@@ -6,7 +6,7 @@ pub use jsonrpsee::{
 };
 use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::{
-    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest},
+    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest, ExecutedBlockInsertSender},
     tree::{BasicEngineValidator, EngineValidator},
 };
 pub use reth_rpc_builder::{
@@ -348,14 +348,12 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
-    /// Optional sender for conditional direct executed-block insertion into the engine tree,
-    /// bypassing `new_payload` re-execution. The request must name the exact canonical parent and
-    /// carries an acknowledgement receiver so callers can distinguish acceptance from a reorg.
-    pub executed_block_tx: Option<
-        tokio::sync::mpsc::Sender<
-            ExecutedBlockInsertRequest<<Node::Types as NodeTypes>::Primitives>,
-        >,
-    >,
+    /// Optional bounded sender for conditional direct insertion into the engine tree, bypassing
+    /// `new_payload` re-execution. Its high-level API retains capacity across both internal queues
+    /// and returns the tree's typed acknowledgement so callers can distinguish acceptance from a
+    /// reorg or unavailable engine.
+    pub executed_block_tx:
+        Option<ExecutedBlockInsertSender<<Node::Types as NodeTypes>::Primitives>>,
     /// Shared counter tracking the highest block number confirmed as persisted
     /// to MDBX by reth's persistence service. Updated by the engine launch loop.
     /// Used by the Diesis pipeline to gate overlay eviction — entries are only

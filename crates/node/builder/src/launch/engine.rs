@@ -5,7 +5,7 @@ use crate::{
     hooks::NodeHooks,
     rpc::{
         EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, ExecutedBlockInsertRequest,
-        RethRpcAddOns, RpcHandle,
+        ExecutedBlockInsertSender, RethRpcAddOns, RpcHandle,
     },
     setup::build_networked_pipeline,
     AddOns, AddOnsContext, FullNode, LaunchContext, LaunchNode, NodeAdapter,
@@ -307,10 +307,14 @@ impl EngineNodeLauncher {
 
         // Channel for direct executed-block insertion from the Diesis pipeline.
         // Created outside the async block so the sender can be exposed on RpcHandle.
-        let (executed_block_tx, executed_block_rx) =
+        let (executed_block_ingress_tx, executed_block_rx) =
             tokio::sync::mpsc::channel::<
                 ExecutedBlockInsertRequest<<T::Types as reth_node_api::NodeTypes>::Primitives>,
             >(DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        let executed_block_tx = ExecutedBlockInsertSender::new(
+            executed_block_ingress_tx,
+            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        );
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
@@ -481,15 +485,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutedBlockInsertRequest, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY};
+    use super::{
+        ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
+        DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+    };
 
     #[test]
     fn diesis_executed_block_channel_capacity_is_bounded() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<ExecutedBlockInsertRequest>(
             DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
         );
+        let sender = ExecutedBlockInsertSender::new(tx, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
 
-        assert_eq!(tx.max_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
-        assert_eq!(tx.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        assert_eq!(sender.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        assert_eq!(sender.available_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
     }
 }

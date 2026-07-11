@@ -51,7 +51,7 @@ async fn direct_executed_block_requires_expected_canonical_head() {
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let stale_head = BlockNumHash::new(actual_head.number, B256::random());
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new(stale_head, child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(stale_head, child);
 
     let _ = test_harness
         .tree
@@ -77,7 +77,7 @@ async fn direct_executed_block_requires_direct_child_number() {
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let child = test_harness.block_builder.get_executed_block_with_number(3, actual_head.hash);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
 
     let _ = test_harness
         .tree
@@ -101,7 +101,7 @@ async fn direct_executed_block_requires_canonical_parent_hash() {
     let wrong_parent = B256::random();
     let child = test_harness.block_builder.get_executed_block_with_number(2, wrong_parent);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
 
     let _ = test_harness
         .tree
@@ -127,7 +127,7 @@ async fn direct_executed_block_acknowledges_valid_child_after_insertion() {
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new(actual_head, child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
 
     let _ = test_harness
         .tree

@@ -16,9 +16,13 @@ use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{Block, NodePrimitives, SealedBlock};
 use std::{
     fmt::Display,
+    sync::Arc,
     task::{ready, Context, Poll},
 };
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver},
+    oneshot, OwnedSemaphorePermit, Semaphore,
+};
 
 /// A [`ChainHandler`] that advances the chain based on incoming requests (CL engine API).
 ///
@@ -187,17 +191,23 @@ impl<Request, N: NodePrimitives> EngineApiRequestHandler<Request, N> {
     }
 }
 
-impl<Request, N: NodePrimitives> EngineRequestHandler for EngineApiRequestHandler<Request, N>
+impl<T, N> EngineRequestHandler for EngineApiRequestHandler<EngineApiRequest<T, N>, N>
 where
-    Request: Send,
+    T: PayloadTypes,
+    N: NodePrimitives,
 {
     type Event = ConsensusEngineEvent<N>;
-    type Request = Request;
+    type Request = EngineApiRequest<T, N>;
     type Block = N::Block;
 
     fn on_event(&mut self, event: FromEngine<Self::Request, Self::Block>) {
         // delegate to the tree
-        let _ = self.to_tree.send(event);
+        if let Err(error) = self.to_tree.send(event) &&
+            let FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(request)) =
+                error.0
+        {
+            request.reject(ExecutedBlockInsertError::EngineUnavailable);
+        }
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<RequestHandlerEvent<Self::Event>> {
@@ -275,16 +285,27 @@ pub struct ExecutedBlockInsertRequest<N: NodePrimitives = EthPrimitives> {
     expected_canonical_head: BlockNumHash,
     block: ExecutedBlock<N>,
     response: oneshot::Sender<Result<(), ExecutedBlockInsertError>>,
+    permit: OwnedSemaphorePermit,
 }
 
 impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
-    /// Creates a conditional insertion request and its acknowledgement receiver.
-    pub fn new(
+    fn new(
+        expected_canonical_head: BlockNumHash,
+        block: ExecutedBlock<N>,
+        permit: OwnedSemaphorePermit,
+    ) -> (Self, oneshot::Receiver<Result<(), ExecutedBlockInsertError>>) {
+        let (response, receiver) = oneshot::channel();
+        (Self { expected_canonical_head, block, response, permit }, receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
         expected_canonical_head: BlockNumHash,
         block: ExecutedBlock<N>,
     ) -> (Self, oneshot::Receiver<Result<(), ExecutedBlockInsertError>>) {
-        let (response, receiver) = oneshot::channel();
-        (Self { expected_canonical_head, block, response }, receiver)
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.try_acquire_owned().expect("test semaphore has one permit");
+        Self::new(expected_canonical_head, block, permit)
     }
 
     /// Returns the canonical head that must still be current when the request is handled.
@@ -299,15 +320,87 @@ impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
 
     pub(crate) fn into_parts(
         self,
-    ) -> (BlockNumHash, ExecutedBlock<N>, oneshot::Sender<Result<(), ExecutedBlockInsertError>>)
-    {
-        (self.expected_canonical_head, self.block, self.response)
+    ) -> (
+        BlockNumHash,
+        ExecutedBlock<N>,
+        oneshot::Sender<Result<(), ExecutedBlockInsertError>>,
+        OwnedSemaphorePermit,
+    ) {
+        (self.expected_canonical_head, self.block, self.response, self.permit)
+    }
+
+    fn reject(self, error: ExecutedBlockInsertError) {
+        let (_, _, response, permit) = self.into_parts();
+        drop(permit);
+        let _ = response.send(Err(error));
+    }
+}
+
+/// Bounded handle for acknowledged direct insertion into the engine tree.
+///
+/// The shared permit is retained while a request is in either the Tokio ingress queue or the
+/// engine tree's crossbeam queue. This bounds total outstanding direct-insert work rather than
+/// only the first queue. Callers cannot construct an unpermitted request.
+#[derive(Debug, Clone)]
+pub struct ExecutedBlockInsertSender<N: NodePrimitives = EthPrimitives> {
+    sender: mpsc::Sender<ExecutedBlockInsertRequest<N>>,
+    permits: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl<N: NodePrimitives> ExecutedBlockInsertSender<N> {
+    /// Creates a sender with an end-to-end outstanding-request limit.
+    pub fn new(sender: mpsc::Sender<ExecutedBlockInsertRequest<N>>, capacity: usize) -> Self {
+        assert!(capacity > 0, "direct insert capacity must be positive");
+        Self { sender, permits: Arc::new(Semaphore::new(capacity)), capacity }
+    }
+
+    /// Conditionally inserts an executed block and waits for the engine tree's acknowledgement.
+    ///
+    /// Capacity exhaustion is reported immediately. A successful return means the tree validated
+    /// the expected canonical parent and inserted the block before acknowledging it.
+    pub async fn insert(
+        &self,
+        expected_canonical_head: BlockNumHash,
+        block: ExecutedBlock<N>,
+    ) -> Result<(), ExecutedBlockInsertError> {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ExecutedBlockInsertError::QueueFull { capacity: self.capacity })?;
+        let (request, response) =
+            ExecutedBlockInsertRequest::new(expected_canonical_head, block, permit);
+        self.sender.send(request).await.map_err(|_| ExecutedBlockInsertError::EngineUnavailable)?;
+        response.await.map_err(|_| ExecutedBlockInsertError::AcknowledgementDropped)?
+    }
+
+    /// Maximum number of direct-insert requests that may be outstanding end to end.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Number of requests that can be admitted without waiting for prior work to complete.
+    pub fn available_capacity(&self) -> usize {
+        self.permits.available_permits()
     }
 }
 
 /// Reason a conditional executed-block insertion was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutedBlockInsertError {
+    /// The bounded direct-insert path has reached its end-to-end capacity.
+    #[error("direct block admission queue is full (capacity {capacity})")]
+    QueueFull {
+        /// Configured outstanding-request limit.
+        capacity: usize,
+    },
+    /// The engine ingress or engine tree is no longer available.
+    #[error("engine tree is unavailable")]
+    EngineUnavailable,
+    /// The tree-side acknowledgement was dropped, so the admission outcome is ambiguous.
+    #[error("direct block admission acknowledgement was dropped")]
+    AcknowledgementDropped,
     /// The canonical head changed before the engine tree handled the request.
     #[error("canonical head mismatch: expected {expected:?}, actual {actual:?}")]
     CanonicalHeadMismatch {
@@ -338,6 +431,175 @@ pub enum ExecutedBlockInsertError {
         /// Submitted parent hash.
         actual: B256,
     },
+}
+
+#[cfg(test)]
+mod direct_insert_sender_tests {
+    use super::*;
+    use reth_chain_state::test_utils::TestBlockBuilder;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+
+    fn executed_block(number: u64, parent_hash: B256) -> ExecutedBlock {
+        TestBlockBuilder::eth().get_executed_block_with_number(number, parent_hash)
+    }
+
+    fn sender_with_capacity(
+        capacity: usize,
+    ) -> (ExecutedBlockInsertSender, mpsc::Receiver<ExecutedBlockInsertRequest>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (ExecutedBlockInsertSender::new(tx, capacity), rx)
+    }
+
+    #[tokio::test]
+    async fn sixty_fifth_request_is_full_after_tokio_to_crossbeam_forwarding() {
+        const CAPACITY: usize = 64;
+        let (sender, mut ingress) = sender_with_capacity(CAPACITY);
+        let expected_head = BlockNumHash::new(0, B256::random());
+        let (to_tree, from_ingress) = crossbeam_channel::unbounded::<
+            FromEngine<
+                EngineApiRequest<EthEngineTypes, EthPrimitives>,
+                reth_ethereum_primitives::Block,
+            >,
+        >();
+
+        let mut inserts = Vec::with_capacity(CAPACITY);
+        for _ in 0..CAPACITY {
+            inserts.push(tokio::spawn({
+                let sender = sender.clone();
+                async move {
+                    sender.insert(expected_head, executed_block(1, expected_head.hash)).await
+                }
+            }));
+            let request = ingress.recv().await.expect("request reaches Tokio ingress");
+            to_tree
+                .send(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+                    request,
+                )))
+                .expect("request reaches the engine tree queue");
+        }
+
+        assert_eq!(sender.available_capacity(), 0);
+        assert_eq!(
+            sender.insert(expected_head, executed_block(1, expected_head.hash)).await,
+            Err(ExecutedBlockInsertError::QueueFull { capacity: CAPACITY })
+        );
+
+        drop(from_ingress);
+        for insert in inserts {
+            assert_eq!(
+                insert.await.unwrap(),
+                Err(ExecutedBlockInsertError::AcknowledgementDropped)
+            );
+        }
+        assert_eq!(sender.available_capacity(), CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_enqueue_releases_permit() {
+        let (raw_tx, mut ingress) = mpsc::channel(1);
+        let sender = ExecutedBlockInsertSender::new(raw_tx, 2);
+        let expected_head = BlockNumHash::new(0, B256::random());
+        let first = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        tokio::task::yield_now().await;
+
+        let second = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(sender.available_capacity(), 0);
+
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+        assert_eq!(sender.available_capacity(), 1);
+
+        drop(ingress.recv().await.expect("first request was enqueued"));
+        assert_eq!(first.await.unwrap(), Err(ExecutedBlockInsertError::AcknowledgementDropped));
+        assert_eq!(sender.available_capacity(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_enqueue_releases_when_request_finishes() {
+        let (sender, mut ingress) = sender_with_capacity(1);
+        let expected_head = BlockNumHash::new(0, B256::random());
+        let task = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        let request = ingress.recv().await.expect("request was enqueued");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(sender.available_capacity(), 0);
+
+        drop(request);
+        assert_eq!(sender.available_capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn tree_completion_releases_capacity_before_ack_is_consumed() {
+        let (sender, mut ingress) = sender_with_capacity(1);
+        let expected_head = BlockNumHash::new(0, B256::random());
+        let first = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        let request = ingress.recv().await.expect("first request was enqueued");
+        let (_, _, response, permit) = request.into_parts();
+        drop(permit);
+        response.send(Ok(())).expect("caller still awaits acknowledgement");
+
+        assert_eq!(sender.available_capacity(), 1);
+        assert_eq!(first.await.unwrap(), Ok(()));
+
+        let second = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        let request = ingress.recv().await.expect("next request admitted at capacity one");
+        request.reject(ExecutedBlockInsertError::EngineUnavailable);
+        assert_eq!(second.await.unwrap(), Err(ExecutedBlockInsertError::EngineUnavailable));
+    }
+
+    #[tokio::test]
+    async fn closed_tokio_ingress_is_typed_and_leak_free() {
+        let (sender, ingress) = sender_with_capacity(1);
+        drop(ingress);
+        let expected_head = BlockNumHash::new(0, B256::random());
+
+        assert_eq!(
+            sender.insert(expected_head, executed_block(1, expected_head.hash)).await,
+            Err(ExecutedBlockInsertError::EngineUnavailable)
+        );
+        assert_eq!(sender.available_capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_crossbeam_tree_ingress_is_typed_and_leak_free() {
+        let (sender, mut ingress) = sender_with_capacity(1);
+        let expected_head = BlockNumHash::new(0, B256::random());
+        let insert = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+        });
+        let request = ingress.recv().await.expect("request was enqueued");
+
+        let (to_tree, tree_rx) = crossbeam_channel::unbounded();
+        drop(tree_rx);
+        let (_from_tree_tx, from_tree_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = EngineApiRequestHandler::<
+            EngineApiRequest<EthEngineTypes, EthPrimitives>,
+            EthPrimitives,
+        >::new(to_tree, from_tree_rx);
+        handler.on_event(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )));
+
+        assert_eq!(insert.await.unwrap(), Err(ExecutedBlockInsertError::EngineUnavailable));
+        assert_eq!(sender.available_capacity(), 1);
+    }
 }
 
 impl<T: PayloadTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {
