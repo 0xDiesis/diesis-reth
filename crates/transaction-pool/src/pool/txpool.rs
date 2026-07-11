@@ -17,7 +17,9 @@ use crate::{
         update::{Destination, PoolUpdate, UpdateOutcome},
         AddedPendingTransaction, AddedTransaction, OnNewCanonicalStateOutcome,
     },
-    traits::{BestTransactionsAttributes, BlockInfo, PoolSize},
+    traits::{
+        BestTransactionsAttributes, BlockInfo, NoopSenderCostOverlay, PoolSize, SenderCostOverlay,
+    },
     PoolConfig, PoolResult, PoolTransaction, PoolUpdateKind, PriceBumpConfig, TransactionOrdering,
     ValidPoolTransaction, U256,
 };
@@ -39,7 +41,7 @@ use alloy_primitives::{
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 #[cfg(test)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::{
     cmp::Ordering,
     collections::{btree_map::Entry, hash_map, BTreeMap},
@@ -128,6 +130,15 @@ pub struct TxPool<T: TransactionOrdering> {
 impl<T: TransactionOrdering> TxPool<T> {
     /// Create a new graph pool instance.
     pub fn new(ordering: T, config: PoolConfig) -> Self {
+        Self::new_with_sender_cost_overlay(ordering, config, Arc::new(NoopSenderCostOverlay))
+    }
+
+    /// Create a graph pool with a custom sender-cost overlay.
+    pub fn new_with_sender_cost_overlay(
+        ordering: T,
+        config: PoolConfig,
+        sender_cost_overlay: Arc<dyn SenderCostOverlay<T::Transaction>>,
+    ) -> Self {
         Self {
             pending_pool: PendingPool::with_buffer(
                 ordering,
@@ -136,7 +147,10 @@ impl<T: TransactionOrdering> TxPool<T> {
             queued_pool: Default::default(),
             basefee_pool: Default::default(),
             blob_pool: Default::default(),
-            all_transactions: AllTransactions::new(&config),
+            all_transactions: AllTransactions::new_with_sender_cost_overlay(
+                &config,
+                sender_cost_overlay,
+            ),
             config,
             metrics: Default::default(),
         }
@@ -655,6 +669,21 @@ impl<T: TransactionOrdering> TxPool<T> {
         update
     }
 
+    /// Re-evaluate all tracked senders after a sender-cost overlay changes.
+    pub(crate) fn refresh_sender_cost_overlay(&mut self) -> UpdateOutcome<T::Transaction> {
+        let revoked = self.all_transactions.refresh_sender_cost_overlay();
+        let mut discarded = revoked
+            .iter()
+            .filter_map(|hash| {
+                self.all_transactions.sender_cost_overlay.on_revoked(*hash);
+                self.remove_transaction_by_hash(hash)
+            })
+            .collect::<Vec<_>>();
+        let mut outcome = self.update_accounts(self.all_transactions.sender_info.clone());
+        outcome.discarded.append(&mut discarded);
+        outcome
+    }
+
     /// Updates the entire pool after a new block was mined.
     ///
     /// This removes all mined transactions, updates according to the new base fee and blob fee and
@@ -758,10 +787,14 @@ impl<T: TransactionOrdering> TxPool<T> {
         on_chain_code_hash: Option<B256>,
     ) -> PoolResult<AddedTransaction<T::Transaction>> {
         if self.contains(tx.hash()) {
+            self.all_transactions.sender_cost_overlay.on_rejected(*tx.hash());
             return Err(PoolError::new(*tx.hash(), PoolErrorKind::AlreadyImported))
         }
 
-        self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash)?;
+        if let Err(err) = self.validate_auth(&tx, on_chain_nonce, on_chain_code_hash) {
+            self.all_transactions.sender_cost_overlay.on_rejected(*tx.hash());
+            return Err(err)
+        }
 
         // Update sender info with balance and nonce
         self.all_transactions
@@ -1418,17 +1451,37 @@ pub(crate) struct AllTransactions<T: PoolTransaction> {
     auths: FxHashMap<SenderId, B256Set>,
     /// All Transactions metrics
     metrics: AllTransactionsMetrics,
+    /// Sender-cost accounting and synchronous lifecycle observer.
+    sender_cost_overlay: Arc<dyn SenderCostOverlay<T>>,
 }
 
 impl<T: PoolTransaction> AllTransactions<T> {
-    /// Create a new instance
-    fn new(config: &PoolConfig) -> Self {
+    fn refresh_sender_cost_overlay(&mut self) -> Vec<TxHash> {
+        let overlay = self.sender_cost_overlay.clone();
+        let mut revoked = Vec::new();
+        for transaction in self.txs.values_mut() {
+            let refreshed =
+                overlay.cost_credit(&transaction.transaction).min(*transaction.transaction.cost());
+            if transaction.cost_credit > U256::ZERO && refreshed == U256::ZERO {
+                revoked.push(*transaction.transaction.hash());
+            } else {
+                transaction.cost_credit = refreshed;
+            }
+        }
+        revoked
+    }
+
+    fn new_with_sender_cost_overlay(
+        config: &PoolConfig,
+        sender_cost_overlay: Arc<dyn SenderCostOverlay<T>>,
+    ) -> Self {
         Self {
             max_account_slots: config.max_account_slots,
             price_bumps: config.price_bumps,
             local_transactions_config: config.local_transactions_config.clone(),
             minimal_protocol_basefee: config.minimal_protocol_basefee,
             block_gas_limit: config.gas_limit,
+            sender_cost_overlay,
             ..Default::default()
         }
     }
@@ -1572,7 +1625,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
                     tx.state.insert(TxState::NO_NONCE_GAPS);
                     tx.state.insert(TxState::NO_PARKED_ANCESTORS);
                     tx.cumulative_cost = U256::ZERO;
-                    if tx.transaction.cost() > &info.balance {
+                    if tx.sender_cost() > info.balance {
                         // sender lacks sufficient funds to pay for this transaction
                         tx.state.remove(TxState::ENOUGH_BALANCE);
                     } else {
@@ -1756,6 +1809,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         self.remove_auths(&internal);
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
+        self.sender_cost_overlay.on_removed(*tx.hash());
         Some((tx, internal.subpool))
     }
 
@@ -1771,6 +1825,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         self.remove_auths(&internal);
         // decrement the counter for the sender.
         self.tx_decr(tx.sender_id());
+        self.sender_cost_overlay.on_removed(*tx.hash());
         Some((tx, internal.subpool))
     }
 
@@ -1820,6 +1875,10 @@ impl<T: PoolTransaction> AllTransactions<T> {
             self.by_hash.remove(internal.transaction.hash()).map(|tx| (tx, internal.subpool));
 
         self.remove_auths(&internal);
+
+        if let Some((tx, _)) = &result {
+            self.sender_cost_overlay.on_removed(*tx.hash());
+        }
 
         result
     }
@@ -1904,6 +1963,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
         new_blob_tx: ValidPoolTransaction<T>,
         on_chain_balance: U256,
         ancestor: Option<TransactionId>,
+        cost_credit: U256,
     ) -> Result<ValidPoolTransaction<T>, InsertErr<T>> {
         if let Some(ancestor) = ancestor {
             let Some(ancestor_tx) = self.txs.get(&ancestor) else {
@@ -1919,7 +1979,8 @@ impl<T: PoolTransaction> AllTransactions<T> {
             }
 
             // the max cost executing this transaction requires
-            let mut cumulative_cost = ancestor_tx.next_cumulative_cost() + new_blob_tx.cost();
+            let sender_cost = new_blob_tx.cost().saturating_sub(cost_credit);
+            let mut cumulative_cost = ancestor_tx.next_cumulative_cost() + sender_cost;
 
             // check if the new blob would go into overdraft
             if cumulative_cost > on_chain_balance {
@@ -1939,14 +2000,14 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
                 // check if any of descendant blob transactions should be shifted into overdraft
                 for (_, tx) in descendants {
-                    cumulative_cost += tx.transaction.cost();
+                    cumulative_cost += tx.sender_cost();
                     if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
                         // the transaction would shift
                         return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
                     }
                 }
             }
-        } else if new_blob_tx.cost() > &on_chain_balance {
+        } else if new_blob_tx.cost().saturating_sub(cost_credit) > on_chain_balance {
             // the transaction would go into overdraft
             return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
         }
@@ -1991,9 +2052,32 @@ impl<T: PoolTransaction> AllTransactions<T> {
         on_chain_balance: U256,
         on_chain_nonce: u64,
     ) -> InsertResult<T> {
+        let hash = *transaction.hash();
+        let result = self.insert_tx_inner(transaction, on_chain_balance, on_chain_nonce);
+        match &result {
+            Ok(inserted) => {
+                if let Some((replaced, _)) = &inserted.replaced_tx {
+                    self.sender_cost_overlay.on_replaced(*replaced.hash(), hash);
+                } else {
+                    self.sender_cost_overlay.on_accepted(hash);
+                }
+            }
+            Err(_) => self.sender_cost_overlay.on_rejected(hash),
+        }
+        result
+    }
+
+    fn insert_tx_inner(
+        &mut self,
+        transaction: ValidPoolTransaction<T>,
+        on_chain_balance: U256,
+        on_chain_nonce: u64,
+    ) -> InsertResult<T> {
         assert!(on_chain_nonce <= transaction.nonce(), "Invalid transaction");
 
         let mut transaction = self.ensure_valid(transaction, on_chain_nonce)?;
+        let cost_credit =
+            self.sender_cost_overlay.cost_credit(&transaction).min(*transaction.cost());
 
         let inserted_tx_id = *transaction.id();
         let mut state = TxState::default();
@@ -2016,8 +2100,12 @@ impl<T: PoolTransaction> AllTransactions<T> {
         if transaction.is_eip4844() {
             state.insert(TxState::BLOB_TRANSACTION);
 
-            transaction =
-                self.ensure_valid_blob_transaction(transaction, on_chain_balance, ancestor)?;
+            transaction = self.ensure_valid_blob_transaction(
+                transaction,
+                on_chain_balance,
+                ancestor,
+                cost_credit,
+            )?;
             let blob_fee_cap = transaction.transaction.max_fee_per_blob_gas().unwrap_or_default();
             if blob_fee_cap >= self.pending_fees.blob_fee {
                 state.insert(TxState::ENOUGH_BLOB_FEE_CAP_BLOCK);
@@ -2053,6 +2141,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
             subpool: state.into(),
             state,
             cumulative_cost,
+            cost_credit,
         };
 
         // try to insert the transaction
@@ -2216,6 +2305,7 @@ impl<T: PoolTransaction> Default for AllTransactions<T> {
             local_transactions_config: Default::default(),
             auths: Default::default(),
             metrics: Default::default(),
+            sender_cost_overlay: Arc::new(NoopSenderCostOverlay),
         }
     }
 }
@@ -2301,13 +2391,19 @@ pub(crate) struct PoolInternalTransaction<T: PoolTransaction> {
     /// This is the combined `cost` of all transactions from the same sender that currently
     /// come before this transaction.
     pub(crate) cumulative_cost: U256,
+    /// Portion of this transaction's consensus cost funded outside the sender.
+    pub(crate) cost_credit: U256,
 }
 
 // === impl PoolInternalTransaction ===
 
 impl<T: PoolTransaction> PoolInternalTransaction<T> {
+    fn sender_cost(&self) -> U256 {
+        self.transaction.cost().saturating_sub(self.cost_credit)
+    }
+
     fn next_cumulative_cost(&self) -> U256 {
-        self.cumulative_cost + self.transaction.cost()
+        self.cumulative_cost + self.sender_cost()
     }
 }
 
@@ -2339,6 +2435,98 @@ mod tests {
     };
     use alloy_consensus::{Transaction, TxType};
     use alloy_primitives::address;
+    use std::{
+        collections::HashSet,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize},
+            Mutex,
+        },
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OverlayEvent {
+        Accepted(TxHash),
+        Rejected(TxHash),
+        Replaced { old: TxHash, new: TxHash },
+        Removed(TxHash),
+        Revoked(TxHash),
+    }
+
+    #[derive(Debug, Default)]
+    struct OverlayLifecycle {
+        provisional: HashMap<TxHash, usize>,
+        live: HashSet<TxHash>,
+        events: Vec<OverlayEvent>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ValueOnlyCostOverlay {
+        lifecycle: Mutex<OverlayLifecycle>,
+        disabled: AtomicBool,
+        credit_divisor: AtomicUsize,
+    }
+
+    impl ValueOnlyCostOverlay {
+        fn begin_attempt(&self, hash: TxHash) {
+            *self.lifecycle.lock().unwrap().provisional.entry(hash).or_default() += 1;
+        }
+
+        fn finish_attempt(state: &mut OverlayLifecycle, hash: TxHash) {
+            let count = state.provisional.get_mut(&hash).expect("attempt must be provisional");
+            *count -= 1;
+            if *count == 0 {
+                state.provisional.remove(&hash);
+            }
+        }
+    }
+
+    impl SenderCostOverlay<MockTransaction> for ValueOnlyCostOverlay {
+        fn cost_credit(&self, transaction: &ValidPoolTransaction<MockTransaction>) -> U256 {
+            if !self.disabled.load(std::sync::atomic::Ordering::Relaxed) &&
+                transaction.transaction.value() == U256::from(7)
+            {
+                let full_credit =
+                    transaction.cost().saturating_sub(transaction.transaction.value());
+                full_credit /
+                    U256::from(
+                        self.credit_divisor.load(std::sync::atomic::Ordering::Relaxed).max(1),
+                    )
+            } else {
+                U256::ZERO
+            }
+        }
+
+        fn on_accepted(&self, hash: TxHash) {
+            let mut state = self.lifecycle.lock().unwrap();
+            Self::finish_attempt(&mut state, hash);
+            assert!(state.live.insert(hash), "accepted transaction must not already be live");
+            state.events.push(OverlayEvent::Accepted(hash));
+        }
+
+        fn on_rejected(&self, hash: TxHash) {
+            let mut state = self.lifecycle.lock().unwrap();
+            Self::finish_attempt(&mut state, hash);
+            state.events.push(OverlayEvent::Rejected(hash));
+        }
+
+        fn on_replaced(&self, replaced: TxHash, replacement: TxHash) {
+            let mut state = self.lifecycle.lock().unwrap();
+            Self::finish_attempt(&mut state, replacement);
+            assert!(state.live.remove(&replaced), "replaced transaction must be live");
+            assert!(state.live.insert(replacement), "replacement must not already be live");
+            state.events.push(OverlayEvent::Replaced { old: replaced, new: replacement });
+        }
+
+        fn on_removed(&self, hash: TxHash) {
+            let mut state = self.lifecycle.lock().unwrap();
+            assert!(state.live.remove(&hash), "removed transaction must be live");
+            state.events.push(OverlayEvent::Removed(hash));
+        }
+
+        fn on_revoked(&self, hash: TxHash) {
+            self.lifecycle.lock().unwrap().events.push(OverlayEvent::Revoked(hash));
+        }
+    }
 
     #[test]
     fn test_insert_blob() {
@@ -3938,6 +4126,232 @@ mod tests {
 
         assert!(pool.pending_transactions().is_empty());
         assert_eq!(3, pool.queued_transactions().len());
+    }
+
+    #[test]
+    fn sender_cost_overlay_survives_canonical_balance_update() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let tx = MockTransaction::eip1559()
+            .with_gas_price(100)
+            .with_gas_limit(21_000)
+            .with_value(U256::from(7));
+        let validated = factory.validated(tx);
+        let sender_id = validated.sender_id();
+
+        overlay.begin_attempt(*validated.hash());
+        pool.add_transaction(validated, U256::from(7), 0, None).unwrap();
+        assert_eq!(pool.pending_transactions().len(), 1);
+
+        pool.update_accounts(HashMap::from_iter([(
+            sender_id,
+            SenderInfo { state_nonce: 0, balance: U256::from(7) },
+        )]));
+
+        assert_eq!(
+            pool.pending_transactions().len(),
+            1,
+            "head updates must use the same sender-funded cost as insertion"
+        );
+        assert!(pool.queued_transactions().is_empty());
+    }
+
+    #[test]
+    fn sender_cost_overlay_funds_blob_overdraft_check() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let validated = factory.validated(
+            MockTransaction::eip4844()
+                .with_gas_price(100)
+                .with_gas_limit(21_000)
+                .with_value(U256::from(7)),
+        );
+
+        overlay.begin_attempt(*validated.hash());
+        pool.add_transaction(validated, U256::from(7), 0, None)
+            .expect("external credit must cover the blob fee portion");
+
+        assert_eq!(pool.pending_transactions().len(), 1);
+        assert!(pool.queued_transactions().is_empty());
+    }
+
+    #[test]
+    fn sender_cost_overlay_revocation_discards_live_transaction() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let validated = factory.validated(
+            MockTransaction::eip1559()
+                .with_gas_price(100)
+                .with_gas_limit(21_000)
+                .with_value(U256::from(7)),
+        );
+        overlay.begin_attempt(*validated.hash());
+        pool.add_transaction(validated.clone(), U256::from(7), 0, None).unwrap();
+
+        overlay.disabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = pool.refresh_sender_cost_overlay();
+
+        assert!(!pool.contains(validated.hash()));
+        assert_eq!(outcome.discarded.len(), 1);
+        assert_eq!(outcome.discarded[0].hash(), validated.hash());
+        assert!(overlay.lifecycle.lock().unwrap().live.is_empty());
+        assert_eq!(
+            overlay.lifecycle.lock().unwrap().events,
+            vec![
+                OverlayEvent::Accepted(*validated.hash()),
+                OverlayEvent::Revoked(*validated.hash()),
+                OverlayEvent::Removed(*validated.hash()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sender_cost_overlay_partial_credit_decrease_demotes_transaction() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let validated = factory.validated(
+            MockTransaction::eip1559()
+                .with_gas_price(100)
+                .with_gas_limit(21_000)
+                .with_value(U256::from(7)),
+        );
+        overlay.begin_attempt(*validated.hash());
+        pool.add_transaction(validated.clone(), U256::from(7), 0, None).unwrap();
+        assert_eq!(pool.pending_transactions().len(), 1);
+
+        overlay.credit_divisor.store(2, std::sync::atomic::Ordering::Relaxed);
+        let outcome = pool.refresh_sender_cost_overlay();
+
+        assert!(outcome.discarded.is_empty());
+        assert!(pool.contains(validated.hash()));
+        assert!(pool.pending_transactions().is_empty());
+        assert_eq!(pool.queued_transactions().len(), 1);
+    }
+
+    #[test]
+    fn sender_cost_overlay_accounts_mixed_sender_transactions_independently() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let sponsored = MockTransaction::eip1559()
+            .with_gas_price(100)
+            .with_gas_limit(21_000)
+            .with_value(U256::from(7));
+        let unsponsored = sponsored.clone().next().with_value(U256::from(3));
+        let sponsored = factory.validated(sponsored);
+        let unsponsored = factory.validated(unsponsored);
+        let sender_balance = U256::from(7 + 3 + 100 * 21_000);
+
+        overlay.begin_attempt(*sponsored.hash());
+        pool.add_transaction(sponsored, sender_balance, 0, None).unwrap();
+        overlay.begin_attempt(*unsponsored.hash());
+        pool.add_transaction(unsponsored, sender_balance, 0, None).unwrap();
+
+        assert_eq!(pool.pending_transactions().len(), 2);
+        assert!(pool.queued_transactions().is_empty());
+    }
+
+    #[test]
+    fn sender_cost_overlay_distinguishes_attempts_from_live_transactions() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let original = MockTransaction::eip1559()
+            .with_gas_price(100)
+            .with_gas_limit(21_000)
+            .with_value(U256::from(7));
+        let original = factory.validated(original.clone());
+        let underpriced = factory.validated(original.transaction.clone().rng_hash());
+        let replacement =
+            factory.validated(original.transaction.clone().rng_hash().with_gas_price(200));
+
+        overlay.begin_attempt(*original.hash());
+        pool.add_transaction(original.clone(), U256::from(7), 0, None).unwrap();
+
+        overlay.begin_attempt(*original.hash());
+        assert!(matches!(
+            pool.add_transaction(original.clone(), U256::from(7), 0, None),
+            Err(PoolError { kind: PoolErrorKind::AlreadyImported, .. })
+        ));
+
+        overlay.begin_attempt(*underpriced.hash());
+        assert!(matches!(
+            pool.add_transaction(underpriced.clone(), U256::from(7), 0, None),
+            Err(PoolError { kind: PoolErrorKind::ReplacementUnderpriced, .. })
+        ));
+        overlay.begin_attempt(*replacement.hash());
+        pool.add_transaction(replacement.clone(), U256::from(7), 0, None).unwrap();
+        pool.remove_transaction(replacement.id());
+
+        let state = overlay.lifecycle.lock().unwrap();
+        assert!(state.provisional.is_empty());
+        assert!(state.live.is_empty());
+        assert_eq!(
+            state.events,
+            vec![
+                OverlayEvent::Accepted(*original.hash()),
+                OverlayEvent::Rejected(*original.hash()),
+                OverlayEvent::Rejected(*underpriced.hash()),
+                OverlayEvent::Replaced { old: *original.hash(), new: *replacement.hash() },
+                OverlayEvent::Removed(*replacement.hash()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sender_cost_overlay_observes_each_internal_removal_once() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut all =
+            AllTransactions::new_with_sender_cost_overlay(&PoolConfig::default(), overlay.clone());
+        let mut factory = MockTransactionFactory::default();
+        let by_hash = factory.validated(MockTransaction::eip1559().with_value(U256::from(7)));
+        let by_id = factory.validated(MockTransaction::eip1559().with_value(U256::from(7)));
+        let direct = factory.validated(MockTransaction::eip1559().with_value(U256::from(7)));
+
+        for transaction in [&by_hash, &by_id, &direct] {
+            overlay.begin_attempt(*transaction.hash());
+            all.insert_tx(transaction.clone(), U256::MAX, 0).unwrap();
+        }
+
+        all.remove_transaction_by_hash(by_hash.hash()).expect("transaction must be live");
+        all.remove_transaction_by_id(by_id.id()).expect("transaction must be live");
+        all.remove_transaction(direct.id()).expect("transaction must be live");
+
+        let state = overlay.lifecycle.lock().unwrap();
+        assert!(state.provisional.is_empty());
+        assert!(state.live.is_empty());
+        assert_eq!(
+            state.events.iter().filter(|event| matches!(event, OverlayEvent::Removed(_))).count(),
+            3
+        );
     }
 
     #[test]

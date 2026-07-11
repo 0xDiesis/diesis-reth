@@ -102,7 +102,7 @@ use rustc_hash::FxHashMap;
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -110,7 +110,9 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 mod events;
-pub use best::{BestTransactionFilter, BestTransactionsWithPrioritizedSenders};
+pub use best::{
+    BestTransactionFilter, BestTransactionsWithPrioritizedSenders, RefreshGuardedBestTransactions,
+};
 pub use blob::{blob_tx_priority, fee_delta, BlobOrd, BlobTransactions};
 pub use events::{FullTransactionEvent, NewTransactionEvent, TransactionEvent};
 pub use listener::{AllTransactionsEvents, TransactionEvents, TransactionListenerKind};
@@ -149,6 +151,10 @@ where
     blob_store: S,
     /// The internal pool that manages all transactions.
     pool: RwLock<TxPool<T>>,
+    /// Serializes custom sender-cost publication with admission and best-transaction snapshots.
+    sender_cost_refresh_gate: Option<RwLock<()>>,
+    /// Invalidates already-created best-transaction snapshots across sender-cost refreshes.
+    sender_cost_refresh_generation: Option<Arc<AtomicU64>>,
     /// Pool settings.
     config: PoolConfig,
     /// Manages listeners for transaction state change events.
@@ -175,12 +181,48 @@ where
 {
     /// Create a new transaction pool instance.
     pub fn new(validator: V, ordering: T, blob_store: S, config: PoolConfig) -> Self {
+        Self::new_inner(
+            validator,
+            ordering,
+            blob_store,
+            config,
+            Arc::new(crate::NoopSenderCostOverlay),
+            false,
+        )
+    }
+
+    /// Create pool internals with a policy-free sender-cost overlay.
+    pub fn new_with_sender_cost_overlay(
+        validator: V,
+        ordering: T,
+        blob_store: S,
+        config: PoolConfig,
+        sender_cost_overlay: Arc<dyn crate::SenderCostOverlay<T::Transaction>>,
+    ) -> Self {
+        Self::new_inner(validator, ordering, blob_store, config, sender_cost_overlay, true)
+    }
+
+    fn new_inner(
+        validator: V,
+        ordering: T,
+        blob_store: S,
+        config: PoolConfig,
+        sender_cost_overlay: Arc<dyn crate::SenderCostOverlay<T::Transaction>>,
+        gate_sender_cost_refresh: bool,
+    ) -> Self {
         Self {
             identifiers: Default::default(),
             validator,
             event_listener: Default::default(),
             has_event_listeners: AtomicBool::new(false),
-            pool: RwLock::new(TxPool::new(ordering, config.clone())),
+            pool: RwLock::new(TxPool::new_with_sender_cost_overlay(
+                ordering,
+                config.clone(),
+                sender_cost_overlay,
+            )),
+            sender_cost_refresh_gate: gate_sender_cost_refresh.then(RwLock::default),
+            sender_cost_refresh_generation: gate_sender_cost_refresh
+                .then(|| Arc::new(AtomicU64::new(0))),
             pending_transaction_listener: Default::default(),
             transaction_listener: Default::default(),
             blob_transaction_sidecar_listener: Default::default(),
@@ -531,23 +573,43 @@ where
         let CanonicalStateUpdate {
             new_tip, changed_accounts, mined_transactions, update_kind, ..
         } = update;
-        self.validator.on_new_head_block(new_tip);
-
-        let changed_senders = self.changed_senders(changed_accounts.into_iter());
-
-        // update the pool
-        let outcome = self.pool.write().on_canonical_state_change(
-            block_info,
-            mined_transactions,
-            changed_senders,
-            update_kind,
-        );
+        let (outcome, overlay_outcome) = {
+            // Custom sender-cost state must be published atomically with the canonical mutation:
+            // admission and best-transaction snapshots take the read side of this gate.
+            let _refresh_guard = self.sender_cost_refresh_gate.as_ref().map(RwLock::write);
+            if let Some(generation) = self.sender_cost_refresh_generation.as_ref() {
+                // Odd generations invalidate snapshots immediately while refresh is in flight.
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+            self.validator.on_new_head_block(new_tip);
+            let changed_senders = self.changed_senders(changed_accounts.into_iter());
+            let outcome = self.pool.write().on_canonical_state_change(
+                block_info,
+                mined_transactions,
+                changed_senders,
+                update_kind,
+            );
+            let overlay_outcome = self
+                .validator
+                .on_new_head_block_after_pool_update(new_tip)
+                .then(|| self.pool.write().refresh_sender_cost_overlay());
+            if let Some(generation) = self.sender_cost_refresh_generation.as_ref() {
+                // Publish the next stable (even) generation before releasing the admission gate.
+                generation.fetch_add(1, Ordering::Release);
+            }
+            (outcome, overlay_outcome)
+        };
 
         // This will discard outdated transactions based on the account's nonce
         self.delete_discarded_blobs(outcome.discarded.iter());
 
         // notify listeners about updates
         self.notify_on_new_state(outcome);
+
+        if let Some(UpdateOutcome { promoted, discarded }) = overlay_outcome {
+            self.delete_discarded_blobs(discarded.iter());
+            self.notify_on_transaction_updates(promoted, discarded);
+        }
     }
 
     /// Performs account updates on the pool.
@@ -668,6 +730,7 @@ where
             Item = (TransactionOrigin, TransactionValidationOutcome<T::Transaction>),
         >,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+        let _refresh_guard = self.sender_cost_refresh_gate.as_ref().map(RwLock::read);
         // Collect results and metadata while holding the pool write lock
         let (mut results, added_metas, discarded) = {
             let mut pool = self.pool.write();
@@ -1001,8 +1064,13 @@ where
     }
 
     /// Returns an iterator that yields transactions that are ready to be included in the block.
-    pub fn best_transactions(&self) -> BestTransactions<T> {
-        self.get_pool_data().best_transactions()
+    pub fn best_transactions(&self) -> RefreshGuardedBestTransactions<BestTransactions<T>> {
+        let _refresh_guard = self.sender_cost_refresh_gate.as_ref().map(RwLock::read);
+        let generation = self.sender_cost_refresh_generation.as_ref().map(|generation| {
+            let captured = generation.load(Ordering::Acquire);
+            (generation.clone(), captured)
+        });
+        RefreshGuardedBestTransactions::new(self.get_pool_data().best_transactions(), generation)
     }
 
     /// Returns an iterator that yields transactions that are ready to be included in the block with
@@ -1012,7 +1080,15 @@ where
         best_transactions_attributes: BestTransactionsAttributes,
     ) -> Box<dyn crate::traits::BestTransactions<Item = Arc<ValidPoolTransaction<T::Transaction>>>>
     {
-        self.get_pool_data().best_transactions_with_attributes(best_transactions_attributes)
+        let _refresh_guard = self.sender_cost_refresh_gate.as_ref().map(RwLock::read);
+        let generation = self.sender_cost_refresh_generation.as_ref().map(|generation| {
+            let captured = generation.load(Ordering::Acquire);
+            (generation.clone(), captured)
+        });
+        Box::new(RefreshGuardedBestTransactions::new(
+            self.get_pool_data().best_transactions_with_attributes(best_transactions_attributes),
+            generation,
+        ))
     }
 
     /// Returns only the first `max` transactions in the pending pool.
@@ -1643,13 +1719,224 @@ mod tests {
     use crate::{
         blobstore::{BlobStore, InMemoryBlobStore},
         identifier::SenderId,
-        test_utils::{MockTransaction, TestPoolBuilder},
+        noop::MockTransactionValidator,
+        test_utils::{MockOrdering, MockTransaction, TestPoolBuilder},
         validate::ValidTransaction,
-        BlockInfo, PoolConfig, SubPoolLimit, TransactionOrigin, TransactionValidationOutcome, U256,
+        BlockInfo, CanonicalStateUpdate, Pool, PoolConfig, PoolTransaction, PoolUpdateKind,
+        SenderCostOverlay, SubPoolLimit, TransactionOrigin, TransactionPool,
+        TransactionValidationOutcome, TransactionValidator, ValidPoolTransaction, U256,
     };
+    use alloy_consensus::Transaction;
     use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
-    use alloy_primitives::Address;
-    use std::{fs, path::PathBuf};
+    use alloy_primitives::{Address, B256};
+    use reth_primitives_traits::Block as _;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Barrier, Mutex,
+        },
+        time::Duration,
+    };
+
+    #[derive(Debug, Default)]
+    struct RecordingOverlay {
+        events: Mutex<Vec<(&'static str, B256)>>,
+        disabled: AtomicBool,
+    }
+
+    impl SenderCostOverlay<MockTransaction> for RecordingOverlay {
+        fn cost_credit(&self, transaction: &ValidPoolTransaction<MockTransaction>) -> U256 {
+            if !self.disabled.load(Ordering::Acquire) &&
+                transaction.transaction.value() == U256::from(7)
+            {
+                transaction.cost().saturating_sub(transaction.transaction.value())
+            } else {
+                U256::ZERO
+            }
+        }
+
+        fn on_accepted(&self, hash: B256) {
+            self.events.lock().unwrap().push(("accepted", hash));
+        }
+
+        fn on_rejected(&self, hash: B256) {
+            self.events.lock().unwrap().push(("rejected", hash));
+        }
+
+        fn on_removed(&self, hash: B256) {
+            self.events.lock().unwrap().push(("removed", hash));
+        }
+
+        fn on_revoked(&self, hash: B256) {
+            self.events.lock().unwrap().push(("revoked", hash));
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingHeadValidator {
+        overlay: Arc<RecordingOverlay>,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl TransactionValidator for BlockingHeadValidator {
+        type Transaction = MockTransaction;
+        type Block = reth_ethereum_primitives::Block;
+
+        async fn validate_transaction(
+            &self,
+            origin: TransactionOrigin,
+            transaction: Self::Transaction,
+        ) -> TransactionValidationOutcome<Self::Transaction> {
+            TransactionValidationOutcome::Valid {
+                balance: U256::from(7),
+                state_nonce: 0,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(transaction),
+                propagate: origin.is_external(),
+                authorities: None,
+            }
+        }
+
+        fn on_new_head_block_after_pool_update(
+            &self,
+            _new_tip_block: &reth_primitives_traits::SealedBlock<Self::Block>,
+        ) -> bool {
+            self.overlay.disabled.store(true, Ordering::Release);
+            self.entered.wait();
+            self.release.wait();
+            true
+        }
+    }
+
+    #[test]
+    fn capacity_eviction_reports_accepted_then_removed_in_one_admission() {
+        let overlay = Arc::new(RecordingOverlay::default());
+        let pool = Pool::new_with_sender_cost_overlay(
+            MockTransactionValidator::default(),
+            MockOrdering::default(),
+            InMemoryBlobStore::default(),
+            PoolConfig { pending_limit: SubPoolLimit::new(0, usize::MAX), ..Default::default() },
+            overlay.clone(),
+        );
+        let transaction = MockTransaction::eip1559();
+        let hash = *transaction.hash();
+        let result = pool.inner().add_transactions(
+            TransactionOrigin::External,
+            [TransactionValidationOutcome::Valid {
+                balance: U256::MAX,
+                state_nonce: 0,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(transaction),
+                propagate: true,
+                authorities: None,
+            }],
+        );
+
+        assert!(result[0].is_err(), "capacity-evicted insertion must be reported as discarded");
+        assert_eq!(*overlay.events.lock().unwrap(), vec![("accepted", hash), ("removed", hash)]);
+    }
+
+    #[test]
+    fn canonical_overlay_refresh_gates_admission_and_best_selection() {
+        let overlay = Arc::new(RecordingOverlay::default());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let validator = BlockingHeadValidator {
+            overlay: overlay.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+        let pool = Arc::new(Pool::new_with_sender_cost_overlay(
+            validator,
+            MockOrdering::default(),
+            InMemoryBlobStore::default(),
+            Default::default(),
+            overlay.clone(),
+        ));
+        let live = MockTransaction::eip1559()
+            .with_gas_price(100)
+            .with_gas_limit(21_000)
+            .with_value(U256::from(7));
+        pool.inner().add_transactions(
+            TransactionOrigin::External,
+            [TransactionValidationOutcome::Valid {
+                balance: U256::from(7),
+                state_nonce: 0,
+                bytecode_hash: None,
+                transaction: ValidTransaction::Valid(live.clone()),
+                propagate: true,
+                authorities: None,
+            }],
+        )[0]
+        .as_ref()
+        .expect("initial sponsored transaction must be live");
+        let mut stale_snapshot = pool.inner().best_transactions();
+
+        let canonical_pool = pool.clone();
+        let canonical = std::thread::spawn(move || {
+            let new_tip = reth_ethereum_primitives::Block::default().seal_slow();
+            canonical_pool.inner().on_canonical_state_change(CanonicalStateUpdate {
+                new_tip: &new_tip,
+                pending_block_base_fee: 0,
+                pending_block_blob_fee: None,
+                changed_accounts: Vec::new(),
+                mined_transactions: Vec::new(),
+                update_kind: PoolUpdateKind::Commit,
+            });
+        });
+        entered.wait();
+
+        let candidate = live.next().with_value(U256::from(7));
+        let candidate_hash = *candidate.hash();
+        let admission_pool = pool.clone();
+        let (admission_tx, admission_rx) = mpsc::channel();
+        let admission = std::thread::spawn(move || {
+            let result = admission_pool.inner().add_transactions(
+                TransactionOrigin::External,
+                [TransactionValidationOutcome::Valid {
+                    balance: U256::from(7),
+                    state_nonce: 0,
+                    bytecode_hash: None,
+                    transaction: ValidTransaction::Valid(candidate),
+                    propagate: true,
+                    authorities: None,
+                }],
+            );
+            admission_tx.send(result[0].is_err()).unwrap();
+        });
+        let selection_pool = pool.clone();
+        let (selection_tx, selection_rx) = mpsc::channel();
+        let selection = std::thread::spawn(move || {
+            selection_tx.send(selection_pool.inner().best_transactions().next().is_none()).unwrap();
+        });
+
+        assert!(admission_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(selection_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release.wait();
+
+        canonical.join().unwrap();
+        admission.join().unwrap();
+        selection.join().unwrap();
+        assert!(admission_rx.recv().unwrap(), "stale sponsored admission must be rejected");
+        assert!(selection_rx.recv().unwrap(), "revoked transaction must not be selected");
+        assert!(
+            stale_snapshot.next().is_none(),
+            "an iterator captured before refresh must stop at the new generation"
+        );
+        assert!(!pool.contains(live.hash()));
+        assert_eq!(
+            *overlay.events.lock().unwrap(),
+            vec![
+                ("accepted", *live.hash()),
+                ("revoked", *live.hash()),
+                ("removed", *live.hash()),
+                ("rejected", candidate_hash),
+            ]
+        );
+    }
 
     #[test]
     fn test_discard_blobs_on_blob_tx_eviction() {

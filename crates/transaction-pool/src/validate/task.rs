@@ -319,6 +319,13 @@ where
     fn on_new_head_block(&self, new_tip_block: &SealedBlock<Self::Block>) {
         self.validator.on_new_head_block(new_tip_block)
     }
+
+    fn on_new_head_block_after_pool_update(
+        &self,
+        new_tip_block: &SealedBlock<Self::Block>,
+    ) -> bool {
+        self.validator.on_new_head_block_after_pool_update(new_tip_block)
+    }
 }
 
 #[cfg(test)]

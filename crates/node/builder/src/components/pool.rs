@@ -7,10 +7,10 @@ use reth_chainspec::EthereumHardforks;
 use reth_node_api::{BlockTy, NodeTypes, TxTy};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, BlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction,
-    SubPoolLimit, TransactionOrdering, TransactionPool, TransactionValidationTaskExecutor,
-    TransactionValidator,
+    SenderCostOverlay, SubPoolLimit, TransactionOrdering, TransactionPool,
+    TransactionValidationTaskExecutor, TransactionValidator,
 };
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 /// A type that knows how to build the transaction pool.
 pub trait PoolBuilder<Node: FullNodeTypes, Evm>: Send {
@@ -180,6 +180,37 @@ where
             blob_store,
             pool_config,
         )
+    }
+
+    /// Build a transaction pool with a policy-free sender-cost overlay and spawn maintenance
+    /// tasks.
+    pub fn build_with_sender_cost_overlay_and_spawn_maintenance_task<BS>(
+        self,
+        blob_store: BS,
+        pool_config: PoolConfig,
+        sender_cost_overlay: Arc<dyn SenderCostOverlay<V::Transaction>>,
+    ) -> eyre::Result<
+        reth_transaction_pool::Pool<
+            TransactionValidationTaskExecutor<V>,
+            CoinbaseTipOrdering<V::Transaction>,
+            BS,
+        >,
+    >
+    where
+        BS: BlobStore,
+    {
+        let TxPoolBuilder { ctx, validator, .. } = self;
+        let transaction_pool = reth_transaction_pool::Pool::new_with_sender_cost_overlay(
+            validator,
+            CoinbaseTipOrdering::default(),
+            blob_store,
+            pool_config.clone(),
+            sender_cost_overlay,
+        );
+
+        spawn_maintenance_tasks(ctx, transaction_pool.clone(), &pool_config)?;
+
+        Ok(transaction_pool)
     }
 
     /// Build the transaction pool with a custom [`TransactionOrdering`] and spawn its maintenance

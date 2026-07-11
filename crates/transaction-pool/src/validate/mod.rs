@@ -237,6 +237,17 @@ pub trait TransactionValidator: Debug + Send + Sync {
     ///
     /// This can be used to update fork specific values (timestamp).
     fn on_new_head_block(&self, _new_tip_block: &SealedBlock<Self::Block>) {}
+
+    /// Invoked after the canonical pool update releases its write lock.
+    ///
+    /// Implementations may perform bounded maintenance that must not run recursively under the
+    /// pool lock. Sender-cost overlays are refreshed once this callback returns.
+    fn on_new_head_block_after_pool_update(
+        &self,
+        _new_tip_block: &SealedBlock<Self::Block>,
+    ) -> bool {
+        false
+    }
 }
 
 impl<A, B> TransactionValidator for Either<A, B>
@@ -273,6 +284,16 @@ where
         match self {
             Self::Left(v) => v.on_new_head_block(new_tip_block),
             Self::Right(v) => v.on_new_head_block(new_tip_block),
+        }
+    }
+
+    fn on_new_head_block_after_pool_update(
+        &self,
+        new_tip_block: &SealedBlock<Self::Block>,
+    ) -> bool {
+        match self {
+            Self::Left(v) => v.on_new_head_block_after_pool_update(new_tip_block),
+            Self::Right(v) => v.on_new_head_block_after_pool_update(new_tip_block),
         }
     }
 }

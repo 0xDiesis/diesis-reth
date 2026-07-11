@@ -86,6 +86,60 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+
+/// Policy-free extension for transaction types whose sender-funded pool cost
+/// differs from their consensus maximum cost.
+///
+/// The default implementation returns no credit and preserves Ethereum pool
+/// behavior. Implementations must never fabricate an on-chain balance; the
+/// credit is used only by internal cumulative-solvency accounting.
+pub trait SenderCostOverlay<T: PoolTransaction>: core::fmt::Debug + Send + Sync + 'static {
+    /// Amount of `transaction.cost()` funded outside the sender account.
+    fn cost_credit(&self, _transaction: &ValidPoolTransaction<T>) -> U256 {
+        U256::ZERO
+    }
+
+    /// Called after an admission attempt is accepted into the pool.
+    ///
+    /// Lifecycle callbacks execute synchronously while the pool write lock is held. Implementations
+    /// must not block, re-enter the pool, or call any pool method.
+    fn on_accepted(&self, _hash: TxHash) {}
+
+    /// Called when an admission attempt is rejected. This rolls back only the provisional attempt;
+    /// an already-live transaction with the same hash must remain live.
+    ///
+    /// Lifecycle callbacks execute synchronously while the pool write lock is held. Implementations
+    /// must not block, re-enter the pool, or call any pool method.
+    fn on_rejected(&self, _hash: TxHash) {}
+
+    /// Atomically replace one accepted transaction with another accepted admission attempt.
+    ///
+    /// Lifecycle callbacks execute synchronously while the pool write lock is held. Implementations
+    /// must not block, re-enter the pool, or call any pool method.
+    fn on_replaced(&self, _replaced: TxHash, _replacement: TxHash) {}
+
+    /// Called when an accepted transaction leaves the pool.
+    ///
+    /// This may immediately follow [`Self::on_accepted`] when capacity enforcement evicts the
+    /// just-inserted transaction. The callback is reason-agnostic; overlays that need to observe
+    /// sender-cost revocation separately should implement [`Self::on_revoked`].
+    ///
+    /// Lifecycle callbacks execute synchronously while the pool write lock is held. Implementations
+    /// must not block, re-enter the pool, or call any pool method.
+    fn on_removed(&self, _hash: TxHash) {}
+
+    /// Called immediately before an accepted transaction is removed because its previously
+    /// positive external cost credit became zero during canonical-head refresh.
+    ///
+    /// [`Self::on_removed`] follows exactly once for the same hash.
+    fn on_revoked(&self, _hash: TxHash) {}
+}
+
+/// Ethereum-compatible no-op sender-cost overlay.
+#[derive(Debug, Default)]
+pub struct NoopSenderCostOverlay;
+
+impl<T: PoolTransaction> SenderCostOverlay<T> for NoopSenderCostOverlay {}
 use tokio::sync::mpsc::Receiver;
 
 /// The `PeerId` type.

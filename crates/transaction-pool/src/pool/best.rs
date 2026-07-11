@@ -11,12 +11,62 @@ use imbl::OrdMap;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::broadcast::{error::TryRecvError, Receiver};
 use tracing::debug;
 
 const MAX_NEW_TRANSACTIONS_PER_BATCH: usize = 16;
+
+/// Stops a best-transaction snapshot once sender-cost state advances to a new generation.
+#[derive(Debug)]
+pub struct RefreshGuardedBestTransactions<I> {
+    inner: I,
+    generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl<I> RefreshGuardedBestTransactions<I> {
+    pub(crate) const fn new(inner: I, generation: Option<(Arc<AtomicU64>, u64)>) -> Self {
+        Self { inner, generation }
+    }
+
+    fn is_current(&self) -> bool {
+        self.generation
+            .as_ref()
+            .is_none_or(|(generation, captured)| generation.load(Ordering::Acquire) == *captured)
+    }
+}
+
+impl<I: Iterator> Iterator for RefreshGuardedBestTransactions<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.is_current().then(|| self.inner.next()).flatten()
+    }
+}
+
+impl<I: crate::traits::BestTransactions> crate::traits::BestTransactions
+    for RefreshGuardedBestTransactions<I>
+{
+    fn mark_invalid(&mut self, tx: &Self::Item, kind: &InvalidPoolTransactionError) {
+        self.inner.mark_invalid(tx, kind)
+    }
+
+    fn no_updates(&mut self) {
+        self.inner.no_updates()
+    }
+
+    fn skip_blobs(&mut self) {
+        self.inner.skip_blobs()
+    }
+
+    fn set_skip_blobs(&mut self, skip_blobs: bool) {
+        self.inner.set_skip_blobs(skip_blobs)
+    }
+}
 
 /// An iterator that returns transactions that can be executed on the current state (*best*
 /// transactions).

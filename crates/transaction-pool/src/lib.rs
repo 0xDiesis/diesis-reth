@@ -364,6 +364,25 @@ where
         Self { pool: Arc::new(PoolInner::new(validator, ordering, blob_store, config)) }
     }
 
+    /// Create a transaction pool with a policy-free sender-cost overlay.
+    pub fn new_with_sender_cost_overlay(
+        validator: V,
+        ordering: T,
+        blob_store: S,
+        config: PoolConfig,
+        sender_cost_overlay: Arc<dyn SenderCostOverlay<T::Transaction>>,
+    ) -> Self {
+        Self {
+            pool: Arc::new(PoolInner::new_with_sender_cost_overlay(
+                validator,
+                ordering,
+                blob_store,
+                config,
+                sender_cost_overlay,
+            )),
+        }
+    }
+
     /// Returns the wrapped pool internals.
     pub fn inner(&self) -> &PoolInner<V, T, S> {
         &self.pool
