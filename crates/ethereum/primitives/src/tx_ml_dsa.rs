@@ -750,6 +750,53 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "invalid TxMlDsa compact payload header")]
+    fn compact_rejects_non_list_header() {
+        use reth_codecs::Compact;
+
+        let mut encoded = Vec::new();
+        Header { list: false, payload_length: 0 }.encode(&mut encoded);
+        let _ = TxMlDsa::from_compact(&encoded, encoded.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid TxMlDsa compact header")]
+    fn compact_rejects_truncated_rlp_payload() {
+        use reth_codecs::Compact;
+
+        let tx = sample_tx();
+        let mut original = Vec::new();
+        tx.to_compact(&mut original);
+        let mut body = original.as_slice();
+        let header = Header::decode(&mut body).expect("valid compact header");
+
+        let mut malformed = Vec::new();
+        Header { list: true, payload_length: header.payload_length + 1 }.encode(&mut malformed);
+        malformed.extend_from_slice(body);
+
+        let _ = TxMlDsa::from_compact(&malformed, malformed.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "TxMlDsa compact decode left trailing field bytes")]
+    fn compact_rejects_header_payload_length_mismatch() {
+        use reth_codecs::Compact;
+
+        let tx = sample_tx();
+        let mut original = Vec::new();
+        tx.to_compact(&mut original);
+        let mut body = original.as_slice();
+        let header = Header::decode(&mut body).expect("valid compact header");
+
+        let mut malformed = Vec::new();
+        Header { list: true, payload_length: header.payload_length + 1 }.encode(&mut malformed);
+        malformed.extend_from_slice(body);
+        malformed.push(0);
+
+        let _ = TxMlDsa::from_compact(&malformed, malformed.len());
+    }
+
+    #[test]
     fn tx_hash_matches_keccak_of_encoded() {
         let tx = sample_tx();
 

@@ -412,7 +412,7 @@ impl TransactionSigned {
         keccak256(self.encoded_2718())
     }
 
-    fn canonical_signature(transaction: &Transaction, signature: Signature) -> Signature {
+    const fn canonical_signature(transaction: &Transaction, signature: Signature) -> Signature {
         if matches!(transaction, Transaction::MlDsa(_)) {
             ml_dsa_dummy_signature()
         } else {
@@ -453,7 +453,7 @@ impl TransactionSigned {
     }
 
     /// Creates a new signed transaction and lazily computes the hash on first access.
-    pub fn new_unhashed(transaction: Transaction, signature: Signature) -> Self {
+    pub const fn new_unhashed(transaction: Transaction, signature: Signature) -> Self {
         let signature = Self::canonical_signature(&transaction, signature);
         Self { hash: OnceLock::new(), signature, transaction }
     }
@@ -922,7 +922,7 @@ impl Encodable2718 for TransactionSigned {
     }
 }
 
-fn ml_dsa_dummy_signature() -> Signature {
+const fn ml_dsa_dummy_signature() -> Signature {
     Signature::new(U256::ZERO, U256::ZERO, false)
 }
 

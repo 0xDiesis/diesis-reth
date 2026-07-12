@@ -133,11 +133,7 @@ impl reth_codecs::Compact for DiesisTxType {
             Self::Legacy => reth_codecs::txtype::COMPACT_IDENTIFIER_LEGACY,
             Self::Eip2930 => reth_codecs::txtype::COMPACT_IDENTIFIER_EIP2930,
             Self::Eip1559 => reth_codecs::txtype::COMPACT_IDENTIFIER_EIP1559,
-            Self::Eip7702 | Self::MlDsa => {
-                buf.put_u8(self.ty());
-                reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG
-            }
-            Self::Eip4844 => {
+            Self::Eip4844 | Self::Eip7702 | Self::MlDsa => {
                 buf.put_u8(self.ty());
                 reth_codecs::txtype::COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
