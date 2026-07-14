@@ -53,6 +53,7 @@ use reth_primitives_traits::{
     Block, GotExpected, GotExpectedBoxed, NodePrimitives, RecoveredBlock, SealedBlock,
     SealedHeader,
 };
+use reth_storage_api::StateProvider;
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -124,6 +125,15 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
 /// `HeaderValidator` is a protocol that validates headers and their relationships.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
+    /// Whether engine validation must supply an exact parent-state snapshot.
+    ///
+    /// The default keeps ordinary consensus implementations on the existing
+    /// header-only validation path without cloning or eagerly converting a
+    /// payload. State-dependent consensus implementations opt in explicitly.
+    fn requires_parent_state_validation(&self) -> bool {
+        false
+    }
+
     /// Validate if header is correct and follows consensus specification.
     ///
     /// This is called on standalone header to check if all hashes are correct.
@@ -144,6 +154,20 @@ pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
         header: &SealedHeader<H>,
         parent: &SealedHeader<H>,
     ) -> Result<(), ConsensusError>;
+
+    /// Validate a header against its parent using the exact parent-state snapshot.
+    ///
+    /// Engine-tree validation calls this hook when the parent may live only in
+    /// an in-memory fork overlay. Consensus implementations whose rules do not
+    /// depend on parent state inherit the ordinary parent-header validation.
+    fn validate_header_against_parent_with_state(
+        &self,
+        header: &SealedHeader<H>,
+        parent: &SealedHeader<H>,
+        _parent_state: &dyn StateProvider,
+    ) -> Result<(), ConsensusError> {
+        self.validate_header_against_parent(header, parent)
+    }
 
     /// Validates the given headers
     ///
