@@ -429,15 +429,18 @@ where
                     }
                 }
             };
+        let mut prevalidated_block = None;
 
         /// A helper macro that returns the block in case there was an error
-        /// This macro is used for early returns before block conversion
         macro_rules! ensure_ok {
             ($expr:expr) => {
                 match $expr {
                     Ok(val) => val,
                     Err(e) => {
-                        let block = convert_to_block(input)?;
+                        let block = match prevalidated_block.take() {
+                            Some(block) => block,
+                            None => convert_to_block(input)?,
+                        };
                         return Err(InsertBlockError::new(block, e.into()).into());
                     }
                 }
@@ -488,7 +491,6 @@ where
         };
 
         let parent_state_validated = self.consensus.requires_parent_state_validation();
-        let mut prevalidated_block = None;
         if parent_state_validated {
             let block = convert_to_block(input.clone())?;
             if let Err(consensus_err) = self.consensus.validate_header(block.sealed_header()) {

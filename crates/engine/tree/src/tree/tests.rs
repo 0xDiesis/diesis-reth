@@ -3,7 +3,7 @@ use crate::{
     engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest},
     persistence::PersistenceAction,
     tree::{
-        payload_validator::{BasicEngineValidator, TreeCtx, ValidationOutcome},
+        payload_validator::{BasicEngineValidator, BlockOrPayload, TreeCtx, ValidationOutcome},
         persistence_state::CurrentPersistenceAction,
         PersistTarget, TreeConfig,
     },
@@ -18,7 +18,7 @@ use alloy_primitives::{
 };
 use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{
-    ExecutionData, ExecutionPayloadSidecar, ExecutionPayloadV1, ForkchoiceState,
+    ExecutionData, ExecutionPayloadSidecar, ExecutionPayloadV1, ExecutionPayloadV4, ForkchoiceState,
 };
 use assert_matches::assert_matches;
 use reth_chain_state::{test_utils::TestBlockBuilder, BlockState, ComputedTrieData};
@@ -149,8 +149,16 @@ async fn direct_executed_block_acknowledges_valid_child_after_insertion() {
 }
 
 /// Mock engine validator for tests
-#[derive(Debug, Clone)]
-struct MockEngineValidator;
+#[derive(Debug, Clone, Default)]
+struct MockEngineValidator {
+    conversion_calls: Option<Arc<AtomicUsize>>,
+}
+
+impl MockEngineValidator {
+    fn with_conversion_counter(conversion_calls: Arc<AtomicUsize>) -> Self {
+        Self { conversion_calls: Some(conversion_calls) }
+    }
+}
 
 impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineValidator {
     type Block = Block;
@@ -162,6 +170,9 @@ impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineVali
         reth_primitives_traits::SealedBlock<Self::Block>,
         reth_payload_primitives::NewPayloadError,
     > {
+        if let Some(conversion_calls) = &self.conversion_calls {
+            conversion_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let block = reth_ethereum_primitives::Block::try_from(payload.payload).map_err(|e| {
             reth_payload_primitives::NewPayloadError::Other(format!("{e:?}").into())
         })?;
@@ -289,7 +300,7 @@ impl TestHarness {
 
         let provider = MockEthProvider::default();
 
-        let payload_validator = MockEngineValidator;
+        let payload_validator = MockEngineValidator::default();
 
         let (from_tree_tx, from_tree_rx) = unbounded_channel();
 
@@ -511,7 +522,7 @@ impl ValidatorTestHarness {
 
         // Create validator identical to the one in TestHarness.
         let provider = harness.provider.clone();
-        let payload_validator = MockEngineValidator;
+        let payload_validator = MockEngineValidator::default();
         let evm_config = MockEvmConfig::default();
         let changeset_cache = ChangesetCache::new();
 
@@ -613,6 +624,42 @@ fn validate_block_with_real_provider(
     canonical_head: BlockNumHash,
     block: SealedBlock<Block>,
 ) -> ValidationOutcome<EthPrimitives> {
+    validate_input_with_real_provider(
+        chain_spec,
+        consensus,
+        unpersisted_blocks,
+        canonical_head,
+        BlockOrPayload::Block(block),
+        MockEngineValidator::default(),
+    )
+}
+
+fn validate_payload_with_real_provider(
+    chain_spec: Arc<ChainSpec>,
+    consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    unpersisted_blocks: Vec<ExecutedBlock>,
+    canonical_head: BlockNumHash,
+    payload: ExecutionData,
+    payload_validator: MockEngineValidator,
+) -> ValidationOutcome<EthPrimitives> {
+    validate_input_with_real_provider(
+        chain_spec,
+        consensus,
+        unpersisted_blocks,
+        canonical_head,
+        BlockOrPayload::Payload(payload),
+        payload_validator,
+    )
+}
+
+fn validate_input_with_real_provider(
+    chain_spec: Arc<ChainSpec>,
+    consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    unpersisted_blocks: Vec<ExecutedBlock>,
+    canonical_head: BlockNumHash,
+    input: BlockOrPayload<EthEngineTypes>,
+    payload_validator: MockEngineValidator,
+) -> ValidationOutcome<EthPrimitives> {
     let mut tree_harness =
         ValidatorTestHarness::new_with_consensus(Arc::clone(&chain_spec), Arc::clone(&consensus))
             .with_unpersisted_fork_blocks(unpersisted_blocks, canonical_head);
@@ -630,7 +677,7 @@ fn validate_block_with_real_provider(
         provider,
         consensus,
         EthEvmConfig::new(chain_spec),
-        MockEngineValidator,
+        payload_validator,
         TreeConfig::default(),
         Box::new(NoopInvalidBlockHook::default()),
         ChangesetCache::new(),
@@ -640,7 +687,7 @@ fn validate_block_with_real_provider(
         &mut tree_harness.harness.tree.state,
         &tree_harness.harness.tree.canonical_in_memory_state,
     );
-    validator.validate_block(block, ctx)
+    validator.validate_block_with_state(input, ctx)
 }
 
 fn empty_child_candidate(candidate: &ExecutedBlock, parent: &ExecutedBlock) -> SealedBlock<Block> {
@@ -2052,6 +2099,59 @@ fn opt_in_parent_state_success_continues_through_execution_and_post_validation()
             first_branch_nonce: Some(expected_nonce),
             second_branch_nonce: None,
         }]
+    );
+}
+
+#[test]
+fn opt_in_malformed_block_access_list_returns_error_after_single_conversion() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let conversion_calls = Arc::new(AtomicUsize::new(0));
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let marker = branch.signer;
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let candidate = branch.get_executed_block_with_number(2, parent.recovered_block().hash());
+    let canonical_head = parent.recovered_block().num_hash();
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: marker,
+        second_branch: Address::repeat_byte(0xee),
+        reject_standalone_header: false,
+        reject_after_observation: false,
+        observations,
+    });
+    let payload_validator =
+        MockEngineValidator::with_conversion_counter(Arc::clone(&conversion_calls));
+    let candidate = candidate.recovered_block().clone().into_sealed_block();
+    let candidate_hash = candidate.hash();
+    let candidate = candidate.into_block();
+    let payload = ExecutionData {
+        payload: ExecutionPayloadV4::from_block_unchecked_with_bal(
+            candidate_hash,
+            &candidate,
+            Bytes::from_static(&[0xff]),
+        )
+        .into(),
+        sidecar: ExecutionPayloadSidecar::none(),
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_payload_with_real_provider(
+            chain_spec,
+            consensus,
+            vec![parent],
+            canonical_head,
+            payload,
+            payload_validator,
+        )
+    }));
+
+    assert_eq!(conversion_calls.load(Ordering::Relaxed), 1);
+    let outcome = outcome.expect("malformed block access list must return an error, not panic");
+    assert_matches!(
+        outcome,
+        Err(InsertPayloadError::Block(error))
+            if matches!(error.kind(), crate::tree::error::InsertBlockErrorKind::Other(_))
     );
 }
 
