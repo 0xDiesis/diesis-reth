@@ -4,7 +4,8 @@ use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
     rpc::{
-        EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, ExecutedBlockInsertRequest,
+        CanonicalSnapshotBarrierRequest, CanonicalSnapshotHandle, EngineShutdown,
+        EngineValidatorAddOn, EngineValidatorBuilder, ExecutedBlockInsertRequest,
         ExecutedBlockInsertSender, RethRpcAddOns, RpcHandle,
     },
     setup::build_networked_pipeline,
@@ -46,6 +47,10 @@ use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 const DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY: usize = 64;
+
+/// Ingress capacity for canonical snapshot export requests. Snapshots are
+/// produced at most once per certified checkpoint, so a small queue suffices.
+const DIESIS_CANONICAL_SNAPSHOT_CHANNEL_CAPACITY: usize = 4;
 
 /// The engine node launcher.
 #[derive(Debug)]
@@ -283,6 +288,7 @@ impl EngineNodeLauncher {
             engine_shutdown: _,
             executed_block_tx: _,
             persisted_head: _,
+            canonical_snapshot: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -316,6 +322,15 @@ impl EngineNodeLauncher {
             DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
         );
 
+        // Channel for canonical snapshot export requests from the Diesis
+        // checkpoint snapshot producer. Created outside the async block so the
+        // handle can be exposed on RpcHandle.
+        let (canonical_snapshot_tx, canonical_snapshot_rx) =
+            tokio::sync::mpsc::channel::<CanonicalSnapshotBarrierRequest>(
+                DIESIS_CANONICAL_SNAPSHOT_CHANNEL_CAPACITY,
+            );
+        let canonical_snapshot_handle = CanonicalSnapshotHandle::new(canonical_snapshot_tx);
+
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
             if let Some(initial_target) = initial_target {
@@ -329,6 +344,7 @@ impl EngineNodeLauncher {
             let mut res = Ok(());
             let mut shutdown_rx = shutdown_rx.fuse();
             let mut executed_block_rx = executed_block_rx;
+            let mut canonical_snapshot_rx = canonical_snapshot_rx;
 
             // advance the chain and await payloads built locally to add into the engine api
             // tree handler to prevent re-execution if that block is received as payload from
@@ -399,6 +415,16 @@ impl EngineNodeLauncher {
                             EngineApiRequest::InsertExecutedBlockIfCanonical(request).into()
                         );
                     }
+                    Some(request) = canonical_snapshot_rx.recv() => {
+                        debug!(
+                            target: "reth::cli",
+                            target_block=?request.target(),
+                            "exporting canonical snapshot at persisted boundary"
+                        );
+                        orchestrator.handler_mut().handler_mut().on_event(
+                            EngineApiRequest::ExportCanonicalSnapshot(request).into()
+                        );
+                    }
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
                             debug!(target: "reth::cli", "received engine shutdown request");
@@ -446,6 +472,7 @@ impl EngineNodeLauncher {
                 engine_shutdown,
                 executed_block_tx: Some(executed_block_tx),
                 persisted_head: std::sync::Arc::clone(&persisted_head),
+                canonical_snapshot: Some(canonical_snapshot_handle),
             },
         };
         // Notify on node started

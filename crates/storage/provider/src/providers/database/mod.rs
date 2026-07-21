@@ -38,7 +38,7 @@ use reth_trie_db::ChangesetCache;
 use revm_database::BundleState;
 use std::{
     ops::{RangeBounds, RangeInclusive},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -48,7 +48,8 @@ use tracing::{info, instrument, trace, warn};
 
 mod provider;
 pub use provider::{
-    CommitOrder, DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, SaveBlocksMode,
+    CanonicalSnapshotError, CanonicalSnapshotRequest, CanonicalSnapshotResult, CommitOrder,
+    DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, SaveBlocksMode,
 };
 
 use super::ProviderNodeTypes;
@@ -61,6 +62,38 @@ mod metrics;
 
 mod chain;
 pub use chain::*;
+
+/// File name of the exported MDBX database inside a canonical snapshot directory.
+pub const SNAPSHOT_DATABASE_FILE: &str = "mdbx.dat";
+/// Directory name of the exported static files inside a canonical snapshot directory.
+pub const SNAPSHOT_STATIC_FILES_DIR: &str = "static_files";
+
+/// Recursively copy a directory tree, creating `dst`. Regular files are copied
+/// byte-for-byte; nested directories recurse. Symlinks are not followed — the
+/// static-file store contains only regular files, and following links out of an
+/// export would let it capture unrelated data.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), CanonicalSnapshotError> {
+    std::fs::create_dir_all(dst)
+        .map_err(|source| CanonicalSnapshotError::Io { path: dst.to_path_buf(), source })?;
+    let entries = std::fs::read_dir(src)
+        .map_err(|source| CanonicalSnapshotError::Io { path: src.to_path_buf(), source })?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|source| CanonicalSnapshotError::Io { path: src.to_path_buf(), source })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| CanonicalSnapshotError::Io { path: entry.path(), source })?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)
+                .map_err(|source| CanonicalSnapshotError::Io { path: from.clone(), source })?;
+        }
+    }
+    Ok(())
+}
 
 /// Sync state for read-only [`ProviderFactory`] instances.
 struct ReadOnlySyncState {
@@ -383,6 +416,77 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.db.path(),
         )
         .with_minimum_pruning_distance(self.minimum_pruning_distance))
+    }
+
+    /// Export a consistent, point-in-time snapshot of the canonical database and
+    /// static files at `request.target`.
+    ///
+    /// The target must be at or below the persisted database head and its hash
+    /// must be the canonical hash at that height, or the export is refused
+    /// before any file is written. The MDBX environment is copied through an
+    /// internal read transaction — a self-consistent single-file snapshot even
+    /// under concurrent writes — and the static-file directory is copied
+    /// alongside it. The two stores only agree on one head if no persistence
+    /// write is in flight during the copy, so callers that require a coherent
+    /// boundary (a checkpoint snapshot producer) run this behind the engine
+    /// tree's persistence barrier.
+    pub fn export_canonical_snapshot(
+        &self,
+        request: &CanonicalSnapshotRequest,
+    ) -> Result<CanonicalSnapshotResult, CanonicalSnapshotError> {
+        use alloy_consensus::BlockHeader;
+
+        let CanonicalSnapshotRequest { target, output_dir } = request;
+
+        if output_dir.exists() {
+            return Err(CanonicalSnapshotError::OutputExists(output_dir.clone()));
+        }
+
+        // Verify the target is durable and canonical before touching disk.
+        let provider = self.provider()?;
+        let persisted = provider.best_block_number()?;
+        if target.number > persisted {
+            return Err(CanonicalSnapshotError::TargetAbovePersistedHead {
+                target: target.number,
+                persisted,
+            });
+        }
+        let canonical = provider.block_hash(target.number)?;
+        if canonical != Some(target.hash) {
+            return Err(CanonicalSnapshotError::TargetNotCanonical {
+                number: target.number,
+                requested: target.hash,
+                found: canonical,
+            });
+        }
+        let header = provider
+            .sealed_header(target.number)?
+            .ok_or(CanonicalSnapshotError::MissingHeader(target.number))?;
+        let mpt_state_root = header.state_root();
+        drop(provider);
+
+        std::fs::create_dir_all(output_dir)
+            .map_err(|source| CanonicalSnapshotError::Io { path: output_dir.clone(), source })?;
+
+        // Consistent MDBX copy through an internal read transaction.
+        let database_rel = PathBuf::from(SNAPSHOT_DATABASE_FILE);
+        let database_dst = output_dir.join(&database_rel);
+        self.db_ref()
+            .snapshot_copy(&database_dst, false)
+            .map_err(CanonicalSnapshotError::DatabaseCopy)?;
+
+        // Copy the static-file directory alongside the database. The persistence
+        // barrier guarantees no static-file writer is active during the copy.
+        let static_files_rel = PathBuf::from(SNAPSHOT_STATIC_FILES_DIR);
+        let static_files_dst = output_dir.join(&static_files_rel);
+        let static_files_src = self.static_file_provider().directory().to_path_buf();
+        copy_dir_recursive(&static_files_src, &static_files_dst)?;
+
+        Ok(CanonicalSnapshotResult {
+            target: *target,
+            mpt_state_root,
+            files: vec![database_rel, static_files_rel],
+        })
     }
 
     /// Returns a provider with a created `DbTxMut` inside, which allows fetching and updating
@@ -1005,6 +1109,7 @@ mod tests {
         BlockHashReader, BlockNumReader, BlockWriter, DBProvider, HeaderSyncGapProvider,
         TransactionsProvider,
     };
+    use alloy_consensus::transaction::TxHashRef;
     use alloy_primitives::{TxNumber, B256};
     use assert_matches::assert_matches;
     use reth_chainspec::ChainSpecBuilder;

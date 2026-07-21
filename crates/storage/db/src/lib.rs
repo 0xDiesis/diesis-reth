@@ -152,6 +152,14 @@ pub mod test_utils {
         fn last_txnid(&self) -> Option<u64> {
             self.db().last_txnid()
         }
+
+        fn snapshot_copy(
+            &self,
+            dest: &std::path::Path,
+            compact: bool,
+        ) -> Result<(), DatabaseError> {
+            self.db().snapshot_copy(dest, compact)
+        }
     }
 
     impl<DB: DatabaseMetrics> DatabaseMetrics for TempDatabase<DB> {

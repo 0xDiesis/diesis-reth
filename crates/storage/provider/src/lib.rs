@@ -22,10 +22,11 @@ pub use traits::*;
 /// Provider trait implementations.
 pub mod providers;
 pub use providers::{
-    DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
-    HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
-    PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
-    StaticFileWriteCtx, StaticFileWriter,
+    CanonicalSnapshotError, CanonicalSnapshotRequest, CanonicalSnapshotResult, DatabaseProvider,
+    DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider, HistoricalStateProviderRef,
+    LatestStateProvider, LatestStateProviderRef, ProviderFactory, PruneShardOutcome, PrunedIndices,
+    SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder, StaticFileWriteCtx,
+    StaticFileWriter,
 };
 
 pub mod changeset_walker;

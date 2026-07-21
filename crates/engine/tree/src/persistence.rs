@@ -6,8 +6,9 @@ use reth_errors::ProviderError;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
-    providers::ProviderNodeTypes, BlockExecutionWriter, BlockHashReader, ChainStateBlockWriter,
-    DBProvider, DatabaseProviderFactory, ProviderFactory, SaveBlocksMode,
+    providers::ProviderNodeTypes, BlockExecutionWriter, BlockHashReader, CanonicalSnapshotError,
+    CanonicalSnapshotRequest, CanonicalSnapshotResult, ChainStateBlockWriter, DBProvider,
+    DatabaseProviderFactory, ProviderFactory, SaveBlocksMode,
 };
 use reth_prune::{PrunerError, PrunerWithFactory};
 use reth_stages_api::{MetricEvent, MetricEventsSender};
@@ -120,6 +121,16 @@ where
                 }
                 PersistenceAction::SaveSafeBlock(safe_block) => {
                     self.pending_safe_block = Some(safe_block);
+                }
+                PersistenceAction::ExportCanonicalSnapshot(request, tx) => {
+                    // The persistence thread is idle between saves, so the copy
+                    // sees a consistent database and static-file view at the
+                    // requested boundary.
+                    let result = self.provider.export_canonical_snapshot(&request);
+                    if let Err(ref error) = result {
+                        error!(target: "engine::persistence", %error, "Canonical snapshot export failed");
+                    }
+                    let _ = tx.send(result);
                 }
             }
         }
@@ -237,6 +248,17 @@ pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
 
     /// Update the persisted safe block on disk
     SaveSafeBlock(u64),
+
+    /// Export a consistent point-in-time snapshot of the canonical database and
+    /// static files at a persisted block boundary.
+    ///
+    /// Running the export as a persistence action serializes it against block
+    /// saves on the persistence thread, so no static-file writer is active while
+    /// the two stores are copied. The result is returned on the one-shot channel.
+    ExportCanonicalSnapshot(
+        CanonicalSnapshotRequest,
+        tokio::sync::oneshot::Sender<Result<CanonicalSnapshotResult, CanonicalSnapshotError>>,
+    ),
 }
 
 /// A handle to the persistence service
@@ -312,6 +334,18 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         tx: CrossbeamSender<PersistenceResult>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
         self.send_action(PersistenceAction::SaveBlocks(blocks, tx))
+    }
+
+    /// Queues a consistent canonical snapshot export.
+    ///
+    /// The export runs on the persistence thread, serialized against block
+    /// saves, and the result is delivered on `tx`.
+    pub fn export_canonical_snapshot(
+        &self,
+        request: CanonicalSnapshotRequest,
+        tx: tokio::sync::oneshot::Sender<Result<CanonicalSnapshotResult, CanonicalSnapshotError>>,
+    ) -> Result<(), SendError<PersistenceAction<T>>> {
+        self.send_action(PersistenceAction::ExportCanonicalSnapshot(request, tx))
     }
 
     /// Queues the finalized block number to be persisted on disk.

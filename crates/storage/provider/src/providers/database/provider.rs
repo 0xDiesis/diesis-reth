@@ -24,7 +24,7 @@ use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
     BlockHeader, TxReceipt,
 };
-use alloy_eips::BlockHashOrNumber;
+use alloy_eips::{BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::{
     keccak256,
     map::{hash_map, AddressSet, B256Map, HashMap},
@@ -734,10 +734,8 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 for block in &blocks {
                     if let Some(ref verkle_bytes) = block.verkle_updates {
                         let block_number = block.recovered_block().number();
-                        self.tx.put::<tables::VerkleStateDiffs>(
-                            block_number,
-                            verkle_bytes.clone(),
-                        )?;
+                        self.tx
+                            .put::<tables::VerkleStateDiffs>(block_number, verkle_bytes.clone())?;
                     }
                 }
             }
@@ -3913,6 +3911,82 @@ impl<TX: Send, N: NodeTypes> StoragePath for DatabaseProvider<TX, N> {
     }
 }
 
+/// A request to export a consistent, point-in-time snapshot of the canonical
+/// database and static files at a specific persisted block boundary.
+///
+/// The snapshot is the durable state archive a fresh node reconstructs its
+/// datadir from. Because it is taken at an exact canonical boundary, both the
+/// exported MDBX environment and the static files it is paired with must agree
+/// on the same head.
+#[derive(Debug, Clone)]
+pub struct CanonicalSnapshotRequest {
+    /// The canonical block the snapshot reconstructs. It must be at or below the
+    /// persisted database head and its hash must be the canonical hash at that
+    /// height, or the export is refused.
+    pub target: BlockNumHash,
+    /// Directory the snapshot is written into. It must not already exist; the
+    /// export creates it so a partially written export can never be mistaken for
+    /// a complete one.
+    pub output_dir: PathBuf,
+}
+
+/// The successful result of a [`CanonicalSnapshotRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalSnapshotResult {
+    /// The canonical block boundary that was exported.
+    pub target: BlockNumHash,
+    /// The internal MPT state root committed by the exported head's header.
+    pub mpt_state_root: B256,
+    /// The exported paths, relative to the request's `output_dir`, in export
+    /// order (the MDBX database file first, then the static-file directory).
+    pub files: Vec<PathBuf>,
+}
+
+/// A failure while exporting a canonical snapshot.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonicalSnapshotError {
+    /// The requested target is above the persisted database head, so it cannot
+    /// yet be exported from durable storage.
+    #[error("snapshot target block {target} is above the persisted database head {persisted}")]
+    TargetAbovePersistedHead {
+        /// Requested target block number.
+        target: u64,
+        /// Highest persisted (durable) block number.
+        persisted: u64,
+    },
+    /// The persisted canonical hash at the target height does not match the
+    /// requested hash, so the target is not canonical on this node.
+    #[error("snapshot target {number} hash {requested} is not canonical (found {found:?})")]
+    TargetNotCanonical {
+        /// Target block number.
+        number: u64,
+        /// Requested (expected) canonical hash.
+        requested: B256,
+        /// The hash actually recorded at that height, if any.
+        found: Option<B256>,
+    },
+    /// The target header is missing from durable storage.
+    #[error("snapshot target header {0} is missing from durable storage")]
+    MissingHeader(u64),
+    /// The output directory already exists.
+    #[error("snapshot output directory {0:?} already exists")]
+    OutputExists(PathBuf),
+    /// A database or provider read failed.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    /// The consistent database copy failed.
+    #[error("consistent database snapshot copy failed: {0}")]
+    DatabaseCopy(#[source] reth_db_api::DatabaseError),
+    /// A filesystem operation failed.
+    #[error("snapshot filesystem error at {path:?}: {source}")]
+    Io {
+        /// The path being operated on.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3938,6 +4012,77 @@ mod tests {
     use revm_database::BundleState;
     use revm_state::AccountInfo;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn export_canonical_snapshot_copies_db_and_static_files_and_refuses_bad_targets() {
+        use reth_stages_types::{StageCheckpoint, StageId};
+        use reth_storage_api::StageCheckpointWriter;
+
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw.insert_block(&data.genesis.clone().try_recover().unwrap()).unwrap();
+        provider_rw.insert_block(&data.blocks[0].0).unwrap();
+        provider_rw.insert_block(&data.blocks[1].0).unwrap();
+        let head_number = data.blocks[1].0.number();
+        let head_hash = data.blocks[1].0.hash();
+        // best_block_number reads the Finish stage checkpoint.
+        provider_rw
+            .save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(head_number))
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        let out = tempfile::TempDir::new().unwrap();
+        let dest = out.path().join("snapshot");
+
+        // A canonical, persisted target exports both stores.
+        let result = factory
+            .export_canonical_snapshot(&CanonicalSnapshotRequest {
+                target: BlockNumHash::new(head_number, head_hash),
+                output_dir: dest.clone(),
+            })
+            .expect("canonical target should export");
+        assert_eq!(result.target, BlockNumHash::new(head_number, head_hash));
+        assert_eq!(
+            result.mpt_state_root,
+            data.blocks[1].0.state_root(),
+            "reported MPT root must be the head header state root"
+        );
+        let db_path = dest.join(crate::providers::database::SNAPSHOT_DATABASE_FILE);
+        let sf_path = dest.join(crate::providers::database::SNAPSHOT_STATIC_FILES_DIR);
+        assert!(db_path.is_file(), "the mdbx snapshot file must exist");
+        assert!(db_path.metadata().unwrap().len() > 0, "the mdbx snapshot must be non-empty");
+        assert!(sf_path.is_dir(), "the static-files directory must be copied");
+
+        // A target above the persisted head is refused.
+        let err = factory
+            .export_canonical_snapshot(&CanonicalSnapshotRequest {
+                target: BlockNumHash::new(head_number + 1, head_hash),
+                output_dir: out.path().join("above_head"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, CanonicalSnapshotError::TargetAbovePersistedHead { .. }), "{err:?}");
+
+        // A non-canonical hash at a valid height is refused.
+        let err = factory
+            .export_canonical_snapshot(&CanonicalSnapshotRequest {
+                target: BlockNumHash::new(head_number, B256::ZERO),
+                output_dir: out.path().join("wrong_hash"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, CanonicalSnapshotError::TargetNotCanonical { .. }), "{err:?}");
+
+        // An already-existing output directory is refused so a partial export is
+        // never mistaken for a complete one.
+        let err = factory
+            .export_canonical_snapshot(&CanonicalSnapshotRequest {
+                target: BlockNumHash::new(head_number, head_hash),
+                output_dir: dest.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, CanonicalSnapshotError::OutputExists(_)), "{err:?}");
+    }
 
     #[test]
     fn test_receipts_by_block_range_empty_range() {

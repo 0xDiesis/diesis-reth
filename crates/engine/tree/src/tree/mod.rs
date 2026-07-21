@@ -2,8 +2,8 @@ use crate::{
     backfill::{BackfillAction, BackfillSyncState},
     chain::FromOrchestrator,
     engine::{
-        DownloadRequest, EngineApiEvent, EngineApiKind, EngineApiRequest, ExecutedBlockInsertError,
-        FromEngine,
+        CanonicalSnapshotBarrierRequest, DownloadRequest, EngineApiEvent, EngineApiKind,
+        EngineApiRequest, ExecutedBlockInsertError, FromEngine,
     },
     persistence::PersistenceHandle,
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
@@ -32,10 +32,10 @@ use reth_primitives_traits::{
     FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use reth_provider::{
-    BlockExecutionOutput, BlockExecutionResult, BlockReader, ChangeSetReader,
-    DatabaseProviderFactory, HashedPostStateProvider, ProviderError, StageCheckpointReader,
-    StateProviderBox, StateProviderFactory, StateReader, StorageChangeSetReader,
-    StorageSettingsCache, TransactionVariant,
+    BlockExecutionOutput, BlockExecutionResult, BlockReader, CanonicalSnapshotError,
+    CanonicalSnapshotRequest, ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider,
+    ProviderError, StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::ControlFlow;
@@ -1454,6 +1454,57 @@ where
         result
     }
 
+    /// Drains direct-insert work through the snapshot target and exports a
+    /// consistent point-in-time snapshot of the canonical database and static
+    /// files at that boundary.
+    ///
+    /// The target must be a canonical block already present on this node. Any
+    /// in-memory canonical blocks up to the head are persisted first so the
+    /// target boundary is durable, then the export is handed to the persistence
+    /// service, which runs it serialized against block saves. The engine tree
+    /// does not block on the copy itself — only on draining pending persistence.
+    fn export_canonical_snapshot(&mut self, request: CanonicalSnapshotBarrierRequest) {
+        let target = request.target();
+        let canonical_head = *self.state.tree_state.canonical_head();
+
+        // A target above the current canonical head cannot be exported: the
+        // block is not present, so there is nothing durable to snapshot.
+        if target.number > canonical_head.number {
+            request.reject(CanonicalSnapshotError::TargetAbovePersistedHead {
+                target: target.number,
+                persisted: self.persistence_state.last_persisted_block.number,
+            });
+            return;
+        }
+
+        // Drain direct-insert work through the target by persisting every
+        // canonical block up to the head. This makes the target boundary durable
+        // before the copy reads it.
+        if self.persistence_state.last_persisted_block.number < target.number &&
+            let Err(error) = self.persist_until_complete()
+        {
+            error!(target: "engine::tree", %error, "Failed to drain persistence for snapshot export");
+            request.reject(CanonicalSnapshotError::Provider(ProviderError::other(error)));
+            return;
+        }
+
+        // After draining, the target must be durable. If it still is not (for
+        // example the head regressed), refuse rather than export a stale view.
+        if self.persistence_state.last_persisted_block.number < target.number {
+            request.reject(CanonicalSnapshotError::TargetAbovePersistedHead {
+                target: target.number,
+                persisted: self.persistence_state.last_persisted_block.number,
+            });
+            return;
+        }
+
+        let (target, output_dir, response) = request.into_parts();
+        let snapshot_request = CanonicalSnapshotRequest { target, output_dir };
+        if let Err(error) = self.persistence.export_canonical_snapshot(snapshot_request, response) {
+            error!(target: "engine::tree", %error, "Failed to dispatch snapshot export to persistence service");
+        }
+    }
+
     /// Persists all remaining blocks until none are left.
     fn persist_until_complete(&mut self) -> Result<(), AdvancePersistenceError> {
         loop {
@@ -1611,6 +1662,9 @@ where
                         // must not depend on when the caller happens to poll the acknowledgement.
                         drop(permit);
                         let _ = response.send(result);
+                    }
+                    EngineApiRequest::ExportCanonicalSnapshot(request) => {
+                        self.export_canonical_snapshot(request);
                     }
                     EngineApiRequest::Beacon(request) => {
                         match request {

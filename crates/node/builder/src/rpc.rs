@@ -6,7 +6,10 @@ pub use jsonrpsee::{
 };
 use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::{
-    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest, ExecutedBlockInsertSender},
+    engine::{
+        CanonicalSnapshotBarrierRequest, CanonicalSnapshotExportError, CanonicalSnapshotHandle,
+        ExecutedBlockInsertError, ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
+    },
     tree::{BasicEngineValidator, EngineValidator},
 };
 pub use reth_rpc_builder::{
@@ -359,6 +362,11 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     /// Used by the Diesis pipeline to gate overlay eviction — entries are only
     /// evicted once their state is loadable from disk.
     pub persisted_head: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Optional handle for exporting a consistent point-in-time snapshot of the
+    /// canonical database and static files at a persisted block boundary. Used
+    /// by the Diesis checkpoint snapshot producer. Populated by the engine
+    /// launch loop.
+    pub canonical_snapshot: Option<CanonicalSnapshotHandle>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -371,6 +379,7 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             engine_shutdown: self.engine_shutdown.clone(),
             executed_block_tx: self.executed_block_tx.clone(),
             persisted_head: self.persisted_head.clone(),
+            canonical_snapshot: self.canonical_snapshot.clone(),
         }
     }
 }
@@ -1102,6 +1111,7 @@ where
             engine_shutdown: EngineShutdown::default(),
             executed_block_tx: None,
             persisted_head: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            canonical_snapshot: None,
         })
     }
 

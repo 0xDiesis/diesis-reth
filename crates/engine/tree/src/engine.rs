@@ -14,8 +14,10 @@ use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineEvent};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{Block, NodePrimitives, SealedBlock};
+use reth_provider::{CanonicalSnapshotError, CanonicalSnapshotResult};
 use std::{
     fmt::Display,
+    path::PathBuf,
     sync::Arc,
     task::{ready, Context, Poll},
 };
@@ -206,6 +208,9 @@ where
             let FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(request)) =
                 error.0
         {
+            // A rejected snapshot barrier request simply drops its reply channel,
+            // which the caller observes as a dropped acknowledgement; only the
+            // direct-insert path needs an explicit typed rejection here.
             request.reject(ExecutedBlockInsertError::EngineUnavailable);
         }
     }
@@ -260,6 +265,10 @@ pub enum EngineApiRequest<T: PayloadTypes, N: NodePrimitives> {
     /// Request to insert an already executed block only if it is the direct child of the expected
     /// canonical head.
     InsertExecutedBlockIfCanonical(ExecutedBlockInsertRequest<N>),
+    /// Request to export a consistent point-in-time snapshot of the canonical database and static
+    /// files at a persisted block boundary. The engine tree drains direct-insert work through the
+    /// target and pins the persistence service before exporting.
+    ExportCanonicalSnapshot(CanonicalSnapshotBarrierRequest),
 }
 
 impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
@@ -275,6 +284,9 @@ impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
                 request.expected_canonical_head(),
                 request.block().recovered_block().num_hash()
             ),
+            Self::ExportCanonicalSnapshot(request) => {
+                write!(f, "ExportCanonicalSnapshot(target={:?})", request.target())
+            }
         }
     }
 }
@@ -431,6 +443,97 @@ pub enum ExecutedBlockInsertError {
         /// Submitted parent hash.
         actual: B256,
     },
+}
+
+/// A request to export a canonical snapshot through the engine tree barrier.
+///
+/// It carries the target boundary, the output directory, and a one-shot channel
+/// the engine tree replies on once it has drained direct-insert work through the
+/// target and either exported the snapshot or refused the request.
+#[derive(Debug)]
+pub struct CanonicalSnapshotBarrierRequest {
+    target: BlockNumHash,
+    output_dir: PathBuf,
+    response: oneshot::Sender<Result<CanonicalSnapshotResult, CanonicalSnapshotError>>,
+}
+
+impl CanonicalSnapshotBarrierRequest {
+    /// The canonical block boundary the snapshot must reconstruct.
+    pub const fn target(&self) -> BlockNumHash {
+        self.target
+    }
+
+    /// The directory the snapshot is written into.
+    pub fn output_dir(&self) -> &std::path::Path {
+        &self.output_dir
+    }
+
+    /// Split the request into its target, output directory, and reply channel.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BlockNumHash,
+        PathBuf,
+        oneshot::Sender<Result<CanonicalSnapshotResult, CanonicalSnapshotError>>,
+    ) {
+        (self.target, self.output_dir, self.response)
+    }
+
+    /// Reply to the caller with an export failure.
+    pub fn reject(self, error: CanonicalSnapshotError) {
+        let _ = self.response.send(Err(error));
+    }
+}
+
+/// Handle for requesting a consistent canonical snapshot from the engine tree.
+///
+/// The engine tree accepts the barrier only after the target is persisted and
+/// canonical: it drains direct-insert work through the target, serializes the
+/// export behind the persistence service so no static-file writer is active, and
+/// then copies the database and static files at that exact boundary.
+#[derive(Debug, Clone)]
+pub struct CanonicalSnapshotHandle {
+    sender: mpsc::Sender<CanonicalSnapshotBarrierRequest>,
+}
+
+impl CanonicalSnapshotHandle {
+    /// Create a handle over the barrier ingress channel.
+    pub const fn new(sender: mpsc::Sender<CanonicalSnapshotBarrierRequest>) -> Self {
+        Self { sender }
+    }
+
+    /// Export a consistent snapshot of the canonical state at `target` into
+    /// `output_dir`, awaiting the engine tree's reply.
+    pub async fn export(
+        &self,
+        target: BlockNumHash,
+        output_dir: PathBuf,
+    ) -> Result<CanonicalSnapshotResult, CanonicalSnapshotExportError> {
+        let (response, receiver) = oneshot::channel();
+        let request = CanonicalSnapshotBarrierRequest { target, output_dir, response };
+        self.sender
+            .send(request)
+            .await
+            .map_err(|_| CanonicalSnapshotExportError::EngineUnavailable)?;
+        receiver
+            .await
+            .map_err(|_| CanonicalSnapshotExportError::AcknowledgementDropped)?
+            .map_err(CanonicalSnapshotExportError::Export)
+    }
+}
+
+/// Reason a canonical snapshot export failed.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonicalSnapshotExportError {
+    /// The engine ingress or engine tree is no longer available.
+    #[error("engine tree is unavailable")]
+    EngineUnavailable,
+    /// The engine-side reply was dropped, so the export outcome is unknown.
+    #[error("snapshot export acknowledgement was dropped")]
+    AcknowledgementDropped,
+    /// The engine tree refused or failed the export.
+    #[error(transparent)]
+    Export(#[from] CanonicalSnapshotError),
 }
 
 #[cfg(test)]
