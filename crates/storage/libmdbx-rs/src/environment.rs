@@ -167,6 +167,29 @@ impl Environment {
         mdbx_result(unsafe { ffi::mdbx_env_sync_ex(self.env_ptr(), force, false) })
     }
 
+    /// Write an MDBX-consistent point-in-time copy of this environment to a new
+    /// database file at `dest`.
+    ///
+    /// The copy is taken through an internal read-only transaction, so it is a
+    /// self-consistent snapshot of the whole environment even while other
+    /// threads keep writing; no external transaction has to be held open across
+    /// the copy. Only the data file is produced — no lock file — so the result
+    /// is a single regular file that can be hashed and shipped as-is.
+    ///
+    /// `dest` must not already exist and its parent directory must be writable.
+    /// When `compact` is set, free pages are omitted and pages are renumbered,
+    /// producing a smaller output at the cost of slightly more CPU.
+    ///
+    /// Because it employs a long-lived read transaction, running this
+    /// concurrently with heavy write traffic can grow the source database file;
+    /// callers that need a torn-free snapshot should drain writers first.
+    pub fn copy(&self, dest: &Path, compact: bool) -> Result<()> {
+        let dest = path_to_cstring(dest)?;
+        let flags = if compact { ffi::MDBX_CP_COMPACT } else { ffi::MDBX_CP_DEFAULTS };
+        mdbx_result(unsafe { ffi::mdbx_env_copy(self.env_ptr(), dest.as_ptr(), flags) })?;
+        Ok(())
+    }
+
     /// Retrieves statistics about this environment.
     pub fn stat(&self) -> Result<Stat> {
         unsafe {
@@ -944,6 +967,19 @@ pub(crate) mod read_transactions {
 /// Converts a [`HandleSlowReadersCallback`] to the actual FFI function pointer.
 fn convert_hsr_fn(callback: Option<HandleSlowReadersCallback>) -> ffi::MDBX_hsr_func {
     unsafe { std::mem::transmute(callback) }
+}
+
+/// Encode a filesystem path as a NUL-terminated C string for the MDBX FFI,
+/// rejecting a path that contains an interior NUL byte.
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = path.to_string_lossy().to_string().into_bytes();
+    CString::new(bytes).map_err(|_| Error::Invalid)
 }
 
 #[cfg(test)]

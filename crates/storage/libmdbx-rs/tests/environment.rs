@@ -83,6 +83,51 @@ fn test_sync() {
 }
 
 #[test]
+fn test_copy_is_a_consistent_readable_snapshot() {
+    let src_dir = tempdir().unwrap();
+    let env = Environment::builder().set_max_dbs(2).open(src_dir.path()).unwrap();
+
+    // Seed deterministic contents in a named table.
+    let txn = env.begin_rw_txn().unwrap();
+    let db = txn.create_db(Some("t"), DatabaseFlags::empty()).unwrap();
+    for i in 0u32..128 {
+        let mut key = [0u8; 4];
+        LittleEndian::write_u32(&mut key, i);
+        txn.put(db.dbi(), key, key, WriteFlags::empty()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Copy to a fresh, not-yet-existing single database file.
+    let dst_dir = tempdir().unwrap();
+    let dst_file = dst_dir.path().join("snapshot.dat");
+    env.copy(&dst_file, false).unwrap();
+    assert!(dst_file.is_file(), "copy must produce a single data file");
+
+    // Copying over an existing path must fail (dest must not exist).
+    env.copy(&dst_file, false).unwrap_err();
+
+    // The copy reopens as a self-consistent environment with identical data.
+    // It is a single file, so it must be opened in no-subdir mode.
+    let copied = Environment::builder()
+        .set_max_dbs(2)
+        .set_flags(EnvironmentFlags {
+            no_sub_dir: true,
+            mode: Mode::ReadOnly,
+            ..Default::default()
+        })
+        .open(&dst_file)
+        .unwrap();
+    let rtxn = copied.begin_ro_txn().unwrap();
+    let rdb = rtxn.open_db(Some("t")).unwrap();
+    for i in 0u32..128 {
+        let mut key = [0u8; 4];
+        LittleEndian::write_u32(&mut key, i);
+        let value = rtxn.get::<[u8; 4]>(rdb.dbi(), &key).unwrap();
+        assert_eq!(value, Some(key));
+    }
+}
+
+#[test]
 fn test_stat() {
     let dir = tempdir().unwrap();
     let env = Environment::builder().open(dir.path()).unwrap();

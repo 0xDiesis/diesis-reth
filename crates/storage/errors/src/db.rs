@@ -48,6 +48,9 @@ pub enum DatabaseError {
     /// Failed to use the specified log level, as it's not available.
     #[error("log level {_0:?} is not available")]
     LogLevelUnavailable(LogLevel),
+    /// Failed to write a consistent point-in-time copy of the database.
+    #[error("failed to snapshot the database: {_0}")]
+    SnapshotCopy(DatabaseErrorInfo),
     /// Other unspecified error.
     #[error("{_0}")]
     Other(String),

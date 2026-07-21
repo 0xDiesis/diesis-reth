@@ -3,7 +3,12 @@ use crate::{
     transaction::{DbTx, DbTxMut},
     DatabaseError,
 };
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use reth_storage_errors::db::DatabaseErrorInfo;
+use std::{
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// Main Database trait that can open read-only and read-write transactions.
 ///
@@ -36,6 +41,25 @@ pub trait Database: Send + Sync + Debug {
 
     /// Returns the ID of the most recently committed transaction, if available.
     fn last_txnid(&self) -> Option<u64>;
+
+    /// Write a consistent point-in-time copy of the whole database to a new file
+    /// at `dest`, without holding an externally visible transaction open across
+    /// the copy.
+    ///
+    /// The copy is a self-consistent snapshot even while other threads keep
+    /// writing, so it is suitable for shipping as a durable state archive. `dest`
+    /// must not already exist and its parent directory must be writable. When
+    /// `compact` is set, free pages are omitted from the output.
+    ///
+    /// Backends that cannot produce such a copy return
+    /// [`DatabaseError::SnapshotCopy`]; the default implementation does so.
+    fn snapshot_copy(&self, dest: &Path, compact: bool) -> Result<(), DatabaseError> {
+        let _ = (dest, compact);
+        Err(DatabaseError::SnapshotCopy(DatabaseErrorInfo {
+            message: "snapshot copy is not supported by this database backend".into(),
+            code: -1,
+        }))
+    }
 
     /// Takes a function and passes a read-only transaction into it, making sure it's closed in the
     /// end of the execution.
@@ -89,6 +113,10 @@ impl<DB: Database> Database for Arc<DB> {
     fn last_txnid(&self) -> Option<u64> {
         <DB as Database>::last_txnid(self)
     }
+
+    fn snapshot_copy(&self, dest: &Path, compact: bool) -> Result<(), DatabaseError> {
+        <DB as Database>::snapshot_copy(self, dest, compact)
+    }
 }
 
 impl<DB: Database> Database for &DB {
@@ -113,6 +141,10 @@ impl<DB: Database> Database for &DB {
 
     fn last_txnid(&self) -> Option<u64> {
         <DB as Database>::last_txnid(self)
+    }
+
+    fn snapshot_copy(&self, dest: &Path, compact: bool) -> Result<(), DatabaseError> {
+        <DB as Database>::snapshot_copy(self, dest, compact)
     }
 }
 

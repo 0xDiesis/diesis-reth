@@ -303,6 +303,10 @@ impl Database for DatabaseEnv {
             Some(txnid as u64)
         }
     }
+
+    fn snapshot_copy(&self, dest: &Path, compact: bool) -> Result<(), DatabaseError> {
+        self.inner.copy(dest, compact).map_err(|e| DatabaseError::SnapshotCopy(e.into()))
+    }
 }
 
 impl DatabaseMetrics for DatabaseEnv {
@@ -718,6 +722,47 @@ mod tests {
     #[test]
     fn db_creation() {
         let _tempdir = create_test_db(DatabaseEnvKind::RW);
+    }
+
+    #[test]
+    fn snapshot_copy_produces_a_reopenable_consistent_file() {
+        let (_tempdir, db) = create_test_db(DatabaseEnvKind::RW);
+
+        // Populate a named table with deterministic rows.
+        db.update(|tx| {
+            for number in 0u64..32 {
+                tx.put::<CanonicalHeaders>(number, B256::with_last_byte(number as u8))
+                    .expect(ERROR_PUT);
+            }
+        })
+        .expect(ERROR_COMMIT);
+
+        let dest_dir = tempfile::TempDir::new().expect(ERROR_TEMPDIR);
+        let dest = dest_dir.path().join("snapshot.dat");
+
+        // The copy succeeds and yields a single, non-empty data file.
+        db.snapshot_copy(&dest, false).expect("snapshot copy");
+        assert!(dest.is_file());
+        assert!(std::fs::metadata(&dest).unwrap().len() > 0);
+
+        // Copying onto an existing path fails closed as SnapshotCopy.
+        assert!(matches!(db.snapshot_copy(&dest, false), Err(DatabaseError::SnapshotCopy(_))));
+
+        // The copy reopens as a consistent single-file MDBX env carrying the
+        // populated named table.
+        let copied = reth_libmdbx::Environment::builder()
+            .set_max_dbs(Tables::ALL.len())
+            .set_flags(reth_libmdbx::EnvironmentFlags {
+                no_sub_dir: true,
+                mode: reth_libmdbx::Mode::ReadOnly,
+                ..Default::default()
+            })
+            .open(&dest)
+            .expect("reopen snapshot");
+        let tx = copied.begin_ro_txn().expect(ERROR_INIT_TX);
+        let table = tx.open_db(Some(CanonicalHeaders::NAME)).expect("table present in snapshot");
+        let cursor = tx.cursor(table.dbi()).expect("cursor over snapshot table");
+        assert_eq!(cursor.iter_slices().count(), 32);
     }
 
     #[test]
