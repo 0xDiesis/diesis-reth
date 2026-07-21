@@ -123,14 +123,32 @@ where
                     self.pending_safe_block = Some(safe_block);
                 }
                 PersistenceAction::ExportCanonicalSnapshot(request, tx) => {
-                    // The persistence thread is idle between saves, so the copy
-                    // sees a consistent database and static-file view at the
-                    // requested boundary.
-                    let result = self.provider.export_canonical_snapshot(&request);
-                    if let Err(ref error) = result {
-                        error!(target: "engine::persistence", %error, "Canonical snapshot export failed");
+                    // Capture the static-file boundary here, on the single-threaded
+                    // persistence writer between saves, so no append is in flight
+                    // and the lengths are a consistent cut of complete rows.
+                    // The minutes-long copy (a consistent MDBX MVCC copy plus the
+                    // truncated static-file copy) then runs on a separate thread so
+                    // this writer is released immediately and consensus is not
+                    // stalled. `mdbx_env_copy` is MVCC-consistent without pausing
+                    // writers, so the concurrent copy still captures the boundary.
+                    match self.provider.capture_static_file_lengths() {
+                        Ok(static_file_lengths) => {
+                            let provider = self.provider.clone();
+                            // Detached: the export replies on `tx` when it finishes.
+                            let _ = spawn_os_thread("canonical-snapshot-export", move || {
+                                let result = provider
+                                    .export_canonical_snapshot(&request, &static_file_lengths);
+                                if let Err(ref error) = result {
+                                    debug!(target: "engine::persistence", %error, "Canonical snapshot export refused or failed");
+                                }
+                                let _ = tx.send(result);
+                            });
+                        }
+                        Err(error) => {
+                            error!(target: "engine::persistence", %error, "Failed to capture static-file boundary for snapshot export");
+                            let _ = tx.send(Err(error));
+                        }
                     }
-                    let _ = tx.send(result);
                 }
             }
         }

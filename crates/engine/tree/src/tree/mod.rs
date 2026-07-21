@@ -32,9 +32,9 @@ use reth_primitives_traits::{
     FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use reth_provider::{
-    BlockExecutionOutput, BlockExecutionResult, BlockReader, CanonicalSnapshotError,
-    CanonicalSnapshotRequest, ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider,
-    ProviderError, StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    BlockExecutionOutput, BlockExecutionResult, BlockReader, CanonicalSnapshotRequest,
+    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
+    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
     StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
@@ -1458,46 +1458,14 @@ where
     /// consistent point-in-time snapshot of the canonical database and static
     /// files at that boundary.
     ///
-    /// The target must be a canonical block already present on this node. Any
-    /// in-memory canonical blocks up to the head are persisted first so the
-    /// target boundary is durable, then the export is handed to the persistence
-    /// service, which runs it serialized against block saves. The engine tree
-    /// does not block on the copy itself — only on draining pending persistence.
-    fn export_canonical_snapshot(&mut self, request: CanonicalSnapshotBarrierRequest) {
-        let target = request.target();
-        let canonical_head = *self.state.tree_state.canonical_head();
-
-        // A target above the current canonical head cannot be exported: the
-        // block is not present, so there is nothing durable to snapshot.
-        if target.number > canonical_head.number {
-            request.reject(CanonicalSnapshotError::TargetAbovePersistedHead {
-                target: target.number,
-                persisted: self.persistence_state.last_persisted_block.number,
-            });
-            return;
-        }
-
-        // Drain direct-insert work through the target by persisting every
-        // canonical block up to the head. This makes the target boundary durable
-        // before the copy reads it.
-        if self.persistence_state.last_persisted_block.number < target.number &&
-            let Err(error) = self.persist_until_complete()
-        {
-            error!(target: "engine::tree", %error, "Failed to drain persistence for snapshot export");
-            request.reject(CanonicalSnapshotError::Provider(ProviderError::other(error)));
-            return;
-        }
-
-        // After draining, the target must be durable. If it still is not (for
-        // example the head regressed), refuse rather than export a stale view.
-        if self.persistence_state.last_persisted_block.number < target.number {
-            request.reject(CanonicalSnapshotError::TargetAbovePersistedHead {
-                target: target.number,
-                persisted: self.persistence_state.last_persisted_block.number,
-            });
-            return;
-        }
-
+    /// The export requires the target to be exactly the persisted database head,
+    /// which the persistence service verifies. The tree does not drain to the
+    /// target (that would push the persisted head past it and break the equality
+    /// the export needs); instead the caller retries as persistence naturally
+    /// lands on the certified tip. The persistence service captures the boundary
+    /// and runs the copy on a separate thread, so neither this loop nor the
+    /// persistence writer is blocked for the duration of the copy.
+    fn export_canonical_snapshot(&self, request: CanonicalSnapshotBarrierRequest) {
         let (target, output_dir, response) = request.into_parts();
         let snapshot_request = CanonicalSnapshotRequest { target, output_dir };
         if let Err(error) = self.persistence.export_canonical_snapshot(snapshot_request, response) {

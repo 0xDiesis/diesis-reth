@@ -3954,6 +3954,18 @@ pub enum CanonicalSnapshotError {
         /// Highest persisted (durable) block number.
         persisted: u64,
     },
+    /// The requested target is not exactly the persisted database head. A
+    /// consistent copy captures the whole persisted environment, so the target
+    /// must equal the persisted head or the copied contents (the head) would not
+    /// match the label (the target). The caller retries until persistence lands
+    /// on the certified tip.
+    #[error("snapshot target block {target} is not the persisted database head {persisted}")]
+    TargetNotPersistedHead {
+        /// Requested target block number.
+        target: u64,
+        /// Highest persisted (durable) block number.
+        persisted: u64,
+    },
     /// The persisted canonical hash at the target height does not match the
     /// requested hash, so the target is not canonical on this node.
     #[error("snapshot target {number} hash {requested} is not canonical (found {found:?})")]
@@ -4035,14 +4047,19 @@ mod tests {
 
         let out = tempfile::TempDir::new().unwrap();
         let dest = out.path().join("snapshot");
+        let lengths = factory.capture_static_file_lengths().unwrap();
 
-        // A canonical, persisted target exports both stores.
+        // The target must be exactly the persisted head; the copied stores
+        // capture that head and are labeled with it.
         let result = factory
-            .export_canonical_snapshot(&CanonicalSnapshotRequest {
-                target: BlockNumHash::new(head_number, head_hash),
-                output_dir: dest.clone(),
-            })
-            .expect("canonical target should export");
+            .export_canonical_snapshot(
+                &CanonicalSnapshotRequest {
+                    target: BlockNumHash::new(head_number, head_hash),
+                    output_dir: dest.clone(),
+                },
+                &lengths,
+            )
+            .expect("persisted-head target should export");
         assert_eq!(result.target, BlockNumHash::new(head_number, head_hash));
         assert_eq!(
             result.mpt_state_root,
@@ -4055,31 +4072,54 @@ mod tests {
         assert!(db_path.metadata().unwrap().len() > 0, "the mdbx snapshot must be non-empty");
         assert!(sf_path.is_dir(), "the static-files directory must be copied");
 
-        // A target above the persisted head is refused.
+        // A target above the persisted head is refused (not the persisted head).
         let err = factory
-            .export_canonical_snapshot(&CanonicalSnapshotRequest {
-                target: BlockNumHash::new(head_number + 1, head_hash),
-                output_dir: out.path().join("above_head"),
-            })
+            .export_canonical_snapshot(
+                &CanonicalSnapshotRequest {
+                    target: BlockNumHash::new(head_number + 1, head_hash),
+                    output_dir: out.path().join("above_head"),
+                },
+                &lengths,
+            )
             .unwrap_err();
-        assert!(matches!(err, CanonicalSnapshotError::TargetAbovePersistedHead { .. }), "{err:?}");
+        assert!(matches!(err, CanonicalSnapshotError::TargetNotPersistedHead { .. }), "{err:?}");
 
-        // A non-canonical hash at a valid height is refused.
+        // A target BELOW the persisted head is refused: the copy would capture
+        // the head H while the manifest claims the older target T.
+        let below_hash = data.blocks[0].0.hash();
         let err = factory
-            .export_canonical_snapshot(&CanonicalSnapshotRequest {
-                target: BlockNumHash::new(head_number, B256::ZERO),
-                output_dir: out.path().join("wrong_hash"),
-            })
+            .export_canonical_snapshot(
+                &CanonicalSnapshotRequest {
+                    target: BlockNumHash::new(head_number - 1, below_hash),
+                    output_dir: out.path().join("below_head"),
+                },
+                &lengths,
+            )
+            .unwrap_err();
+        assert!(matches!(err, CanonicalSnapshotError::TargetNotPersistedHead { .. }), "{err:?}");
+
+        // A non-canonical hash at the persisted head is refused.
+        let err = factory
+            .export_canonical_snapshot(
+                &CanonicalSnapshotRequest {
+                    target: BlockNumHash::new(head_number, B256::ZERO),
+                    output_dir: out.path().join("wrong_hash"),
+                },
+                &lengths,
+            )
             .unwrap_err();
         assert!(matches!(err, CanonicalSnapshotError::TargetNotCanonical { .. }), "{err:?}");
 
         // An already-existing output directory is refused so a partial export is
         // never mistaken for a complete one.
         let err = factory
-            .export_canonical_snapshot(&CanonicalSnapshotRequest {
-                target: BlockNumHash::new(head_number, head_hash),
-                output_dir: dest.clone(),
-            })
+            .export_canonical_snapshot(
+                &CanonicalSnapshotRequest {
+                    target: BlockNumHash::new(head_number, head_hash),
+                    output_dir: dest.clone(),
+                },
+                &lengths,
+            )
             .unwrap_err();
         assert!(matches!(err, CanonicalSnapshotError::OutputExists(_)), "{err:?}");
     }

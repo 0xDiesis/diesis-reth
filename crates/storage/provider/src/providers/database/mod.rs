@@ -68,28 +68,75 @@ pub const SNAPSHOT_DATABASE_FILE: &str = "mdbx.dat";
 /// Directory name of the exported static files inside a canonical snapshot directory.
 pub const SNAPSHOT_STATIC_FILES_DIR: &str = "static_files";
 
-/// Recursively copy a directory tree, creating `dst`. Regular files are copied
-/// byte-for-byte; nested directories recurse. Symlinks are not followed — the
-/// static-file store contains only regular files, and following links out of an
-/// export would let it capture unrelated data.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), CanonicalSnapshotError> {
-    std::fs::create_dir_all(dst)
-        .map_err(|source| CanonicalSnapshotError::Io { path: dst.to_path_buf(), source })?;
-    let entries = std::fs::read_dir(src)
-        .map_err(|source| CanonicalSnapshotError::Io { path: src.to_path_buf(), source })?;
+/// Recursively record `(relative_path, byte_len)` for every regular file under
+/// `dir`. Symlinks are ignored — the static-file store holds only regular files.
+fn collect_file_lengths(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, u64)>,
+) -> Result<(), CanonicalSnapshotError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|source| CanonicalSnapshotError::Io { path: dir.to_path_buf(), source })?;
     for entry in entries {
         let entry = entry
-            .map_err(|source| CanonicalSnapshotError::Io { path: src.to_path_buf(), source })?;
-        let file_type = entry
-            .file_type()
+            .map_err(|source| CanonicalSnapshotError::Io { path: dir.to_path_buf(), source })?;
+        let metadata = entry
+            .metadata()
             .map_err(|source| CanonicalSnapshotError::Io { path: entry.path(), source })?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&from, &to)
-                .map_err(|source| CanonicalSnapshotError::Io { path: from.clone(), source })?;
+        let path = entry.path();
+        if metadata.is_dir() {
+            collect_file_lengths(root, &path, out)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| CanonicalSnapshotError::Io {
+                    path: path.clone(),
+                    source: std::io::Error::other("static file escaped the static-file root"),
+                })?
+                .to_path_buf();
+            out.push((relative, metadata.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Copy each static file named in `lengths` from `src` to `dst`, copying only up
+/// to its captured length. Files are append-only, so this yields a consistent
+/// cut at the captured boundary even while the writer appends beyond it. Files
+/// that appeared after the capture are not copied.
+fn copy_static_files_truncated(
+    src: &Path,
+    dst: &Path,
+    lengths: &[(PathBuf, u64)],
+) -> Result<(), CanonicalSnapshotError> {
+    use std::io::{Read, Write};
+
+    std::fs::create_dir_all(dst)
+        .map_err(|source| CanonicalSnapshotError::Io { path: dst.to_path_buf(), source })?;
+    for (relative, len) in lengths {
+        let from = src.join(relative);
+        let to = dst.join(relative);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| CanonicalSnapshotError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let source_file = std::fs::File::open(&from)
+            .map_err(|source| CanonicalSnapshotError::Io { path: from.clone(), source })?;
+        let mut reader = source_file.take(*len);
+        let mut writer = std::fs::File::create(&to)
+            .map_err(|source| CanonicalSnapshotError::Io { path: to.clone(), source })?;
+        let copied = std::io::copy(&mut reader, &mut writer)
+            .map_err(|source| CanonicalSnapshotError::Io { path: from.clone(), source })?;
+        writer.flush().map_err(|source| CanonicalSnapshotError::Io { path: to.clone(), source })?;
+        if copied != *len {
+            return Err(CanonicalSnapshotError::Io {
+                path: from,
+                source: std::io::Error::other(format!(
+                    "static file {relative:?} shrank below its captured length: expected {len}, copied {copied}"
+                )),
+            });
         }
     }
     Ok(())
@@ -433,6 +480,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     pub fn export_canonical_snapshot(
         &self,
         request: &CanonicalSnapshotRequest,
+        static_file_lengths: &[(PathBuf, u64)],
     ) -> Result<CanonicalSnapshotResult, CanonicalSnapshotError> {
         use alloy_consensus::BlockHeader;
 
@@ -442,11 +490,17 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             return Err(CanonicalSnapshotError::OutputExists(output_dir.clone()));
         }
 
-        // Verify the target is durable and canonical before touching disk.
+        // The MDBX copy and static-file copy capture the current persisted head,
+        // so the target must BE the persisted head. If persistence has not yet
+        // reached the target (or has already passed it), refuse; the caller
+        // retries until persistence lands exactly on the certified tip. Even a
+        // sub-microsecond overshoot between this check and the MVCC copy is
+        // self-healed on import, where Reth unwinds the two stores to their
+        // common head.
         let provider = self.provider()?;
         let persisted = provider.best_block_number()?;
-        if target.number > persisted {
-            return Err(CanonicalSnapshotError::TargetAbovePersistedHead {
+        if target.number != persisted {
+            return Err(CanonicalSnapshotError::TargetNotPersistedHead {
                 target: target.number,
                 persisted,
             });
@@ -468,25 +522,46 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         std::fs::create_dir_all(output_dir)
             .map_err(|source| CanonicalSnapshotError::Io { path: output_dir.clone(), source })?;
 
-        // Consistent MDBX copy through an internal read transaction.
+        // Consistent MDBX copy through an internal read transaction. `mdbx_env_copy`
+        // takes an MVCC snapshot at call time and copies it without pausing
+        // writers, so this can run concurrently with the persistence writer.
         let database_rel = PathBuf::from(SNAPSHOT_DATABASE_FILE);
         let database_dst = output_dir.join(&database_rel);
         self.db_ref()
             .snapshot_copy(&database_dst, false)
             .map_err(CanonicalSnapshotError::DatabaseCopy)?;
 
-        // Copy the static-file directory alongside the database. The persistence
-        // barrier guarantees no static-file writer is active during the copy.
+        // Copy the static files up to the byte lengths captured at the boundary
+        // (on the single-threaded persistence writer, so no append was in
+        // flight). Static files are append-only, so bytes below each captured
+        // length are immutable and safe to copy while the writer appends beyond
+        // them.
         let static_files_rel = PathBuf::from(SNAPSHOT_STATIC_FILES_DIR);
         let static_files_dst = output_dir.join(&static_files_rel);
         let static_files_src = self.static_file_provider().directory().to_path_buf();
-        copy_dir_recursive(&static_files_src, &static_files_dst)?;
+        copy_static_files_truncated(&static_files_src, &static_files_dst, static_file_lengths)?;
 
         Ok(CanonicalSnapshotResult {
             target: *target,
             mpt_state_root,
             files: vec![database_rel, static_files_rel],
         })
+    }
+
+    /// Capture the current byte length of every regular file under the
+    /// static-file directory, relative to that directory.
+    ///
+    /// This must be called on the single-threaded persistence writer between
+    /// writes so no append is in flight; the returned lengths are then a
+    /// consistent cut of complete rows that [`Self::export_canonical_snapshot`]
+    /// copies up to.
+    pub fn capture_static_file_lengths(
+        &self,
+    ) -> Result<Vec<(PathBuf, u64)>, CanonicalSnapshotError> {
+        let root = self.static_file_provider().directory().to_path_buf();
+        let mut lengths = Vec::new();
+        collect_file_lengths(&root, &root, &mut lengths)?;
+        Ok(lengths)
     }
 
     /// Returns a provider with a created `DbTxMut` inside, which allows fetching and updating
