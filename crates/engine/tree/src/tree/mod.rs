@@ -2,8 +2,9 @@ use crate::{
     backfill::{BackfillAction, BackfillSyncState},
     chain::FromOrchestrator,
     engine::{
-        CanonicalSnapshotBarrierRequest, DownloadRequest, EngineApiEvent, EngineApiKind,
-        EngineApiRequest, ExecutedBlockInsertError, FromEngine,
+        CanonicalSnapshotBarrierRequest, DirectInsertBlockIdentity, DownloadRequest,
+        EngineApiEvent, EngineApiKind, EngineApiRequest, ExecutedBlockAdmissionOutcome,
+        ExecutedBlockInsertError, FromEngine,
     },
     persistence::PersistenceHandle,
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
@@ -90,6 +91,32 @@ pub mod state;
 /// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
 /// backfill this gap.
 pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
+
+fn validate_direct_insert_identity(
+    identity: DirectInsertBlockIdentity,
+    actual_block: BlockNumHash,
+    actual_parent: B256,
+) -> Result<(), ExecutedBlockInsertError> {
+    if identity.block != actual_block || identity.expected_parent.hash != actual_parent {
+        return Err(ExecutedBlockInsertError::IdentityPayloadMismatch {
+            identity,
+            actual_block,
+            actual_parent,
+        })
+    }
+
+    let expected_number = identity.expected_parent.number.checked_add(1).ok_or(
+        ExecutedBlockInsertError::CanonicalHeadNumberOverflow { head: identity.expected_parent },
+    )?;
+    if identity.block.number != expected_number {
+        return Err(ExecutedBlockInsertError::BlockNumberMismatch {
+            expected: expected_number,
+            actual: identity.block.number,
+        })
+    }
+
+    Ok(())
+}
 
 fn validate_executed_block_child(
     expected_head: BlockNumHash,
@@ -1584,6 +1611,83 @@ where
         Ok(())
     }
 
+    /// Resolves the canonical identity at `number` from the in-memory canonical chain or the
+    /// canonical provider after the in-memory window has been evicted.
+    fn canonical_identity_at(
+        &self,
+        number: u64,
+    ) -> Result<Option<DirectInsertBlockIdentity>, ExecutedBlockInsertError> {
+        if let Some(state) = self.canonical_in_memory_state.state_by_number(number) {
+            let block = state.block_ref().recovered_block();
+            return Ok(Some(DirectInsertBlockIdentity {
+                expected_parent: BlockNumHash::new(number.saturating_sub(1), block.parent_hash()),
+                block: block.num_hash(),
+            }))
+        }
+
+        let header = self.provider.sealed_header(number).map_err(|error| {
+            ExecutedBlockInsertError::CanonicalProviderReadFailed { message: error.to_string() }
+        })?;
+        Ok(header.map(|header| DirectInsertBlockIdentity {
+            expected_parent: BlockNumHash::new(number.saturating_sub(1), header.parent_hash()),
+            block: header.num_hash(),
+        }))
+    }
+
+    fn pending_direct_insert_identity(&self) -> Option<DirectInsertBlockIdentity> {
+        let pending = self.canonical_in_memory_state.pending_state()?;
+        let block = pending.block_ref().recovered_block();
+        Some(DirectInsertBlockIdentity {
+            expected_parent: BlockNumHash::new(
+                block.number().saturating_sub(1),
+                block.parent_hash(),
+            ),
+            block: block.num_hash(),
+        })
+    }
+
+    /// Classifies idempotent direct admission before validating that the caller's expected parent
+    /// is still the tree head. Exact canonical retries win over stale-head rejection, while a
+    /// different canonical or pending identity fails closed.
+    fn classify_direct_insert(
+        &self,
+        identity: DirectInsertBlockIdentity,
+        block: &ExecutedBlock<N>,
+    ) -> Result<Option<ExecutedBlockAdmissionOutcome>, ExecutedBlockInsertError> {
+        validate_direct_insert_identity(
+            identity,
+            block.recovered_block().num_hash(),
+            block.recovered_block().parent_hash(),
+        )?;
+
+        if let Some(canonical) = self.canonical_identity_at(identity.block.number)? {
+            return if canonical == identity {
+                Ok(Some(ExecutedBlockAdmissionOutcome::AlreadyCanonical))
+            } else {
+                Err(ExecutedBlockInsertError::CanonicalIdentityConflict {
+                    requested: identity,
+                    canonical,
+                })
+            }
+        }
+
+        if let Some(pending) = self.pending_direct_insert_identity() &&
+            pending.expected_parent == identity.expected_parent &&
+            pending.block.number == identity.block.number
+        {
+            return if pending == identity {
+                Ok(Some(ExecutedBlockAdmissionOutcome::Admitted))
+            } else {
+                Err(ExecutedBlockInsertError::PendingIdentityConflict {
+                    requested: identity,
+                    pending,
+                })
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Handles a message from the engine.
     ///
     /// Returns `ControlFlow::Break(())` if the engine should terminate.
@@ -1614,18 +1718,22 @@ where
                         self.insert_executed_block(block);
                     }
                     EngineApiRequest::InsertExecutedBlockIfCanonical(request) => {
-                        let (expected_head, block, response, permit) = request.into_parts();
+                        let (identity, block, response, permit) = request.into_parts();
                         let actual_head = *self.state.tree_state.canonical_head();
-                        let result = validate_executed_block_child(
-                            expected_head,
-                            actual_head,
-                            block.recovered_block().num_hash(),
-                            block.recovered_block().parent_hash(),
-                        );
-
-                        if result.is_ok() {
-                            self.insert_executed_block(block);
-                        }
+                        let result = match self.classify_direct_insert(identity, &block) {
+                            Ok(Some(outcome)) => Ok(outcome),
+                            Ok(None) => validate_executed_block_child(
+                                identity.expected_parent,
+                                actual_head,
+                                identity.block,
+                                block.recovered_block().parent_hash(),
+                            )
+                            .map(|()| {
+                                self.insert_executed_block(block);
+                                ExecutedBlockAdmissionOutcome::Admitted
+                            }),
+                            Err(error) => Err(error),
+                        };
                         // Capacity becomes available as soon as tree processing completes; it
                         // must not depend on when the caller happens to poll the acknowledgement.
                         drop(permit);

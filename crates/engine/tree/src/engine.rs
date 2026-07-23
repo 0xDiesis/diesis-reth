@@ -278,12 +278,9 @@ impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
             Self::InsertExecutedBlock(block) => {
                 write!(f, "InsertExecutedBlock({:?})", block.recovered_block().num_hash())
             }
-            Self::InsertExecutedBlockIfCanonical(request) => write!(
-                f,
-                "InsertExecutedBlockIfCanonical(expected={:?}, block={:?})",
-                request.expected_canonical_head(),
-                request.block().recovered_block().num_hash()
-            ),
+            Self::InsertExecutedBlockIfCanonical(request) => {
+                write!(f, "InsertExecutedBlockIfCanonical(identity={:?})", request.identity(),)
+            }
             Self::ExportCanonicalSnapshot(request) => {
                 write!(f, "ExportCanonicalSnapshot(target={:?})", request.target())
             }
@@ -291,38 +288,63 @@ impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
     }
 }
 
-/// An executed block whose admission is conditional on an exact canonical head.
+/// The immutable block identity required for direct engine-tree admission.
+///
+/// Reth authenticates only this block/parent relationship. Diesis-owned publication source and
+/// Verkle-generation identities are intentionally outside this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectInsertBlockIdentity {
+    /// The canonical parent that must admit the submitted block.
+    pub expected_parent: BlockNumHash,
+    /// The exact block that may be admitted.
+    pub block: BlockNumHash,
+}
+
+/// Truthful outcome of direct engine-tree block admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutedBlockAdmissionOutcome {
+    /// The exact block is present once in the engine tree after mutation/event completion.
+    ///
+    /// This does not claim forkchoice acceptance or durable persistence.
+    Admitted,
+    /// The exact block identity already matches the canonical chain.
+    AlreadyCanonical,
+}
+
+/// An executed block whose admission is conditional on an immutable block identity.
 #[derive(Debug)]
 pub struct ExecutedBlockInsertRequest<N: NodePrimitives = EthPrimitives> {
-    expected_canonical_head: BlockNumHash,
+    identity: DirectInsertBlockIdentity,
     block: ExecutedBlock<N>,
-    response: oneshot::Sender<Result<(), ExecutedBlockInsertError>>,
+    response: oneshot::Sender<Result<ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError>>,
     permit: OwnedSemaphorePermit,
 }
 
 impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
     fn new(
-        expected_canonical_head: BlockNumHash,
+        identity: DirectInsertBlockIdentity,
         block: ExecutedBlock<N>,
         permit: OwnedSemaphorePermit,
-    ) -> (Self, oneshot::Receiver<Result<(), ExecutedBlockInsertError>>) {
+    ) -> (Self, oneshot::Receiver<Result<ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError>>)
+    {
         let (response, receiver) = oneshot::channel();
-        (Self { expected_canonical_head, block, response, permit }, receiver)
+        (Self { identity, block, response, permit }, receiver)
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        expected_canonical_head: BlockNumHash,
+        identity: DirectInsertBlockIdentity,
         block: ExecutedBlock<N>,
-    ) -> (Self, oneshot::Receiver<Result<(), ExecutedBlockInsertError>>) {
+    ) -> (Self, oneshot::Receiver<Result<ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError>>)
+    {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.try_acquire_owned().expect("test semaphore has one permit");
-        Self::new(expected_canonical_head, block, permit)
+        Self::new(identity, block, permit)
     }
 
-    /// Returns the canonical head that must still be current when the request is handled.
-    pub const fn expected_canonical_head(&self) -> BlockNumHash {
-        self.expected_canonical_head
+    /// Returns the immutable identity required for admission.
+    pub const fn identity(&self) -> DirectInsertBlockIdentity {
+        self.identity
     }
 
     /// Returns the executed block awaiting admission.
@@ -333,12 +355,12 @@ impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        BlockNumHash,
+        DirectInsertBlockIdentity,
         ExecutedBlock<N>,
-        oneshot::Sender<Result<(), ExecutedBlockInsertError>>,
+        oneshot::Sender<Result<ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError>>,
         OwnedSemaphorePermit,
     ) {
-        (self.expected_canonical_head, self.block, self.response, self.permit)
+        (self.identity, self.block, self.response, self.permit)
     }
 
     fn reject(self, error: ExecutedBlockInsertError) {
@@ -367,22 +389,22 @@ impl<N: NodePrimitives> ExecutedBlockInsertSender<N> {
         Self { sender, permits: Arc::new(Semaphore::new(capacity)), capacity }
     }
 
-    /// Conditionally inserts an executed block and waits for the engine tree's acknowledgement.
+    /// Conditionally admits an executed block and waits for the engine tree's acknowledgement.
     ///
     /// Capacity exhaustion is reported immediately. A successful return means the tree validated
-    /// the expected canonical parent and inserted the block before acknowledging it.
+    /// the immutable identity, then either admitted the block into the engine tree or found it
+    /// already canonical. Neither successful outcome claims forkchoice or persistence.
     pub async fn insert(
         &self,
-        expected_canonical_head: BlockNumHash,
+        identity: DirectInsertBlockIdentity,
         block: ExecutedBlock<N>,
-    ) -> Result<(), ExecutedBlockInsertError> {
+    ) -> Result<ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError> {
         let permit = self
             .permits
             .clone()
             .try_acquire_owned()
             .map_err(|_| ExecutedBlockInsertError::QueueFull { capacity: self.capacity })?;
-        let (request, response) =
-            ExecutedBlockInsertRequest::new(expected_canonical_head, block, permit);
+        let (request, response) = ExecutedBlockInsertRequest::new(identity, block, permit);
         self.sender.send(request).await.map_err(|_| ExecutedBlockInsertError::EngineUnavailable)?;
         response.await.map_err(|_| ExecutedBlockInsertError::AcknowledgementDropped)?
     }
@@ -399,7 +421,7 @@ impl<N: NodePrimitives> ExecutedBlockInsertSender<N> {
 }
 
 /// Reason a conditional executed-block insertion was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutedBlockInsertError {
     /// The bounded direct-insert path has reached its end-to-end capacity.
     #[error("direct block admission queue is full (capacity {capacity})")]
@@ -413,6 +435,42 @@ pub enum ExecutedBlockInsertError {
     /// The tree-side acknowledgement was dropped, so the admission outcome is ambiguous.
     #[error("direct block admission acknowledgement was dropped")]
     AcknowledgementDropped,
+    /// The immutable identity does not describe the supplied executed block payload.
+    #[error(
+        "direct block identity/payload mismatch: identity {identity:?}, payload {actual_block:?}, parent {actual_parent:?}"
+    )]
+    IdentityPayloadMismatch {
+        /// Immutable caller-supplied identity.
+        identity: DirectInsertBlockIdentity,
+        /// Block number/hash derived from the payload.
+        actual_block: BlockNumHash,
+        /// Parent hash derived from the payload.
+        actual_parent: B256,
+    },
+    /// A different direct child of the same canonical parent is already pending admission.
+    #[error(
+        "pending direct block identity conflict: requested {requested:?}, pending {pending:?}"
+    )]
+    PendingIdentityConflict {
+        /// Immutable caller-supplied identity.
+        requested: DirectInsertBlockIdentity,
+        /// Existing pending block identity.
+        pending: DirectInsertBlockIdentity,
+    },
+    /// The canonical chain already has a different block identity at the requested height.
+    #[error("canonical direct block identity conflict: requested {requested:?}, canonical {canonical:?}")]
+    CanonicalIdentityConflict {
+        /// Immutable caller-supplied identity.
+        requested: DirectInsertBlockIdentity,
+        /// Canonical identity resolved in memory or from the provider.
+        canonical: DirectInsertBlockIdentity,
+    },
+    /// Reading canonical identity from the provider failed, so admission is refused.
+    #[error("canonical provider read failed: {message}")]
+    CanonicalProviderReadFailed {
+        /// Provider error rendered for diagnostics while preserving the typed failure category.
+        message: String,
+    },
     /// The canonical head changed before the engine tree handled the request.
     #[error("canonical head mismatch: expected {expected:?}, actual {actual:?}")]
     CanonicalHeadMismatch {
@@ -546,6 +604,13 @@ mod direct_insert_sender_tests {
         TestBlockBuilder::eth().get_executed_block_with_number(number, parent_hash)
     }
 
+    fn direct_insert_identity(
+        expected_parent: BlockNumHash,
+        block: &ExecutedBlock,
+    ) -> DirectInsertBlockIdentity {
+        DirectInsertBlockIdentity { expected_parent, block: block.recovered_block().num_hash() }
+    }
+
     fn sender_with_capacity(
         capacity: usize,
     ) -> (ExecutedBlockInsertSender, mpsc::Receiver<ExecutedBlockInsertRequest>) {
@@ -570,7 +635,8 @@ mod direct_insert_sender_tests {
             inserts.push(tokio::spawn({
                 let sender = sender.clone();
                 async move {
-                    sender.insert(expected_head, executed_block(1, expected_head.hash)).await
+                    let block = executed_block(1, expected_head.hash);
+                    sender.insert(direct_insert_identity(expected_head, &block), block).await
                 }
             }));
             let request = ingress.recv().await.expect("request reaches Tokio ingress");
@@ -582,8 +648,9 @@ mod direct_insert_sender_tests {
         }
 
         assert_eq!(sender.available_capacity(), 0);
+        let block = executed_block(1, expected_head.hash);
         assert_eq!(
-            sender.insert(expected_head, executed_block(1, expected_head.hash)).await,
+            sender.insert(direct_insert_identity(expected_head, &block), block).await,
             Err(ExecutedBlockInsertError::QueueFull { capacity: CAPACITY })
         );
 
@@ -604,13 +671,19 @@ mod direct_insert_sender_tests {
         let expected_head = BlockNumHash::new(0, B256::random());
         let first = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         tokio::task::yield_now().await;
 
         let second = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         tokio::task::yield_now().await;
         assert_eq!(sender.available_capacity(), 0);
@@ -630,7 +703,10 @@ mod direct_insert_sender_tests {
         let expected_head = BlockNumHash::new(0, B256::random());
         let task = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         let request = ingress.recv().await.expect("request was enqueued");
         task.abort();
@@ -647,19 +723,27 @@ mod direct_insert_sender_tests {
         let expected_head = BlockNumHash::new(0, B256::random());
         let first = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         let request = ingress.recv().await.expect("first request was enqueued");
         let (_, _, response, permit) = request.into_parts();
         drop(permit);
-        response.send(Ok(())).expect("caller still awaits acknowledgement");
+        response
+            .send(Ok(ExecutedBlockAdmissionOutcome::Admitted))
+            .expect("caller still awaits acknowledgement");
 
         assert_eq!(sender.available_capacity(), 1);
-        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(first.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
 
         let second = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         let request = ingress.recv().await.expect("next request admitted at capacity one");
         request.reject(ExecutedBlockInsertError::EngineUnavailable);
@@ -671,9 +755,10 @@ mod direct_insert_sender_tests {
         let (sender, ingress) = sender_with_capacity(1);
         drop(ingress);
         let expected_head = BlockNumHash::new(0, B256::random());
+        let block = executed_block(1, expected_head.hash);
 
         assert_eq!(
-            sender.insert(expected_head, executed_block(1, expected_head.hash)).await,
+            sender.insert(direct_insert_identity(expected_head, &block), block).await,
             Err(ExecutedBlockInsertError::EngineUnavailable)
         );
         assert_eq!(sender.available_capacity(), 1);
@@ -685,7 +770,10 @@ mod direct_insert_sender_tests {
         let expected_head = BlockNumHash::new(0, B256::random());
         let insert = tokio::spawn({
             let sender = sender.clone();
-            async move { sender.insert(expected_head, executed_block(1, expected_head.hash)).await }
+            async move {
+                let block = executed_block(1, expected_head.hash);
+                sender.insert(direct_insert_identity(expected_head, &block), block).await
+            }
         });
         let request = ingress.recv().await.expect("request was enqueued");
 

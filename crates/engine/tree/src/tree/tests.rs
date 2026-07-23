@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    engine::{ExecutedBlockInsertError, ExecutedBlockInsertRequest},
+    engine::{
+        DirectInsertBlockIdentity, ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError,
+        ExecutedBlockInsertRequest,
+    },
     persistence::PersistenceAction,
     tree::{
         payload_validator::{BasicEngineValidator, BlockOrPayload, TreeCtx, ValidationOutcome},
@@ -49,17 +52,23 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+fn direct_insert_identity(
+    expected_parent: BlockNumHash,
+    block: &ExecutedBlock,
+) -> DirectInsertBlockIdentity {
+    DirectInsertBlockIdentity { expected_parent, block: block.recovered_block().num_hash() }
+}
+
 #[tokio::test]
-async fn direct_executed_block_requires_expected_canonical_head() {
+async fn direct_insert_requires_expected_canonical_head() {
     let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
-    let child = test_harness
-        .block_builder
-        .get_executed_block_with_number(2, blocks[1].recovered_block().hash());
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let stale_head = BlockNumHash::new(actual_head.number, B256::random());
+    let child = test_harness.block_builder.get_executed_block_with_number(2, stale_head.hash);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new_for_test(stale_head, child);
+    let identity = direct_insert_identity(stale_head, &child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
 
     let _ = test_harness
         .tree
@@ -79,13 +88,14 @@ async fn direct_executed_block_requires_expected_canonical_head() {
 }
 
 #[tokio::test]
-async fn direct_executed_block_requires_direct_child_number() {
+async fn direct_insert_requires_direct_child_number() {
     let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let child = test_harness.block_builder.get_executed_block_with_number(3, actual_head.hash);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
+    let identity = direct_insert_identity(actual_head, &child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
 
     let _ = test_harness
         .tree
@@ -102,14 +112,16 @@ async fn direct_executed_block_requires_direct_child_number() {
 }
 
 #[tokio::test]
-async fn direct_executed_block_requires_canonical_parent_hash() {
+async fn direct_insert_rejects_payload_with_parent_different_from_identity() {
     let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
     let wrong_parent = B256::random();
     let child = test_harness.block_builder.get_executed_block_with_number(2, wrong_parent);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
+    let actual_block = child.recovered_block().num_hash();
+    let identity = DirectInsertBlockIdentity { expected_parent: actual_head, block: actual_block };
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
 
     let _ = test_harness
         .tree
@@ -120,22 +132,25 @@ async fn direct_executed_block_requires_canonical_parent_hash() {
 
     assert_eq!(
         response.await.unwrap(),
-        Err(ExecutedBlockInsertError::ParentHashMismatch {
-            expected: actual_head.hash,
-            actual: wrong_parent,
+        Err(ExecutedBlockInsertError::IdentityPayloadMismatch {
+            identity,
+            actual_block,
+            actual_parent: wrong_parent,
         })
     );
     assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
 }
 
 #[tokio::test]
-async fn direct_executed_block_acknowledges_valid_child_after_insertion() {
+async fn direct_insert_admits_valid_child_after_one_mutation() {
     let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
     let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
     let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let persisted_before = test_harness.tree.persistence_state.last_persisted_block;
     let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
     let child_hash = child.recovered_block().hash();
-    let (request, response) = ExecutedBlockInsertRequest::new_for_test(actual_head, child);
+    let identity = direct_insert_identity(actual_head, &child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
 
     let _ = test_harness
         .tree
@@ -144,8 +159,256 @@ async fn direct_executed_block_acknowledges_valid_child_after_insertion() {
         )))
         .unwrap();
 
-    assert_eq!(response.await.unwrap(), Ok(()));
+    assert_eq!(response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
     assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_some());
+    assert_eq!(test_harness.tree.persistence_state.last_persisted_block, persisted_before);
+}
+
+#[tokio::test]
+async fn direct_insert_rejects_identity_payload_mismatch_before_mutation() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let identity = DirectInsertBlockIdentity {
+        expected_parent: actual_head,
+        block: BlockNumHash::new(2, B256::random()),
+    };
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::IdentityPayloadMismatch {
+            identity,
+            actual_block: BlockNumHash::new(2, child_hash),
+            actual_parent: actual_head.hash,
+        })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
+}
+
+#[tokio::test]
+async fn direct_insert_exact_pending_retry_is_admitted_without_second_event() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let identity = direct_insert_identity(actual_head, &child);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child.clone());
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+    assert_eq!(response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+    let first_event = test_harness.from_tree_rx.recv().await.expect("first admission emits event");
+    assert_matches!(
+        first_event,
+        EngineApiEvent::BeaconConsensus(ConsensusEngineEvent::CanonicalBlockAdded(_, _))
+    );
+
+    let (retry, retry_response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            retry,
+        )))
+        .unwrap();
+
+    assert_eq!(retry_response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_rejects_conflicting_pending_child() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let admitted = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let admitted_identity = direct_insert_identity(actual_head, &admitted);
+    let (request, response) =
+        ExecutedBlockInsertRequest::new_for_test(admitted_identity, admitted.clone());
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+    assert_eq!(response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+    let _ = test_harness.from_tree_rx.recv().await.expect("first admission emits event");
+
+    let conflicting =
+        test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let identity = direct_insert_identity(actual_head, &conflicting);
+    let conflicting_hash = conflicting.recovered_block().hash();
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, conflicting);
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::PendingIdentityConflict {
+            requested: identity,
+            pending: admitted_identity,
+        })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(conflicting_hash).is_none());
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_exact_canonical_retry_is_already_canonical() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let canonical = blocks[1].clone();
+    let expected_parent = blocks[0].recovered_block().num_hash();
+    let identity = direct_insert_identity(expected_parent, &canonical);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, canonical.clone());
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::AlreadyCanonical));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_rejects_conflicting_canonical_identity() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let expected_parent = blocks[0].recovered_block().num_hash();
+    let canonical = blocks[1].clone();
+    let canonical_identity = direct_insert_identity(expected_parent, &canonical);
+    let conflicting =
+        test_harness.block_builder.get_executed_block_with_number(1, expected_parent.hash);
+    let identity = direct_insert_identity(expected_parent, &conflicting);
+    assert_ne!(identity, canonical_identity, "fixture must produce a different canonical identity");
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, conflicting);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::CanonicalIdentityConflict {
+            requested: identity,
+            canonical: canonical_identity,
+        })
+    );
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_real_provider_restart_classifies_exact_canonical_identity() {
+    let chain_spec = MAINNET.clone();
+    let provider_factory = create_test_provider_factory_with_chain_spec(Arc::clone(&chain_spec));
+    insert_genesis(&provider_factory, Arc::clone(&chain_spec)).expect("insert genesis state");
+    let genesis =
+        SealedBlock::<Block>::seal_parts(chain_spec.genesis_header().clone(), BlockBody::default());
+    let genesis = RecoveredBlock::new_sealed(genesis, Vec::new());
+    let mut block_builder = TestBlockBuilder::eth().with_chain_spec((*chain_spec).clone());
+    let canonical = block_builder.get_executed_block_with_number(1, genesis.hash());
+
+    {
+        let provider_rw = provider_factory.provider_rw().expect("open provider for persistence");
+        provider_rw.insert_block(&genesis).expect("persist genesis block");
+        provider_rw.insert_block(canonical.recovered_block()).expect("persist canonical child");
+        provider_rw.commit().expect("commit persisted canonical chain");
+    }
+
+    // Construct a new handler after persistence. Its in-memory canonical state has only a head
+    // marker, so retry classification must read the persisted canonical header from the provider.
+    let provider = BlockchainProvider::new(provider_factory).expect("open provider after restart");
+    let consensus = Arc::new(EthBeaconConsensus::new(Arc::clone(&chain_spec)));
+    let payload_validator = BasicEngineValidator::new(
+        provider.clone(),
+        consensus.clone(),
+        MockEvmConfig::default(),
+        MockEngineValidator::default(),
+        TreeConfig::default(),
+        Box::new(NoopInvalidBlockHook::default()),
+        ChangesetCache::new(),
+        reth_tasks::Runtime::test(),
+    );
+    let (outgoing, mut events) = unbounded_channel();
+    let (persistence_tx, _persistence_rx) = std::sync::mpsc::channel();
+    let canonical_head = canonical.recovered_block().num_hash();
+    let mut tree = EngineApiTreeHandler::new(
+        provider,
+        consensus,
+        payload_validator,
+        outgoing,
+        EngineApiTreeState::new(10, 10, canonical_head, EngineApiKind::Ethereum),
+        CanonicalInMemoryState::with_head(
+            canonical.recovered_block().clone_sealed_header(),
+            None,
+            None,
+        ),
+        PersistenceHandle::new(persistence_tx),
+        PersistenceState { last_persisted_block: canonical_head, rx: None },
+        PayloadBuilderHandle::new(unbounded_channel().0),
+        TreeConfig::default().with_legacy_state_root(false).with_has_enough_parallelism(true),
+        EngineApiKind::Ethereum,
+        MockEvmConfig::default(),
+        ChangesetCache::new(),
+        reth_tasks::Runtime::test(),
+        false,
+        Arc::new(std::sync::atomic::AtomicU64::new(canonical_head.number)),
+    );
+    let identity = direct_insert_identity(BlockNumHash::new(0, genesis.hash()), &canonical);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, canonical);
+
+    let _ = tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(response.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::AlreadyCanonical));
+    assert!(events.try_recv().is_err());
+
+    let conflicting = block_builder.get_executed_block_with_number(1, genesis.hash());
+    let conflicting_identity =
+        direct_insert_identity(BlockNumHash::new(0, genesis.hash()), &conflicting);
+    assert_ne!(conflicting_identity, identity, "fixture must produce a different block hash");
+    let (request, response) =
+        ExecutedBlockInsertRequest::new_for_test(conflicting_identity, conflicting);
+    let _ = tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::CanonicalIdentityConflict {
+            requested: conflicting_identity,
+            canonical: identity,
+        })
+    );
+    assert!(events.try_recv().is_err());
 }
 
 /// Mock engine validator for tests

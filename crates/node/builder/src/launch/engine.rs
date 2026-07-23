@@ -311,8 +311,9 @@ impl EngineNodeLauncher {
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;
 
-        // Channel for direct executed-block insertion from the Diesis pipeline.
-        // Created outside the async block so the sender can be exposed on RpcHandle.
+        // Channel for typed direct executed-block admission from the Diesis pipeline. The
+        // acknowledgement proves only engine-tree admission; forkchoice and persistence remain
+        // separate. Created outside the async block so the sender can be exposed on RpcHandle.
         let (executed_block_ingress_tx, executed_block_rx) =
             tokio::sync::mpsc::channel::<
                 ExecutedBlockInsertRequest<<T::Types as reth_node_api::NodeTypes>::Primitives>,
@@ -407,7 +408,7 @@ impl EngineNodeLauncher {
                     Some(request) = executed_block_rx.recv() => {
                         debug!(
                             target: "reth::cli",
-                            expected_head=?request.expected_canonical_head(),
+                            identity=?request.identity(),
                             block=?request.block().recovered_block().num_hash(),
                             "conditionally inserting pipeline executed block (direct insert)"
                         );

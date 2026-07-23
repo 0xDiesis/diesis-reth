@@ -8,7 +8,8 @@ use reth_engine_tree::tree::WaitForCaches;
 pub use reth_engine_tree::{
     engine::{
         CanonicalSnapshotBarrierRequest, CanonicalSnapshotExportError, CanonicalSnapshotHandle,
-        ExecutedBlockInsertError, ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
+        DirectInsertBlockIdentity, ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError,
+        ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
     },
     tree::{BasicEngineValidator, EngineValidator},
 };
@@ -353,8 +354,8 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub engine_shutdown: EngineShutdown,
     /// Optional bounded sender for conditional direct insertion into the engine tree, bypassing
     /// `new_payload` re-execution. Its high-level API retains capacity across both internal queues
-    /// and returns the tree's typed acknowledgement so callers can distinguish acceptance from a
-    /// reorg or unavailable engine.
+    /// and returns a typed admission outcome. `Admitted` only proves tree admission; forkchoice
+    /// and persistence remain separate operations.
     pub executed_block_tx:
         Option<ExecutedBlockInsertSender<<Node::Types as NodeTypes>::Primitives>>,
     /// Shared counter tracking the highest block number confirmed as persisted
