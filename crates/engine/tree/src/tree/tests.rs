@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     engine::{
         DirectInsertBlockIdentity, ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError,
-        ExecutedBlockInsertRequest,
+        ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
     },
     persistence::PersistenceAction,
     tree::{
@@ -409,6 +409,126 @@ async fn direct_insert_real_provider_restart_classifies_exact_canonical_identity
         })
     );
     assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_provider_read_failure_rejects_before_mutation_or_event() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let identity = direct_insert_identity(actual_head, &child);
+    test_harness.tree.canonical_in_memory_state.clear_state();
+    test_harness.tree.test_canonical_provider_read_error = Some(ProviderError::UnsupportedProvider);
+    let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, child);
+
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            request,
+        )))
+        .unwrap();
+
+    assert_eq!(
+        response.await.unwrap(),
+        Err(ExecutedBlockInsertError::CanonicalProviderReadFailed {
+            message: "this provider does not support this request".to_owned(),
+        })
+    );
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_none());
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_retry_after_response_drop_before_tree_processing_admits_once() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let identity = direct_insert_identity(actual_head, &child);
+    let (ingress_tx, mut ingress_rx) = tokio::sync::mpsc::channel(1);
+    let sender = ExecutedBlockInsertSender::new(ingress_tx, 1);
+
+    let first = tokio::spawn({
+        let sender = sender.clone();
+        let child = child.clone();
+        async move { sender.insert(identity, child).await }
+    });
+    let abandoned_request = ingress_rx.recv().await.expect("public sender enqueues request");
+    first.abort();
+    assert!(first.await.expect_err("caller was cancelled").is_cancelled());
+    drop(abandoned_request);
+    assert_eq!(sender.available_capacity(), 1);
+
+    let retry = tokio::spawn({
+        let sender = sender.clone();
+        async move { sender.insert(identity, child).await }
+    });
+    let retry_request = ingress_rx.recv().await.expect("retry reaches tree ingress");
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            retry_request,
+        )))
+        .unwrap();
+
+    assert_eq!(retry.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_some());
+    assert_matches!(
+        test_harness.from_tree_rx.recv().await,
+        Some(EngineApiEvent::BeaconConsensus(ConsensusEngineEvent::CanonicalBlockAdded(_, _)))
+    );
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_insert_retry_after_response_drop_during_tree_processing_is_idempotent() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut test_harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks.clone());
+    let actual_head = *test_harness.tree.state.tree_state.canonical_head();
+    let child = test_harness.block_builder.get_executed_block_with_number(2, actual_head.hash);
+    let child_hash = child.recovered_block().hash();
+    let identity = direct_insert_identity(actual_head, &child);
+    let (ingress_tx, mut ingress_rx) = tokio::sync::mpsc::channel(1);
+    let sender = ExecutedBlockInsertSender::new(ingress_tx, 1);
+
+    let first = tokio::spawn({
+        let sender = sender.clone();
+        let child = child.clone();
+        async move { sender.insert(identity, child).await }
+    });
+    let first_request = ingress_rx.recv().await.expect("public sender enqueues request");
+    first.abort();
+    assert!(first.await.expect_err("caller was cancelled").is_cancelled());
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            first_request,
+        )))
+        .unwrap();
+    assert!(test_harness.tree.state.tree_state.executed_block_by_hash(child_hash).is_some());
+    assert_matches!(
+        test_harness.from_tree_rx.recv().await,
+        Some(EngineApiEvent::BeaconConsensus(ConsensusEngineEvent::CanonicalBlockAdded(_, _)))
+    );
+    assert_eq!(sender.available_capacity(), 1);
+
+    let retry = tokio::spawn({
+        let sender = sender.clone();
+        async move { sender.insert(identity, child).await }
+    });
+    let retry_request = ingress_rx.recv().await.expect("retry reaches tree ingress");
+    let _ = test_harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            retry_request,
+        )))
+        .unwrap();
+
+    assert_eq!(retry.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+    assert!(test_harness.from_tree_rx.try_recv().is_err());
 }
 
 /// Mock engine validator for tests

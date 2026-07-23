@@ -377,6 +377,9 @@ where
     /// block number. Written here on persistence completion, read by the
     /// pipeline overlay eviction logic.
     persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-only failure injected at the canonical provider lookup boundary.
+    #[cfg(test)]
+    test_canonical_provider_read_error: Option<ProviderError>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -472,6 +475,8 @@ where
             runtime,
             use_hashed_state,
             persisted_head_notifier,
+            #[cfg(test)]
+            test_canonical_provider_read_error: None,
         }
     }
 
@@ -1625,13 +1630,25 @@ where
             }))
         }
 
-        let header = self.provider.sealed_header(number).map_err(|error| {
+        let header = self.read_canonical_header(number).map_err(|error| {
             ExecutedBlockInsertError::CanonicalProviderReadFailed { message: error.to_string() }
         })?;
         Ok(header.map(|header| DirectInsertBlockIdentity {
             expected_parent: BlockNumHash::new(number.saturating_sub(1), header.parent_hash()),
             block: header.num_hash(),
         }))
+    }
+
+    fn read_canonical_header(
+        &self,
+        number: u64,
+    ) -> Result<Option<SealedHeader<N::BlockHeader>>, ProviderError> {
+        #[cfg(test)]
+        if let Some(error) = &self.test_canonical_provider_read_error {
+            return Err(error.clone())
+        }
+
+        self.provider.sealed_header(number)
     }
 
     fn pending_direct_insert_identity(&self) -> Option<DirectInsertBlockIdentity> {
