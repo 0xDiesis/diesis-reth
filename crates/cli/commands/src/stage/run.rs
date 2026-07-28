@@ -30,8 +30,8 @@ use reth_node_metrics::{
 };
 use reth_primitives_traits::FastInstant as Instant;
 use reth_provider::{
-    ChainSpecProvider, DBProvider, DatabaseProviderFactory, StageCheckpointReader,
-    StageCheckpointWriter,
+    providers::BlockchainProvider, ChainSpecProvider, DBProvider, DatabaseProviderFactory,
+    StageCheckpointReader, StageCheckpointWriter,
 };
 use reth_stages::{
     stages::{
@@ -175,7 +175,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             default_peers_path,
                             runtime.clone(),
                         )
-                        .build(provider_factory.clone())
+                        .build(BlockchainProvider::new(provider_factory.clone())?)
                         .start_network()
                         .await?;
                     let fetch_client = Arc::new(network.fetch_client().await?);
@@ -210,7 +210,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                     let consensus = Arc::new(components.consensus().clone());
 
                     let mut config = config;
-                    config.peers.trusted_nodes_only = self.network.trusted_only;
+                    config.peers.trusted_nodes_only |= self.network.trusted_only;
                     config.peers.trusted_nodes.extend(self.network.trusted_peers.clone());
 
                     let network_secret_path = self
@@ -231,7 +231,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             default_peers_path,
                             runtime.clone(),
                         )
-                        .build(provider_factory.clone())
+                        .build(BlockchainProvider::new(provider_factory.clone())?)
                         .start_network()
                         .await?;
                     let fetch_client = Arc::new(network.fetch_client().await?);

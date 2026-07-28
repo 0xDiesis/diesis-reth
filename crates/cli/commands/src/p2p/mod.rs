@@ -76,7 +76,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                     eyre::bail!(
                         "Invalid number of bodies received. Expected: 1. Received: {}",
                         result.len()
-                    )
+                    );
                 }
                 let body = result.into_iter().next().unwrap();
                 tracing::info!(target: "reth::cli", ?body, "Successfully downloaded body")
@@ -185,10 +185,10 @@ impl<C: ChainSpecParser> DownloadArgs<C> {
         if config.peers.trusted_nodes.is_empty() && self.network.trusted_only {
             eyre::bail!(
                 "No trusted nodes. Set trusted peer with `--trusted-peer <enode record>` or set `--trusted-only` to `false`"
-            )
+            );
         }
 
-        config.peers.trusted_nodes_only = self.network.trusted_only;
+        config.peers.trusted_nodes_only |= self.network.trusted_only;
 
         let default_secret_key_path = data_dir.p2p_secret();
         let p2p_secret_key = self.network.secret_key(default_secret_key_path)?;

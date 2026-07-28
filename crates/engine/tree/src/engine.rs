@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use reth_chain_state::ExecutedBlock;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineEvent};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_payload_primitives::PayloadTypes;
+use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadTypes};
 use reth_primitives_traits::{Block, NodePrimitives, SealedBlock};
 use reth_provider::{CanonicalSnapshotError, CanonicalSnapshotResult};
 use std::{
@@ -249,7 +249,7 @@ impl EngineApiKind {
         matches!(self, Self::Ethereum)
     }
 
-    /// Returns true if this is the ethereum variant
+    /// Returns true if this is the opstack variant
     pub const fn is_opstack(&self) -> bool {
         matches!(self, Self::OpStack)
     }
@@ -261,7 +261,7 @@ pub enum EngineApiRequest<T: PayloadTypes, N: NodePrimitives> {
     /// A request received from the consensus engine.
     Beacon(BeaconEngineMessage<T>),
     /// Request to insert an already executed block, e.g. via payload building.
-    InsertExecutedBlock(ExecutedBlock<N>),
+    InsertExecutedBlock(BuiltPayloadExecutedBlock<N>),
     /// Request to insert an already executed block only if it is the direct child of the expected
     /// canonical head.
     InsertExecutedBlockIfCanonical(ExecutedBlockInsertRequest<N>),
@@ -275,8 +275,8 @@ impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Beacon(msg) => msg.fmt(f),
-            Self::InsertExecutedBlock(block) => {
-                write!(f, "InsertExecutedBlock({:?})", block.recovered_block().num_hash())
+            Self::InsertExecutedBlock(payload) => {
+                write!(f, "InsertExecutedBlock({:?})", payload.recovered_block.num_hash())
             }
             Self::InsertExecutedBlockIfCanonical(request) => {
                 write!(f, "InsertExecutedBlockIfCanonical(identity={:?})", request.identity(),)
