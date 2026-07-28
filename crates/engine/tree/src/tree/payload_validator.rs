@@ -485,6 +485,7 @@ where
         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
     {
         let parent_hash = input.parent_hash();
+        let is_payload = matches!(&input, BlockOrPayload::Payload(_));
         let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
         let txpool_snapshot =
             self.txpool_prewarm.as_ref().and_then(|prewarmer| prewarmer.snapshot(parent_hash));
@@ -509,7 +510,16 @@ where
         // Spawn payload conversion and basic validation on a background thread so it runs
         // concurrently with the rest of the function (setup + execution). For payloads this
         // overlaps the cost of RLP decoding + header hashing.
-        let validated_block = self.spawn_convert_and_validate(&input, parent_block.clone());
+        let parent_state_validated = self.consensus.requires_parent_state_validation();
+        let suspicious_gas =
+            input.gas_used() > parent_block.gas_limit() * MAX_EXPECTED_GAS_USAGE_MULTIPLIER;
+        let mut body_prevalidated = false;
+        let mut validated_block = Some(self.spawn_convert_and_validate(
+            &input,
+            parent_block.clone(),
+            parent_state_validated,
+        ));
+        let mut prevalidated_block = None;
 
         /// A helper macro that returns the block in case there was an error
         /// This macro is used for early returns before block conversion
@@ -518,7 +528,14 @@ where
                 match $expr {
                     Ok(val) => val,
                     Err(e) => {
-                        let block = validated_block.try_into_inner().expect("sole handle")?;
+                        let block = match prevalidated_block.take() {
+                            Some(block) => block,
+                            None => validated_block
+                                .take()
+                                .expect("handle present before block materialization")
+                                .try_into_inner()
+                                .expect("sole handle")?,
+                        };
                         return Err(InsertBlockError::new(block, e.into()).into())
                     }
                 }
@@ -541,10 +558,17 @@ where
 
         // If the gas usage is suspiciously high (multiple times higher than parent's gas limit), be
         // cautious and block on pre-execution checks of the block.
-        if input.gas_used() > parent_block.gas_limit() * MAX_EXPECTED_GAS_USAGE_MULTIPLIER {
+        if suspicious_gas {
             // Call `.get()` to await the pre-execution checks and exit early if they fail.
-            if validated_block.get().is_err() {
+            if validated_block
+                .as_ref()
+                .expect("handle present before opt-in materialization")
+                .get()
+                .is_err()
+            {
                 return Err(validated_block
+                    .take()
+                    .expect("handle present after failed suspicious-gas validation")
                     .try_into_inner()
                     .expect("sole handle")
                     .expect_err("Err result checked"))
@@ -559,12 +583,42 @@ where
         else {
             // this is pre-validated in the tree
             return Err(InsertBlockError::new(
-                validated_block.try_into_inner().expect("sole handle")?,
+                validated_block
+                    .take()
+                    .expect("handle present before block materialization")
+                    .try_into_inner()
+                    .expect("sole handle")?,
                 ProviderError::HeaderNotFound(parent_hash.into()).into(),
             )
             .into())
         };
         drop(_enter);
+
+        if parent_state_validated {
+            let block = validated_block
+                .take()
+                .expect("handle present before opt-in materialization")
+                .try_into_inner()
+                .expect("sole handle")?;
+            let provider = match provider_builder.build() {
+                Ok(provider) => provider,
+                Err(err) => return Err(InsertBlockError::new(block, err.into()).into()),
+            };
+            if let Err(err) = self.consensus.validate_header_against_parent_with_state(
+                block.sealed_header(),
+                &parent_block,
+                provider.as_ref(),
+            ) {
+                return Err(InsertBlockError::new(block, err.into()).into());
+            }
+            if suspicious_gas {
+                if let Err(err) = self.validate_block_pre_execution_inner(&block, None) {
+                    return Err(InsertBlockError::new(block, err.into()).into());
+                }
+                body_prevalidated = true;
+            }
+            prevalidated_block = Some(block);
+        }
 
         let evm_env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
             .in_scope(|| self.evm_env_for(&input))
@@ -573,7 +627,7 @@ where
         // Extract the decoded BAL, if valid and available.
         let decoded_bal = ensure_ok!(input
             .try_decoded_access_list()
-            .map_err(|err| ConsensusError::BlockAccessListInvalid(err.to_string())))
+            .map_err(Box::<dyn core::error::Error + Send + Sync + 'static>::from))
         .map(Arc::new);
 
         if let Some(decoded_bal) = decoded_bal.as_deref() {
@@ -740,7 +794,27 @@ where
         if let (Some(metrics), Some(stats)) = (&state_provider_metrics, &state_provider_stats) {
             metrics.record_totals(stats);
         }
-        let (output, senders, receipt_root_rx, built_bal) = ensure_ok!(execution_result);
+        let (output, senders, receipt_root_rx, built_bal) = match execution_result {
+            Ok(output) => output,
+            Err(err) => {
+                let block = match prevalidated_block.take() {
+                    Some(block) => block,
+                    None => validated_block
+                        .take()
+                        .expect("handle present before block materialization")
+                        .try_into_inner()
+                        .expect("sole handle")?,
+                };
+                if parent_state_validated && !body_prevalidated {
+                    if let Err(consensus_err) =
+                        self.validate_block_pre_execution_inner(&block, None)
+                    {
+                        return Err(InsertBlockError::new(block, consensus_err.into()).into());
+                    }
+                }
+                return Err(InsertBlockError::new(block, err).into());
+            }
+        };
 
         // After executing the block we can stop prewarming transactions
         handle.stop_prewarming_execution();
@@ -774,8 +848,27 @@ where
                 }
             });
 
-        let block = validated_block.try_into_inner().expect("sole handle")?;
+        let block = match prevalidated_block.take() {
+            Some(block) => block,
+            None => validated_block
+                .take()
+                .expect("handle present before block materialization")
+                .try_into_inner()
+                .expect("sole handle")?,
+        };
         let block = block.with_senders(senders);
+
+        let transaction_root = (is_payload && parent_state_validated && !body_prevalidated).then(|| {
+            let body = block.body().clone();
+            let parent_span = Span::current();
+            let num_hash = block.num_hash();
+            self.runtime.spawn_blocking_named("payload-tx-root", move || {
+                let _span =
+                    debug_span!(target: "engine::tree::payload_validator", parent: parent_span, "payload_tx_root", block = ?num_hash)
+                        .entered();
+                body.calculate_tx_root()
+            })
+        });
 
         // Wait for the receipt root computation to complete.
         let receipt_root_bloom = {
@@ -795,6 +888,12 @@ where
                 })
                 .ok()
         };
+        let transaction_root = transaction_root.map(|handle| {
+            let _span =
+                debug_span!(target: "engine::tree::payload_validator", "wait_payload_tx_root")
+                    .entered();
+            handle.try_into_inner().expect("sole handle")
+        });
 
         ensure_ok_post_block!(
             self.validate_post_execution(
@@ -802,8 +901,11 @@ where
                 &parent_block,
                 &output,
                 &mut ctx,
+                transaction_root,
                 receipt_root_bloom,
-                built_bal
+                built_bal,
+                parent_state_validated,
+                body_prevalidated,
             ),
             block
         );
@@ -870,6 +972,17 @@ where
             .record_state_root_gas_bucket(block.header().gas_used(), root_elapsed.as_secs_f64());
         debug!(target: "engine::tree::payload_validator", ?root_elapsed, "Calculated state root");
 
+        // This unsafe debug switch is off by default. Chains whose headers carry a Verkle or other
+        // non-MPT commitment need an import-time verifier for that commitment; this bypass is not a
+        // replacement for one, because it accepts the header's root without comparing anything.
+        if self.config.skip_state_root_validation() {
+            debug!(
+                target: "engine::tree::payload_validator",
+                block_state_root = ?block.header().state_root(),
+                computed_mpt_root = ?state_root,
+                "Skipping state root validation via unsafe debug switch"
+            );
+        } else
         // ensure state root matches
         if state_root != block.header().state_root() {
             // call post-block hook
@@ -919,6 +1032,7 @@ where
         &self,
         input: &BlockOrPayload<T>,
         parent: SealedHeader<N::BlockHeader>,
+        parent_state_validated: bool,
     ) -> LazyHandle<Result<SealedBlock<N::Block>, InsertPayloadError<N::Block>>>
     where
         T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>,
@@ -947,24 +1061,41 @@ where
                 return Err(InsertBlockError::consensus_error(e, block).into())
             }
 
-            // now validate against the parent
-            let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_header_against_parent").entered();
-            if let Err(e) = consensus.validate_header_against_parent(block.sealed_header(), &parent)
-            {
-                warn!(target: "engine::tree::payload_validator", ?block, "Failed to validate header {} against parent: {e}", block.hash());
-                return Err(InsertBlockError::consensus_error(e, block).into())
-            }
-            drop(_enter);
+            if !parent_state_validated {
+                // The default path can validate the parent without a state provider.
+                let _enter = debug_span!(target: "engine::tree::payload_validator", "validate_header_against_parent").entered();
+                if let Err(e) =
+                    consensus.validate_header_against_parent(block.sealed_header(), &parent)
+                {
+                    warn!(target: "engine::tree::payload_validator", ?block, "Failed to validate header {} against parent: {e}", block.hash());
+                    return Err(InsertBlockError::consensus_error(e, block).into())
+                }
+                drop(_enter);
 
-            if let Err(e) =
-                consensus.validate_block_pre_execution_with_tx_root(&block, None)
-            {
-                error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {e}", block.hash());
-                return Err(InsertBlockError::consensus_error(e, block).into())
+                if let Err(e) = consensus.validate_block_pre_execution_with_tx_root(&block, None)
+                {
+                    error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {e}", block.hash());
+                    return Err(InsertBlockError::consensus_error(e, block).into())
+                }
             }
 
             Ok(block)
         })
+    }
+
+    fn validate_block_pre_execution_inner(
+        &self,
+        block: &SealedBlock<N::Block>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        if let Err(err) =
+            self.consensus.validate_block_pre_execution_with_tx_root(block, transaction_root)
+        {
+            error!(target: "engine::tree::payload_validator", ?block, "Failed to validate block {}: {err}", block.hash());
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// Return sealed block header from database or in-memory state by hash.
@@ -1304,7 +1435,7 @@ where
     /// Validates the block after execution.
     ///
     /// This performs:
-    /// - parent header validation
+    /// - deferred pre-execution validation when parent-state validation is required
     /// - post-execution consensus validation
     /// - state-root based post-execution validation
     ///
@@ -1319,8 +1450,11 @@ where
         parent_block: &SealedHeader<N::BlockHeader>,
         output: &BlockExecutionOutput<N::Receipt>,
         ctx: &mut TreeCtx<'_, N>,
+        transaction_root: Option<B256>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
         built_bal: Option<BlockAccessList>,
+        parent_state_validated: bool,
+        body_prevalidated: bool,
     ) -> Result<(), InsertBlockErrorKind>
     where
         V: PayloadValidator<T, Block = N::Block>,
@@ -1328,6 +1462,10 @@ where
         let start = Instant::now();
 
         trace!(target: "engine::tree::payload_validator", block=?block.num_hash(), "Validating block consensus");
+
+        if parent_state_validated && !body_prevalidated {
+            self.validate_block_pre_execution_inner(block, transaction_root)?;
+        }
 
         // Validate block post-execution rules
         let _enter =

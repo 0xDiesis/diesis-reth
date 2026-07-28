@@ -54,6 +54,9 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[path = "tests/payload_validator.rs"]
+mod payload_validator;
+
 fn direct_insert_identity(
     expected_parent: BlockNumHash,
     block: &ExecutedBlock,
