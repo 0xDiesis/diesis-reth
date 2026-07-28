@@ -275,6 +275,7 @@ fn stage_checkpoint_progress(provider: &impl StatsReader) -> ProviderResult<Enti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::transaction::TxHashRef;
     use crate::test_utils::{
         stage_test_suite_ext, ExecuteStageTestRunner, StageTestRunner, TestRunnerError,
         TestStageDB, UnwindStageTestRunner,

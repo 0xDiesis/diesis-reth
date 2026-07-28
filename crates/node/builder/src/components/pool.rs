@@ -50,11 +50,11 @@ where
 /// Convenience type to override cli or default pool configuration during build.
 #[derive(Debug, Clone, Default)]
 pub struct PoolBuilderConfigOverrides {
-    /// Max number of transaction in the pending sub-pool
+    /// Max number of transactions in the pending sub-pool
     pub pending_limit: Option<SubPoolLimit>,
-    /// Max number of transaction in the basefee sub-pool
+    /// Max number of transactions in the basefee sub-pool
     pub basefee_limit: Option<SubPoolLimit>,
-    /// Max number of transaction in the queued sub-pool
+    /// Max number of transactions in the queued sub-pool
     pub queued_limit: Option<SubPoolLimit>,
     /// Max number of transactions in the blob sub-pool
     pub blob_limit: Option<SubPoolLimit>,
@@ -136,8 +136,8 @@ where
     V::Transaction:
         PoolTransaction<Consensus = TxTy<Node::Types>> + reth_transaction_pool::EthPoolTransaction,
 {
-    /// Consume the ype and build the [`reth_transaction_pool::Pool`] with the given config and blob
-    /// store.
+    /// Consume the type and build the [`reth_transaction_pool::Pool`] with the given config and
+    /// blob store.
     pub fn build<BS>(
         self,
         blob_store: BS,
@@ -173,7 +173,7 @@ where
         >,
     >
     where
-        BS: BlobStore,
+        BS: BlobStore + Clone,
     {
         self.build_with_ordering_and_spawn_maintenance_task(
             CoinbaseTipOrdering::default(),
@@ -197,7 +197,7 @@ where
         >,
     >
     where
-        BS: BlobStore,
+        BS: BlobStore + Clone,
     {
         let TxPoolBuilder { ctx, validator, .. } = self;
         let transaction_pool = reth_transaction_pool::Pool::new_with_sender_cost_overlay(
@@ -222,7 +222,7 @@ where
         pool_config: PoolConfig,
     ) -> eyre::Result<reth_transaction_pool::Pool<TransactionValidationTaskExecutor<V>, O, BS>>
     where
-        BS: BlobStore,
+        BS: BlobStore + Clone,
         O: TransactionOrdering<Transaction = V::Transaction>,
     {
         let TxPoolBuilder { ctx, validator, .. } = self;

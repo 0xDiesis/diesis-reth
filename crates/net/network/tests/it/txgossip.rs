@@ -1,5 +1,5 @@
 //! Testing gossiping of transactions.
-use alloy_consensus::TxLegacy;
+use alloy_consensus::{transaction::TxHashRef, TxLegacy};
 use alloy_primitives::{Signature, U256};
 use futures::StreamExt;
 use reth_ethereum_primitives::TransactionSigned;

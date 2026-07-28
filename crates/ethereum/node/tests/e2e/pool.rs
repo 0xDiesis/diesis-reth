@@ -1,5 +1,6 @@
 use crate::utils::eth_payload_attributes;
 use alloy_consensus::{EthereumTxEnvelope, TxEip4844};
+use reth_ethereum_primitives::TransactionSigned;
 use alloy_eips::{eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, Encodable2718};
 use alloy_genesis::Genesis;
 use alloy_primitives::B256;
@@ -77,7 +78,7 @@ async fn maintain_txpool_stale_eviction() -> eyre::Result<()> {
     let envelop =
         TransactionTestContext::transfer_tx_with_gas_fee(1, Some(8_u128), wallet.inner).await;
     let tx = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop.clone()),
+        TransactionSigned::from(EthereumTxEnvelope::<TxEip4844>::from(envelop.clone())),
         Default::default(),
     );
     let pooled_tx = EthPooledTransaction::new(tx.clone(), 200);
@@ -147,7 +148,7 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
     // build tx1 from wallet1
     let envelop1 = TransactionTestContext::transfer_tx(1, w1.clone()).await;
     let tx1 = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop1.clone()),
+        TransactionSigned::from(EthereumTxEnvelope::<TxEip4844>::from(envelop1.clone())),
         w1.address(),
     );
     let pooled_tx1 = EthPooledTransaction::new(tx1.clone(), 200);
@@ -156,7 +157,7 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
     // build tx2 from wallet2
     let envelop2 = TransactionTestContext::transfer_tx(1, w2.clone()).await;
     let tx2 = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop2.clone()),
+        TransactionSigned::from(EthereumTxEnvelope::<TxEip4844>::from(envelop2.clone())),
         w2.address(),
     );
     let pooled_tx2 = EthPooledTransaction::new(tx2.clone(), 200);
@@ -275,7 +276,7 @@ async fn maintain_txpool_commit() -> eyre::Result<()> {
 
     let envelop = TransactionTestContext::transfer_tx(1, wallet.inner).await;
     let tx = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop.clone()),
+        TransactionSigned::from(EthereumTxEnvelope::<TxEip4844>::from(envelop.clone())),
         Default::default(),
     );
     let pooled_tx = EthPooledTransaction::new(tx.clone(), 200);
