@@ -902,6 +902,14 @@ where
         state: ForkchoiceState,
         payload_attrs: Option<EngineT::PayloadAttributes>,
     ) -> EngineApiResult<ForkchoiceUpdated> {
+        if payload_attrs.is_some() && !self.inner.capabilities.external_payload_building() {
+            let fcu_res = self.inner.beacon_consensus.fork_choice_updated(state, None).await?;
+            if fcu_res.is_invalid() || fcu_res.payload_status.is_syncing() {
+                return Ok(fcu_res);
+            }
+            return Err(EngineApiError::ExternalPayloadBuildingUnsupported);
+        }
+
         if let Some(ref attrs) = payload_attrs {
             let attr_validation_res =
                 self.inner.validator.ensure_well_formed_attributes(version, attrs);
@@ -1632,6 +1640,21 @@ mod tests {
             ChainSpec,
         >,
     ) {
+        setup_engine_api_with_capabilities(EngineCapabilities::default())
+    }
+
+    fn setup_engine_api_with_capabilities(
+        capabilities: EngineCapabilities,
+    ) -> (
+        EngineApiTestHandle,
+        EngineApi<
+            Arc<MockEthProvider>,
+            EthEngineTypes,
+            NoopTransactionPool,
+            EthereumEngineValidator,
+            ChainSpec,
+        >,
+    ) {
         let client = ClientVersionV1 {
             code: ClientCode::RH,
             name: "Reth".to_string(),
@@ -1652,7 +1675,7 @@ mod tests {
             NoopTransactionPool::default(),
             task_executor,
             client,
-            EngineCapabilities::default(),
+            capabilities,
             EthereumEngineValidator::new(chain_spec.clone()),
             false,
             NoopNetwork::default(),
@@ -2178,6 +2201,159 @@ mod tests {
             .expect("api task should not panic")
             .expect("forkchoiceUpdatedV3 should return a syncing response");
         assert!(response.payload_status.is_syncing());
+        assert!(response.payload_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn fcu_v3_disabled_external_payload_building_returns_error_after_valid_forkchoice() {
+        let (mut handle, api) = setup_engine_api_with_capabilities(
+            EngineCapabilities::default().without_external_payload_building(),
+        );
+        let state = ForkchoiceState {
+            head_block_hash: B256::from([0x31; 32]),
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        let payload_attributes = PayloadAttributes {
+            timestamp: 1,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: Address::ZERO,
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+
+        let api_task = tokio::spawn(async move {
+            api.fork_choice_updated_v3(state, Some(payload_attributes)).await
+        });
+
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle.from_api.recv())
+                .await
+                .expect("timed out waiting for forkchoiceUpdated request")
+                .expect("expected forkchoiceUpdated request");
+        let response_tx = match request {
+            BeaconEngineMessage::ForkchoiceUpdated { payload_attrs, tx, .. } => {
+                assert!(payload_attrs.is_none(), "disabled endpoint must not forward build attrs");
+                tx
+            }
+            other => panic!("unexpected engine message: {other:?}"),
+        };
+        response_tx
+            .send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::from_status(
+                PayloadStatusEnum::Valid,
+            ))))
+            .expect("send valid response");
+
+        assert_matches!(
+            api_task.await.expect("api task should not panic"),
+            Err(EngineApiError::ExternalPayloadBuildingUnsupported)
+        );
+        match tokio::time::timeout(std::time::Duration::from_millis(100), handle.from_api.recv())
+            .await
+        {
+            Err(_) | Ok(None) => {}
+            Ok(Some(BeaconEngineMessage::ForkchoiceUpdated { .. })) => {
+                panic!("disabled endpoint must not schedule a payload build")
+            }
+            Ok(Some(other)) => panic!("unexpected engine message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fcu_v3_disabled_external_payload_building_returns_syncing_without_payload_id() {
+        let (mut handle, api) = setup_engine_api_with_capabilities(
+            EngineCapabilities::default().without_external_payload_building(),
+        );
+        let state = ForkchoiceState {
+            head_block_hash: B256::from([0x32; 32]),
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        let payload_attributes = PayloadAttributes {
+            timestamp: 1,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: Address::ZERO,
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+
+        let api_task = tokio::spawn(async move {
+            api.fork_choice_updated_v3(state, Some(payload_attributes)).await
+        });
+
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle.from_api.recv())
+                .await
+                .expect("timed out waiting for forkchoiceUpdated request")
+                .expect("expected forkchoiceUpdated request");
+        let response_tx = match request {
+            BeaconEngineMessage::ForkchoiceUpdated { payload_attrs, tx, .. } => {
+                assert!(payload_attrs.is_none(), "disabled endpoint must not forward build attrs");
+                tx
+            }
+            other => panic!("unexpected engine message: {other:?}"),
+        };
+        response_tx.send(Ok(OnForkChoiceUpdated::syncing())).expect("send syncing response");
+
+        let response = api_task
+            .await
+            .expect("api task should not panic")
+            .expect("disabled endpoint must preserve syncing response");
+        assert!(response.payload_status.is_syncing());
+        assert!(response.payload_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn fcu_v3_disabled_external_payload_building_returns_invalid_without_payload_id() {
+        let (mut handle, api) = setup_engine_api_with_capabilities(
+            EngineCapabilities::default().without_external_payload_building(),
+        );
+        let state = ForkchoiceState {
+            head_block_hash: B256::from([0x33; 32]),
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        let payload_attributes = PayloadAttributes {
+            timestamp: 1,
+            prev_randao: B256::ZERO,
+            suggested_fee_recipient: Address::ZERO,
+            withdrawals: Some(vec![]),
+            parent_beacon_block_root: Some(B256::ZERO),
+            slot_number: None,
+            target_gas_limit: None,
+        };
+
+        let api_task = tokio::spawn(async move {
+            api.fork_choice_updated_v3(state, Some(payload_attributes)).await
+        });
+
+        let request =
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle.from_api.recv())
+                .await
+                .expect("timed out waiting for forkchoiceUpdated request")
+                .expect("expected forkchoiceUpdated request");
+        let response_tx = match request {
+            BeaconEngineMessage::ForkchoiceUpdated { payload_attrs, tx, .. } => {
+                assert!(payload_attrs.is_none(), "disabled endpoint must not forward build attrs");
+                tx
+            }
+            other => panic!("unexpected engine message: {other:?}"),
+        };
+        response_tx
+            .send(Ok(OnForkChoiceUpdated::with_invalid(PayloadStatus::from_status(
+                PayloadStatusEnum::Invalid { validation_error: "invalid head".to_string() },
+            ))))
+            .expect("send invalid response");
+
+        let response = api_task
+            .await
+            .expect("api task should not panic")
+            .expect("disabled endpoint must preserve invalid response");
+        assert!(response.payload_status.is_invalid());
         assert!(response.payload_id.is_none());
     }
 

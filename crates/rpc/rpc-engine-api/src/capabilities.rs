@@ -49,12 +49,41 @@ pub const CAPABILITIES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct EngineCapabilities {
     inner: HashSet<String>,
+    external_payload_building: bool,
 }
 
 impl EngineCapabilities {
     /// Creates from an iterator of capability strings.
     pub fn new(capabilities: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self { inner: capabilities.into_iter().map(Into::into).collect() }
+        Self {
+            inner: capabilities.into_iter().map(Into::into).collect(),
+            external_payload_building: true,
+        }
+    }
+
+    /// Disables external payload building for this Engine API endpoint.
+    ///
+    /// `engine_getPayloadV1` through `engine_getPayloadV6` are not advertised because this
+    /// endpoint will never schedule a payload build from `engine_forkchoiceUpdated` attributes.
+    pub fn without_external_payload_building(mut self) -> Self {
+        self.external_payload_building = false;
+        self.inner.retain(|method| {
+            !matches!(
+                method.as_str(),
+                "engine_getPayloadV1" |
+                    "engine_getPayloadV2" |
+                    "engine_getPayloadV3" |
+                    "engine_getPayloadV4" |
+                    "engine_getPayloadV5" |
+                    "engine_getPayloadV6"
+            )
+        });
+        self
+    }
+
+    /// Returns whether this endpoint can schedule externally requested payload builds.
+    pub const fn external_payload_building(&self) -> bool {
+        self.external_payload_building
     }
 
     /// Returns the capabilities as a list of strings.
@@ -229,6 +258,32 @@ mod tests {
         let result = el.get_capability_mismatches(&cl);
         assert_eq!(result.missing_in_el, vec!["a_other", "z_other"]);
         assert_eq!(result.missing_in_cl, vec!["a_method", "z_method"]);
+    }
+
+    #[test]
+    fn without_external_payload_building_removes_only_get_payload_methods() {
+        assert!(EngineCapabilities::default().external_payload_building());
+        let capabilities = EngineCapabilities::default().without_external_payload_building();
+
+        assert!(!capabilities.external_payload_building());
+        for version in 1..=6 {
+            assert!(
+                !capabilities.as_set().contains(&format!("engine_getPayloadV{version}")),
+                "engine_getPayloadV{version} must not be advertised"
+            );
+        }
+
+        for method in [
+            "engine_forkchoiceUpdatedV1",
+            "engine_newPayloadV1",
+            "engine_getPayloadBodiesByHashV1",
+            "engine_getPayloadBodiesByRangeV1",
+            "engine_getBlobsV1",
+            "engine_hasBlobs",
+            "engine_getClientVersionV1",
+        ] {
+            assert!(capabilities.as_set().contains(method), "{method} must remain advertised");
+        }
     }
 
     #[test]

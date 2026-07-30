@@ -1527,6 +1527,15 @@ where
 #[derive(Debug, Default)]
 pub struct BasicEngineApiBuilder<PVB> {
     payload_validator_builder: PVB,
+    capabilities: EngineCapabilities,
+}
+
+impl<PVB> BasicEngineApiBuilder<PVB> {
+    /// Configures this endpoint to import forkchoice updates without externally building payloads.
+    pub fn without_external_payload_building(mut self) -> Self {
+        self.capabilities = self.capabilities.without_external_payload_building();
+        self
+    }
 }
 
 impl<N, PVB> EngineApiBuilder<N> for BasicEngineApiBuilder<PVB>
@@ -1549,7 +1558,7 @@ where
     >;
 
     async fn build_engine_api(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::EngineApi> {
-        let Self { payload_validator_builder } = self;
+        let Self { payload_validator_builder, capabilities } = self;
 
         let engine_validator = payload_validator_builder.build(ctx).await?;
         let client = ClientVersionV1 {
@@ -1567,7 +1576,7 @@ where
             ctx.node.pool().clone(),
             ctx.node.task_executor().clone(),
             client,
-            EngineCapabilities::default(),
+            capabilities,
             engine_validator,
             ctx.config.engine.accept_execution_requests_hash,
             ctx.node.network().clone(),

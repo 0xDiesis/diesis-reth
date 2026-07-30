@@ -24,6 +24,10 @@ pub const REQUEST_TOO_LARGE_CODE: i32 = -38004;
 /// Error message for the request too large error.
 const REQUEST_TOO_LARGE_MESSAGE: &str = "Too large request";
 
+/// Stable reason returned when an Engine API endpoint cannot create externally requested payloads.
+pub const EXTERNAL_PAYLOAD_BUILDING_UNSUPPORTED_REASON: &str =
+    "External payload building is disabled for this engine endpoint";
+
 /// Error returned by [`EngineApi`][crate::EngineApi]
 ///
 /// Note: This is a high-fidelity error type which can be converted to an RPC error that adheres to
@@ -83,6 +87,9 @@ pub enum EngineApiError {
     /// Requests hash provided, but can't be accepted by the API.
     #[error("requests hash cannot be accepted by the API without `--engine.accept-execution-requests-hash` flag")]
     UnexpectedRequestsHash,
+    /// The endpoint accepts forkchoice updates but does not support external payload building.
+    #[error("{EXTERNAL_PAYLOAD_BUILDING_UNSUPPORTED_REASON}")]
+    ExternalPayloadBuildingUnsupported,
     /// Any other rpc error
     #[error("{0}")]
     Other(jsonrpsee_types::ErrorObject<'static>),
@@ -129,7 +136,8 @@ impl From<EngineApiError> for jsonrpsee_types::error::ErrorObject<'static> {
                     VersionSpecificValidationError::SlotNumberNotSupported,
                 ),
             ) |
-            EngineApiError::UnexpectedRequestsHash => {
+            EngineApiError::UnexpectedRequestsHash |
+            EngineApiError::ExternalPayloadBuildingUnsupported => {
                 // Note: the data field is not required by the spec, but is also included by other
                 // clients
                 jsonrpsee_types::error::ErrorObject::owned(
@@ -334,6 +342,19 @@ mod tests {
                     VersionSpecificValidationError::ParentBeaconBlockRootNotSupportedBeforeV3,
                 ),
             ),
+        );
+
+    }
+
+    #[test]
+    fn external_payload_building_error_maps_to_invalid_payload_attributes() {
+        let error: jsonrpsee_types::error::ErrorObject<'static> =
+            EngineApiError::ExternalPayloadBuildingUnsupported.into();
+        assert_eq!(error.code(), INVALID_PAYLOAD_ATTRIBUTES_ERROR);
+        assert_eq!(error.message(), INVALID_PAYLOAD_ATTRIBUTES_ERROR_MSG);
+        assert_eq!(
+            error.data().expect("unsupported build error includes data").get(),
+            r#"{"err":"External payload building is disabled for this engine endpoint"}"#
         );
     }
 }
