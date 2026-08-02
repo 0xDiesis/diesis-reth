@@ -14,6 +14,10 @@ CARGO_TARGET_DIR ?= target
 # List of features to use when building. Can be overridden via the environment.
 FEATURES ?=
 
+# Default reth features except the optional LLVM-backed JIT. The full `clippy`
+# target remains the LLVM-equipped all-features gate used by CI.
+LOCAL_RETH_FEATURES ?= jemalloc,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,asm-keccak,gmp,min-trace-logs
+
 # Cargo profile for builds. Default is for local builds, CI uses an override.
 PROFILE ?= release
 
@@ -243,6 +247,9 @@ maxperf-no-asm: ## Builds `reth` with the most aggressive optimisations, minus t
 fmt:
 	cargo +nightly fmt
 
+fmt-check:
+	cargo +nightly fmt --check
+
 clippy:
 	cargo +nightly clippy \
 	--workspace \
@@ -251,6 +258,25 @@ clippy:
 	--tests \
 	--benches \
 	--all-features \
+	-- -D warnings
+
+clippy-local:
+	cargo +nightly clippy \
+	--workspace \
+	--exclude reth \
+	--lib \
+	--examples \
+	--tests \
+	--benches \
+	-- -D warnings
+	cargo +nightly clippy \
+	-p reth \
+	--no-default-features \
+	--features "$(LOCAL_RETH_FEATURES)" \
+	--lib \
+	--examples \
+	--tests \
+	--benches \
 	-- -D warnings
 
 lint-typos: ensure-typos
@@ -287,6 +313,11 @@ lint:
 	make lint-typos && \
 	make lint-toml
 
+lint-local:
+	make fmt-check && \
+	make clippy-local && \
+	make lint-typos
+
 clippy-fix:
 	cargo +nightly clippy \
 	--workspace \
@@ -300,8 +331,37 @@ clippy-fix:
 	--allow-dirty \
 	-- -D warnings
 
+clippy-fix-local:
+	cargo +nightly clippy \
+	--workspace \
+	--exclude reth \
+	--lib \
+	--examples \
+	--tests \
+	--benches \
+	--fix \
+	--allow-staged \
+	--allow-dirty \
+	-- -D warnings
+	cargo +nightly clippy \
+	-p reth \
+	--no-default-features \
+	--features "$(LOCAL_RETH_FEATURES)" \
+	--lib \
+	--examples \
+	--tests \
+	--benches \
+	--fix \
+	--allow-staged \
+	--allow-dirty \
+	-- -D warnings
+
 fix-lint:
 	make clippy-fix && \
+	make fmt
+
+fix-lint-local:
+	make clippy-fix-local && \
 	make fmt
 
 .PHONY: rustdocs
