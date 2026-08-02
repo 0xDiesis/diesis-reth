@@ -418,9 +418,10 @@ where
 mod tests {
     use super::*;
     use alloy_consensus::TxEip1559;
-    use reth_ethereum_primitives::TxType;
     use alloy_primitives::Signature;
-    use reth_ethereum_primitives::{Receipt, Transaction as EthTransaction, TransactionSigned};
+    use reth_ethereum_primitives::{
+        Receipt, Transaction as EthTransaction, TransactionSigned, TxType,
+    };
 
     #[test]
     fn reward_percentiles_use_receipt_gas_weight_for_eip8037() {

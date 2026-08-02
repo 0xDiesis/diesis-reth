@@ -1012,7 +1012,6 @@ impl<N: ProviderNodeTypes> StateReader for BlockchainProvider<N> {
 #[cfg(test)]
 mod tests {
     use super::SNAPSHOT_STATE_RETENTION;
-    use alloy_consensus::transaction::TxHashRef;
     use crate::{
         providers::BlockchainProvider,
         test_utils::{
@@ -1021,7 +1020,7 @@ mod tests {
         },
         BlockWriter, CanonChainTracker, ProviderFactory, SaveBlocksMode,
     };
-    use alloy_consensus::constants::EMPTY_ROOT_HASH;
+    use alloy_consensus::{constants::EMPTY_ROOT_HASH, transaction::TxHashRef};
     use alloy_eips::{BlockHashOrNumber, BlockNumHash, BlockNumberOrTag};
     use alloy_primitives::{keccak256, Address, BlockNumber, TxNumber, B256, U256};
     use itertools::Itertools;

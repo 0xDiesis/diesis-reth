@@ -697,9 +697,8 @@ pub(super) mod serde_bincode_compat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_ethereum_primitives::TxType;
     use alloy_primitives::{map::HashMap, Address, B256};
-    use reth_ethereum_primitives::Receipt;
+    use reth_ethereum_primitives::{Receipt, TxType};
     use revm::{database::BundleState, state::AccountInfo};
 
     #[test]

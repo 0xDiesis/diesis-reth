@@ -3,11 +3,11 @@
 //! This module defines [`GenesisCommitmentProvider`], which allows Diesis to inject
 //! a Verkle-tree-based genesis commitment in place of the default Merkle Patricia Trie.
 
+use crate::init::{compute_state_root_for_commitment, InitStorageError};
 use alloy_genesis::Genesis;
 use alloy_primitives::B256;
 use reth_db_api::transaction::DbTxMut;
 use reth_provider::{DBProvider, StorageSettingsCache, TrieWriter};
-use crate::init::{compute_state_root_for_commitment, InitStorageError};
 
 /// Pluggable state commitment for genesis initialization.
 ///

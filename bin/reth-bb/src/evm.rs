@@ -434,8 +434,8 @@ where
         // the receipt root task (which reads receipts incrementally) sees
         // globally-correct values across all segments.
         let offset = self.gas_used_offset;
-        if offset > 0
-            && let Some(receipt) = self.inner_mut().receipts.last_mut()
+        if offset > 0 &&
+            let Some(receipt) = self.inner_mut().receipts.last_mut()
         {
             receipt.cumulative_gas_used += offset;
         }
@@ -607,4 +607,3 @@ where
         BbBlockExecutor::new(evm, ctx, &self.spec, self.receipt_builder, None, None, None, None)
     }
 }
-

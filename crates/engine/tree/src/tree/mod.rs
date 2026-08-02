@@ -33,9 +33,9 @@ use reth_primitives_traits::{
     FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use reth_provider::{
-    BalProvider, BlockExecutionOutput, BlockExecutionResult, BlockReader,
-    CanonicalSnapshotRequest, ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider,
-    ProviderError, StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    BalProvider, BlockExecutionOutput, BlockExecutionResult, BlockReader, CanonicalSnapshotRequest,
+    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
+    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
     StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;

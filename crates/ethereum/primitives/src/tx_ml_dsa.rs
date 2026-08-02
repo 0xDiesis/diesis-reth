@@ -125,18 +125,18 @@ impl TxMlDsa {
 
     /// Returns the RLP-encoded length of the signing fields (no RLP header).
     pub fn rlp_signing_fields_length(&self) -> usize {
-        self.chain_id.length()
-            + self.nonce.length()
-            + self.max_priority_fee_per_gas.length()
-            + self.max_fee_per_gas.length()
-            + self.gas_limit.length()
-            + self.to.length()
-            + self.value.length()
-            + self.input.0.length()
-            + self.access_list.length()
-            + self.sender.length()
-            + self.ml_dsa_level.length()
-            + self.pubkey.0.length()
+        self.chain_id.length() +
+            self.nonce.length() +
+            self.max_priority_fee_per_gas.length() +
+            self.max_fee_per_gas.length() +
+            self.gas_limit.length() +
+            self.to.length() +
+            self.value.length() +
+            self.input.0.length() +
+            self.access_list.length() +
+            self.sender.length() +
+            self.ml_dsa_level.length() +
+            self.pubkey.0.length()
     }
 
     // -----------------------------------------------------------------------
@@ -284,11 +284,11 @@ impl TxMlDsa {
 
     /// Returns a heuristic for the in-memory size of this transaction.
     pub fn size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.access_list.size()
-            + self.input.len()
-            + self.pubkey.len()
-            + self.ml_dsa_signature.len()
+        mem::size_of::<Self>() +
+            self.access_list.size() +
+            self.input.len() +
+            self.pubkey.len() +
+            self.ml_dsa_signature.len()
     }
 
     // -----------------------------------------------------------------------

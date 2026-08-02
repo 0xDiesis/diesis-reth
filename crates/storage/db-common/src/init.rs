@@ -1048,7 +1048,8 @@ fn write_account_to_db<TX: DbTxMut>(
     Ok(())
 }
 
-/// Computes the genesis state root using MPT, for use by [`crate::commitment::MptGenesisCommitment`].
+/// Computes the genesis state root using MPT, for use by
+/// [`crate::commitment::MptGenesisCommitment`].
 ///
 /// This is a crate-internal bridge that exposes the private [`compute_state_root`] function to the
 /// commitment module without making the full implementation part of the public API.

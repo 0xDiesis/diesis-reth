@@ -437,10 +437,10 @@ impl Hash for TransactionSigned {
 
 impl PartialEq for TransactionSigned {
     fn eq(&self, other: &Self) -> bool {
-        Self::canonical_signature(&self.transaction, self.signature)
-            == Self::canonical_signature(&other.transaction, other.signature)
-            && self.transaction == other.transaction
-            && self.tx_hash() == other.tx_hash()
+        Self::canonical_signature(&self.transaction, self.signature) ==
+            Self::canonical_signature(&other.transaction, other.signature) &&
+            self.transaction == other.transaction &&
+            self.tx_hash() == other.tx_hash()
     }
 }
 
@@ -1100,8 +1100,8 @@ impl TxHashRef for TransactionSigned {
 
 impl IsTyped2718 for TransactionSigned {
     fn is_type(type_id: u8) -> bool {
-        type_id == ML_DSA_TX_TYPE_ID
-            || <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
+        type_id == ML_DSA_TX_TYPE_ID ||
+            <alloy_consensus::TxEnvelope as IsTyped2718>::is_type(type_id)
     }
 }
 
