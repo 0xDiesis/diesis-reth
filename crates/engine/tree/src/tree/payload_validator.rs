@@ -805,12 +805,12 @@ where
                         .try_into_inner()
                         .expect("sole handle")?,
                 };
-                if parent_state_validated && !body_prevalidated {
-                    if let Err(consensus_err) =
+                if parent_state_validated &&
+                    !body_prevalidated &&
+                    let Err(consensus_err) =
                         self.validate_block_pre_execution_inner(&block, None)
-                    {
-                        return Err(InsertBlockError::new(block, consensus_err.into()).into());
-                    }
+                {
+                    return Err(InsertBlockError::new(block, consensus_err.into()).into());
                 }
                 return Err(InsertBlockError::new(block, err).into());
             }
@@ -1444,6 +1444,7 @@ where
     ///
     /// The `hashed_state` handle wraps the background hashed post state computation.
     #[instrument(level = "debug", target = "engine::tree::payload_validator", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     fn validate_post_execution<T: PayloadTypes<BuiltPayload: BuiltPayload<Primitives = N>>>(
         &self,
         block: &RecoveredBlock<N::Block>,

@@ -4287,7 +4287,7 @@ mod tests {
             .with_gas_price(100)
             .with_gas_limit(21_000)
             .with_value(U256::from(7));
-        let unsponsored = sponsored.clone().next().with_value(U256::from(3));
+        let unsponsored = sponsored.next().with_value(U256::from(3));
         let sponsored = factory.validated(sponsored);
         let unsponsored = factory.validated(unsponsored);
         let sender_balance = U256::from(7 + 3 + 100 * 21_000);
@@ -4314,7 +4314,7 @@ mod tests {
             .with_gas_price(100)
             .with_gas_limit(21_000)
             .with_value(U256::from(7));
-        let original = factory.validated(original.clone());
+        let original = factory.validated(original);
         let underpriced = factory.validated(original.transaction.clone().rng_hash());
         let replacement =
             factory.validated(original.transaction.clone().rng_hash().with_gas_price(200));

@@ -4161,7 +4161,7 @@ mod tests {
             .export_canonical_snapshot(
                 &CanonicalSnapshotRequest {
                     target: BlockNumHash::new(head_number, head_hash),
-                    output_dir: dest.clone(),
+                    output_dir: dest,
                 },
                 &lengths,
             )
