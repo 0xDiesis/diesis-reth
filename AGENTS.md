@@ -29,6 +29,8 @@ Reth is a high-performance Ethereum execution client written in Rust, focusing o
 
 ## Development Workflow
 
+Use `sccache` for Cargo compilation commands to reduce rebuild time: prefix `cargo build`, `cargo check`, `cargo test`, `cargo clippy`, and `cargo nextest` with `RUSTC_WRAPPER=sccache`. Do not run `cargo clean` unless invalid artifacts require it. For Docker/Depot builds, preserve `Dockerfile.depot`'s BuildKit Cargo registry/git and `/sccache` mounts, `SCCACHE_DIR=/sccache`, and `RUSTC_WRAPPER=sccache`; avoid `--no-cache` unless diagnosing a proven cache problem.
+
 ### Code Style and Standards
 
 1. **Formatting**: Always use nightly rustfmt
