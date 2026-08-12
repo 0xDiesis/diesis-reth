@@ -386,6 +386,10 @@ impl<N: NodePrimitives> ExecutedBlockInsertSender<N> {
     /// Creates a sender with an end-to-end outstanding-request limit.
     pub fn new(sender: mpsc::Sender<ExecutedBlockInsertRequest<N>>, capacity: usize) -> Self {
         assert!(capacity > 0, "direct insert capacity must be positive");
+        assert!(
+            capacity <= sender.max_capacity(),
+            "direct insert capacity must not exceed ingress capacity"
+        );
         Self { sender, permits: Arc::new(Semaphore::new(capacity)), capacity }
     }
 
@@ -666,9 +670,16 @@ mod direct_insert_sender_tests {
 
     #[tokio::test]
     async fn cancellation_before_enqueue_releases_permit() {
-        let (raw_tx, mut ingress) = mpsc::channel(1);
-        let sender = ExecutedBlockInsertSender::new(raw_tx, 2);
+        let (raw_tx, mut ingress) = mpsc::channel(2);
         let expected_head = BlockNumHash::new(0, B256::random());
+        let prefilled_block = executed_block(1, expected_head.hash);
+        let (prefilled_request, prefilled_response) = ExecutedBlockInsertRequest::new_for_test(
+            direct_insert_identity(expected_head, &prefilled_block),
+            prefilled_block,
+        );
+        raw_tx.try_send(prefilled_request).expect("prefill ingress");
+        drop(prefilled_response);
+        let sender = ExecutedBlockInsertSender::new(raw_tx, 2);
         let first = tokio::spawn({
             let sender = sender.clone();
             async move {
@@ -692,9 +703,17 @@ mod direct_insert_sender_tests {
         assert!(second.await.unwrap_err().is_cancelled());
         assert_eq!(sender.available_capacity(), 1);
 
+        drop(ingress.recv().await.expect("prefilled request was enqueued"));
         drop(ingress.recv().await.expect("first request was enqueued"));
         assert_eq!(first.await.unwrap(), Err(ExecutedBlockInsertError::AcknowledgementDropped));
         assert_eq!(sender.available_capacity(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "direct insert capacity must not exceed ingress capacity")]
+    fn rejects_outstanding_capacity_larger_than_ingress() {
+        let (raw_tx, _ingress) = mpsc::channel::<ExecutedBlockInsertRequest>(1);
+        let _sender = ExecutedBlockInsertSender::new(raw_tx, 2);
     }
 
     #[tokio::test]
