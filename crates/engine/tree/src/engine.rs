@@ -384,6 +384,10 @@ pub struct ExecutedBlockInsertSender<N: NodePrimitives = EthPrimitives> {
 
 impl<N: NodePrimitives> ExecutedBlockInsertSender<N> {
     /// Creates a sender with an end-to-end outstanding-request limit.
+    ///
+    /// The outstanding limit cannot exceed the ingress queue because callers use the limit as the
+    /// advertised immediate-admission capacity. A larger value would allow a permitted request to
+    /// block indefinitely while sending to an already-full ingress queue.
     pub fn new(sender: mpsc::Sender<ExecutedBlockInsertRequest<N>>, capacity: usize) -> Self {
         assert!(capacity > 0, "direct insert capacity must be positive");
         assert!(
