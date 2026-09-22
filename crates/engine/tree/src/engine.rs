@@ -363,7 +363,7 @@ impl<N: NodePrimitives> ExecutedBlockInsertRequest<N> {
         (self.identity, self.block, self.response, self.permit)
     }
 
-    fn reject(self, error: ExecutedBlockInsertError) {
+    pub(crate) fn reject(self, error: ExecutedBlockInsertError) {
         let (_, _, response, permit) = self.into_parts();
         drop(permit);
         let _ = response.send(Err(error));
@@ -500,6 +500,12 @@ pub enum ExecutedBlockInsertError {
         expected: B256,
         /// Submitted parent hash.
         actual: B256,
+    },
+    /// Canonical writer ingress is closed by the actor-owned fence.
+    #[error("direct block admission refused while writer fence is in phase {phase}")]
+    WriterFenced {
+        /// Current actor phase.
+        phase: &'static str,
     },
 }
 

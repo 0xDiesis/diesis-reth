@@ -22,6 +22,7 @@ use reth_engine_tree::{
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
     launch::build_engine_orchestrator,
     tree::TreeConfig,
+    writer_fence::WriterFenceBootstrap,
 };
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
@@ -55,6 +56,9 @@ const DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY: usize = 64;
 /// produced at most once per certified checkpoint, so a small queue suffices.
 const DIESIS_CANONICAL_SNAPSHOT_CHANNEL_CAPACITY: usize = 4;
 
+/// Journal file name of the engine writer release fence inside the node data directory.
+const WRITER_FENCE_JOURNAL_NAME: &str = "engine-writer-release-fence";
+
 /// The engine node launcher.
 #[derive(Debug)]
 pub struct EngineNodeLauncher {
@@ -64,6 +68,34 @@ pub struct EngineNodeLauncher {
     /// Temporary configuration for engine tree.
     /// After engine is stabilized, this should be configured through node builder.
     pub engine_tree_config: TreeConfig,
+
+    /// Optional already reconciled writer-fence bootstrap supplied by trusted node startup.
+    writer_fence_bootstrap: Option<WriterFenceBootstrap>,
+}
+
+/// Consume a supplied bootstrap only when it retains the exact launcher journal path and is
+/// still the exact Clean record under its retained lock and directory identity; otherwise
+/// perform the default clean-only acquisition.
+fn accept_writer_fence_bootstrap(
+    supplied: Option<WriterFenceBootstrap>,
+    expected: std::path::PathBuf,
+) -> Result<WriterFenceBootstrap, reth_engine_tree::writer_fence::WriterFenceError> {
+    match supplied {
+        None => WriterFenceBootstrap::acquire(expected),
+        Some(bootstrap) => {
+            if bootstrap.journal_path() != expected {
+                return Err(reth_engine_tree::writer_fence::WriterFenceError::Journal {
+                    message: format!(
+                        "supplied writer-fence bootstrap path {} differs from launcher path {}",
+                        bootstrap.journal_path().display(),
+                        expected.display()
+                    ),
+                })
+            }
+            bootstrap.recheck_clean()?;
+            Ok(bootstrap)
+        }
+    }
 }
 
 impl EngineNodeLauncher {
@@ -73,7 +105,24 @@ impl EngineNodeLauncher {
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
+        Self {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            engine_tree_config,
+            writer_fence_bootstrap: None,
+        }
+    }
+
+    /// Supply a bootstrap that trusted node startup already inspected and reconciled at the
+    /// exact launcher journal path. It is consumed only after a fresh path and Clean recheck;
+    /// without it the launcher keeps its clean-only acquisition.
+    pub fn with_writer_fence_bootstrap(mut self, bootstrap: WriterFenceBootstrap) -> Self {
+        self.writer_fence_bootstrap = Some(bootstrap);
+        self
+    }
+
+    /// Exact writer-fence journal path for a node data directory.
+    pub fn writer_fence_journal_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+        data_dir.join(WRITER_FENCE_JOURNAL_NAME)
     }
 
     async fn launch_node<N, DB, T, CB, AO>(
@@ -92,7 +141,14 @@ impl EngineNodeLauncher {
         AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     {
-        let Self { ctx, engine_tree_config } = self;
+        let Self { ctx, engine_tree_config, writer_fence_bootstrap } = self;
+        // Acquire and inspect the durable release journal before genesis initialization, static
+        // file movement, component startup, or any other writer in this launch path. A supplied
+        // reconciled bootstrap is consumed only for this exact path after a fresh Clean recheck.
+        let writer_fence_bootstrap = accept_writer_fence_bootstrap(
+            writer_fence_bootstrap,
+            Self::writer_fence_journal_path(&ctx.data_dir.data_dir()),
+        )?;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             rocksdb_provider,
@@ -264,7 +320,7 @@ impl EngineNodeLauncher {
             EngineApiKind::Ethereum
         };
 
-        let mut orchestrator = build_engine_orchestrator(
+        let (mut orchestrator, writer_fence_handle) = build_engine_orchestrator(
             engine_kind,
             consensus.clone(),
             network_client.clone(),
@@ -283,6 +339,7 @@ impl EngineNodeLauncher {
             changeset_cache,
             ctx.task_executor().clone(),
             std::sync::Arc::clone(&persisted_head),
+            writer_fence_bootstrap,
         );
 
         info!(target: "reth::cli", "Consensus engine initialized");
@@ -314,6 +371,7 @@ impl EngineNodeLauncher {
             executed_block_tx: _,
             persisted_head: _,
             canonical_snapshot: _,
+            writer_fence: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -321,6 +379,12 @@ impl EngineNodeLauncher {
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target(disabled_stages)?;
+        let initial_backfill_permit = if initial_target.is_some() {
+            Some(writer_fence_handle.reserve_backfill_start().await?)
+        } else {
+            writer_fence_handle.open_qualified_ingress().await?;
+            None
+        };
         let mut built_payloads = ctx
             .components()
             .payload_builder_handle()
@@ -359,15 +423,21 @@ impl EngineNodeLauncher {
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
+            let mut res = Ok(());
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
                 // network_handle's sync state is already initialized at Syncing
-                orchestrator.start_backfill_sync(initial_target);
+                if let Err(error) = orchestrator.start_backfill_sync(
+                    initial_target,
+                    initial_backfill_permit.expect("permit reserved with startup target"),
+                ) {
+                    let _ = exit.send(Err(eyre::eyre!(error)));
+                    return
+                }
             } else if startup_sync_state_idle {
                 network_handle.update_sync_state(SyncState::Idle);
             }
 
-            let mut res = Ok(());
             let mut shutdown_rx = shutdown_rx.fuse();
             let mut executed_block_rx = executed_block_rx;
             let mut canonical_snapshot_rx = canonical_snapshot_rx;
@@ -499,6 +569,7 @@ impl EngineNodeLauncher {
                 executed_block_tx: Some(executed_block_tx),
                 persisted_head: std::sync::Arc::clone(&persisted_head),
                 canonical_snapshot: Some(canonical_snapshot_handle),
+                writer_fence: Some(writer_fence_handle),
             },
         };
         // Notify on node started
@@ -540,9 +611,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
-        DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        accept_writer_fence_bootstrap, EngineNodeLauncher, ExecutedBlockInsertRequest,
+        ExecutedBlockInsertSender, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
     };
+    use reth_engine_tree::writer_fence::{WriterFenceBootstrap, WriterFenceError};
+
+    #[test]
+    fn supplied_bootstrap_is_consumed_only_at_the_exact_launcher_path() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let expected = EngineNodeLauncher::writer_fence_journal_path(data_dir.path());
+        let bootstrap = WriterFenceBootstrap::acquire(expected.clone()).unwrap();
+        let accepted = accept_writer_fence_bootstrap(Some(bootstrap), expected.clone()).unwrap();
+        assert_eq!(accepted.journal_path(), expected);
+        // The retained owner lock excludes a second clean-only acquisition while consumed.
+        assert!(matches!(
+            WriterFenceBootstrap::acquire(expected.clone()),
+            Err(WriterFenceError::Journal { .. })
+        ));
+        drop(accepted);
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let foreign = WriterFenceBootstrap::acquire(EngineNodeLauncher::writer_fence_journal_path(
+            other_dir.path(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            accept_writer_fence_bootstrap(Some(foreign), expected.clone()),
+            Err(WriterFenceError::Journal { message }) if message.contains("differs from launcher path")
+        ));
+
+        // Default startup keeps clean-only acquisition at the exact path.
+        let default = accept_writer_fence_bootstrap(None, expected.clone()).unwrap();
+        assert_eq!(default.journal_path(), expected);
+    }
+
+    #[test]
+    fn supplied_bootstrap_that_is_no_longer_exactly_clean_is_refused() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let expected = EngineNodeLauncher::writer_fence_journal_path(data_dir.path());
+        let bootstrap = WriterFenceBootstrap::acquire(expected.clone()).unwrap();
+        let clean = std::fs::read(&expected).unwrap();
+        // Any byte change to the retained record, including a corrupt or replaced journal,
+        // must be caught by the consumption-time recheck rather than trusted from earlier.
+        let mut changed = clean.clone();
+        changed[8] = 2;
+        std::fs::write(&expected, &changed).unwrap();
+        assert!(matches!(
+            accept_writer_fence_bootstrap(Some(bootstrap), expected.clone()),
+            Err(WriterFenceError::Journal { .. })
+        ));
+        std::fs::write(&expected, &clean[..clean.len() - 1]).unwrap();
+        let bootstrap = WriterFenceBootstrap::inspect(expected.clone());
+        assert!(matches!(bootstrap, Err(WriterFenceError::Journal { .. })));
+    }
 
     #[test]
     fn diesis_executed_block_channel_capacity_is_bounded() {

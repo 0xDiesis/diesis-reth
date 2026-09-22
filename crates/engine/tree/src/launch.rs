@@ -11,6 +11,7 @@ use crate::{
     engine::{EngineApiKind, EngineApiRequest, EngineApiRequestHandler, EngineHandler},
     persistence::PersistenceHandle,
     tree::{EngineApiTreeHandler, EngineValidator, TreeConfig, WaitForCaches},
+    writer_fence::{WriterFenceBootstrap, WriterFenceHandle},
 };
 use futures::Stream;
 use reth_consensus::FullConsensus;
@@ -67,14 +68,18 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     changeset_cache: ChangesetCache,
     runtime: Runtime,
     persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
-) -> ChainOrchestrator<
-    EngineHandler<
-        EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
-        S,
-        BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
+    writer_fence_bootstrap: WriterFenceBootstrap,
+) -> (
+    ChainOrchestrator<
+        EngineHandler<
+            EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
+            S,
+            BasicBlockDownloader<Client, <N::Primitives as NodePrimitives>::Block>,
+        >,
+        PipelineSync<N>,
     >,
-    PipelineSync<N>,
->
+    WriterFenceHandle<N::Payload>,
+)
 where
     N: ProviderNodeTypes,
     Client: BlockClient<Block = <N::Primitives as NodePrimitives>::Block> + 'static,
@@ -90,7 +95,7 @@ where
 
     let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
-    let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(
+    let (to_tree_tx, from_tree, writer_fence) = EngineApiTreeHandler::spawn_new(
         blockchain_db,
         consensus,
         payload_validator,
@@ -105,6 +110,7 @@ where
         runtime,
         use_hashed_state,
         persisted_head_notifier,
+        writer_fence_bootstrap,
     );
 
     let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
@@ -112,5 +118,9 @@ where
 
     let backfill_sync = PipelineSync::new(pipeline, pipeline_task_spawner);
 
-    ChainOrchestrator::new(handler, backfill_sync)
+    let writer_fence_actor = writer_fence.actor();
+    (
+        ChainOrchestrator::new(handler, backfill_sync).with_writer_fence_actor(writer_fence_actor),
+        writer_fence,
+    )
 }

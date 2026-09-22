@@ -56,12 +56,372 @@ use tokio::sync::oneshot;
 
 #[path = "tests/payload_validator.rs"]
 mod payload_validator;
+#[path = "tests/release_service.rs"]
+mod release_service;
 
 fn direct_insert_identity(
     expected_parent: BlockNumHash,
     block: &ExecutedBlock,
 ) -> DirectInsertBlockIdentity {
     DirectInsertBlockIdentity { expected_parent, block: block.recovered_block().num_hash() }
+}
+
+fn release_binding(parent: BlockNumHash) -> ReleaseBinding {
+    ReleaseBinding::new(parent, B256::repeat_byte(0xd1), B256::repeat_byte(0xd2)).unwrap()
+}
+
+async fn drive_writer_fence<R>(harness: &mut TestHarness, task: tokio::task::JoinHandle<R>) -> R {
+    tokio::task::yield_now().await;
+    let request = harness
+        .tree
+        .writer_fence_incoming
+        .recv_timeout(Duration::from_secs(1))
+        .expect("writer-fence request reaches the actor's bounded control ingress");
+    harness.tree.on_writer_fence_request(request).expect("writer-fence request is non-fatal");
+    task.await.expect("writer-fence caller task completes")
+}
+
+#[tokio::test]
+async fn actual_tree_actor_holds_publication_through_native_handoff() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    harness.tree.writer_fence.enable_qualified_for_test();
+
+    let parent = *harness.tree.state.tree_state.canonical_head();
+    let child = harness.block_builder.get_executed_block_with_number(2, parent.hash);
+    let child_identity = direct_insert_identity(parent, &child);
+    let child_num_hash = child_identity.block;
+    let (insert, inserted) = ExecutedBlockInsertRequest::new_for_test(child_identity, child);
+    let _ = harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            insert,
+        )))
+        .unwrap();
+    assert_eq!(inserted.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+
+    let forkchoice = ForkchoiceState {
+        head_block_hash: child_num_hash.hash,
+        safe_block_hash: child_num_hash.hash,
+        finalized_block_hash: child_num_hash.hash,
+    };
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.begin_publication(parent, child_num_hash, forkchoice).await }
+    });
+    let mut publication = drive_writer_fence(&mut harness, begin).await.unwrap();
+
+    let acquire = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.acquire_release(release_binding(parent)).await }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, acquire).await,
+        Err(WriterFenceError::Busy { phase: "publication-reserved" })
+    );
+
+    let tagged = tokio::spawn(async move {
+        let result = publication.forkchoice_updated(None).await;
+        (publication, result)
+    });
+    let (publication, tagged_result) = drive_writer_fence(&mut harness, tagged).await;
+    assert!(tagged_result.unwrap().payload_status.is_valid());
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), child_num_hash);
+
+    let acquire = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.acquire_release(release_binding(child_num_hash)).await }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, acquire).await,
+        Err(WriterFenceError::Busy { phase: "publication-admitted" })
+    );
+
+    let (untagged_tx, untagged_rx) = oneshot::channel();
+    let _ = harness
+        .tree
+        .on_engine_message(FromEngine::Request(
+            BeaconEngineMessage::ForkchoiceUpdated {
+                state: forkchoice,
+                payload_attrs: None,
+                tx: untagged_tx,
+            }
+            .into(),
+        ))
+        .unwrap();
+    assert!(untagged_rx.await.unwrap().is_err());
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), child_num_hash);
+
+    let finish = tokio::spawn(async move { publication.finish(child_num_hash).await });
+    drive_writer_fence(&mut harness, finish).await.unwrap();
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::Idle);
+}
+
+#[tokio::test]
+async fn admitted_publication_forces_gap_one_persistence_while_session_is_held() {
+    let config = TreeConfig::default()
+        .with_has_enough_parallelism(true)
+        .with_persistence_backpressure_threshold(129)
+        .with_persistence_threshold(128)
+        .with_memory_block_buffer_target(64);
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut harness = TestHarness::with_config(MAINNET.clone(), config).with_blocks(blocks);
+    harness.tree.writer_fence.enable_qualified_for_test();
+    let parent = *harness.tree.state.tree_state.canonical_head();
+    harness.tree.persistence_state.last_persisted_block = parent;
+    let child =
+        harness.block_builder.get_executed_block_with_number(parent.number + 1, parent.hash);
+    let child_id = child.recovered_block().num_hash();
+    let (insert, inserted) =
+        ExecutedBlockInsertRequest::new_for_test(direct_insert_identity(parent, &child), child);
+    let _ = harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            insert,
+        )))
+        .unwrap();
+    assert_eq!(inserted.await.unwrap(), Ok(ExecutedBlockAdmissionOutcome::Admitted));
+
+    let forkchoice = ForkchoiceState {
+        head_block_hash: child_id.hash,
+        safe_block_hash: parent.hash,
+        finalized_block_hash: parent.hash,
+    };
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.begin_publication(parent, child_id, forkchoice).await }
+    });
+    let mut publication = drive_writer_fence(&mut harness, begin).await.unwrap();
+    let tagged = tokio::spawn(async move {
+        let result = publication.forkchoice_updated(None).await;
+        (publication, result)
+    });
+    let (_publication, result) = drive_writer_fence(&mut harness, tagged).await;
+    assert!(result.unwrap().payload_status.is_valid());
+
+    harness.tree.advance_persistence().unwrap();
+    let finalized = harness.action_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_matches!(
+        finalized,
+        PersistenceAction::SaveFinalizedBlock(number) if number == parent.number
+    );
+    let safe = harness.action_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_matches!(safe, PersistenceAction::SaveSafeBlock(number) if number == parent.number);
+    let blocks = harness.action_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_matches!(
+        blocks,
+        PersistenceAction::SaveBlocks(blocks, _) if
+            blocks.last().unwrap().recovered_block().num_hash() == child_id
+    );
+    assert_matches!(
+        harness.tree.writer_fence.phase(),
+        WriterFencePhase::Publication { admitted: true, .. }
+    );
+}
+
+#[tokio::test]
+async fn disconnected_inflight_persistence_faults_release_and_refuses_canonical_admission() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    harness.tree.writer_fence.enable_qualified_for_test();
+    let head = *harness.tree.state.tree_state.canonical_head();
+    let (completion, disconnected) = crossbeam_channel::bounded(1);
+    drop(completion);
+    harness.tree.persistence_state.start_save(head, disconnected);
+
+    let acquire = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.acquire_release(release_binding(head)).await }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, acquire).await,
+        Err(WriterFenceError::Persistence { .. })
+    );
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::Faulted);
+
+    let child = harness.block_builder.get_executed_block_with_number(head.number + 1, head.hash);
+    let (insert, response) =
+        ExecutedBlockInsertRequest::new_for_test(direct_insert_identity(head, &child), child);
+    let _ = harness
+        .tree
+        .on_engine_message(FromEngine::Request(EngineApiRequest::InsertExecutedBlockIfCanonical(
+            insert,
+        )))
+        .unwrap();
+    assert_matches!(response.await.unwrap(), Err(ExecutedBlockInsertError::WriterFenced { .. }));
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), head);
+}
+
+#[tokio::test]
+async fn publication_reservation_refuses_unknown_or_mismatched_target_before_phase_change() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    harness.tree.writer_fence.enable_qualified_for_test();
+    let parent = *harness.tree.state.tree_state.canonical_head();
+
+    let unknown = BlockNumHash::new(parent.number + 1, B256::repeat_byte(0xa1));
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move {
+            handle
+                .begin_publication(
+                    parent,
+                    unknown,
+                    ForkchoiceState {
+                        head_block_hash: unknown.hash,
+                        safe_block_hash: parent.hash,
+                        finalized_block_hash: parent.hash,
+                    },
+                )
+                .await
+        }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, begin).await,
+        Err(WriterFenceError::UnknownPublicationTarget { target }) if target == unknown
+    );
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::Idle);
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), parent);
+
+    let wrong_number = BlockNumHash::new(parent.number + 1, parent.hash);
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move {
+            handle
+                .begin_publication(
+                    parent,
+                    wrong_number,
+                    ForkchoiceState {
+                        head_block_hash: wrong_number.hash,
+                        safe_block_hash: parent.hash,
+                        finalized_block_hash: parent.hash,
+                    },
+                )
+                .await
+        }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, begin).await,
+        Err(WriterFenceError::PublicationTargetIdentityMismatch { expected, actual })
+            if expected == wrong_number && actual == parent
+    );
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::Idle);
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), parent);
+}
+
+#[tokio::test]
+async fn publication_refuses_wrong_direct_parent_and_payload_attributes_before_fcu_effects() {
+    let blocks: Vec<_> = TestBlockBuilder::eth().get_executed_blocks(0..2).collect();
+    let mut harness = TestHarness::new(MAINNET.clone()).with_blocks(blocks);
+    harness.tree.writer_fence.enable_qualified_for_test();
+    let parent = *harness.tree.state.tree_state.canonical_head();
+
+    let wrong_parent_hash = B256::repeat_byte(0xb2);
+    let wrong_child =
+        harness.block_builder.get_executed_block_with_number(parent.number + 1, wrong_parent_hash);
+    let wrong_child_id = wrong_child.recovered_block().num_hash();
+    harness.tree.state.tree_state.blocks_by_hash.insert(wrong_child_id.hash, wrong_child);
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move {
+            handle
+                .begin_publication(
+                    parent,
+                    wrong_child_id,
+                    ForkchoiceState {
+                        head_block_hash: wrong_child_id.hash,
+                        safe_block_hash: parent.hash,
+                        finalized_block_hash: parent.hash,
+                    },
+                )
+                .await
+        }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, begin).await,
+        Err(WriterFenceError::PublicationParentMismatch { expected, actual })
+            if expected == parent.hash && actual == wrong_parent_hash
+    );
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::Idle);
+
+    let child =
+        harness.block_builder.get_executed_block_with_number(parent.number + 1, parent.hash);
+    let child_id = child.recovered_block().num_hash();
+    harness.tree.state.tree_state.blocks_by_hash.insert(child_id.hash, child.clone());
+    let forkchoice = ForkchoiceState {
+        head_block_hash: child_id.hash,
+        safe_block_hash: parent.hash,
+        finalized_block_hash: parent.hash,
+    };
+    let begin = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.begin_publication(parent, child_id, forkchoice).await }
+    });
+    let mut publication = drive_writer_fence(&mut harness, begin).await.unwrap();
+    let attrs = EthPayloadAttributes {
+        timestamp: 1,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Default::default(),
+        withdrawals: None,
+        parent_beacon_block_root: None,
+        slot_number: None,
+        target_gas_limit: None,
+    };
+    assert_matches!(
+        publication.forkchoice_updated(Some(attrs)).await,
+        Err(WriterFenceError::PayloadAttributesUnsupported)
+    );
+    assert_matches!(
+        harness.tree.writer_fence.phase(),
+        WriterFencePhase::Publication { admitted: false, .. }
+    );
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), parent);
+    assert!(!harness.tree.building_payload);
+
+    harness.tree.state.tree_state.blocks_by_hash.remove(&child_id.hash);
+    let tagged = tokio::spawn(async move { publication.forkchoice_updated(None).await });
+    assert_matches!(
+        drive_writer_fence(&mut harness, tagged).await,
+        Err(WriterFenceError::UnknownPublicationTarget { target }) if target == child_id
+    );
+    assert_matches!(
+        harness.tree.writer_fence.phase(),
+        WriterFencePhase::Publication { admitted: false, .. }
+    );
+    assert_eq!(*harness.tree.state.tree_state.canonical_head(), parent);
+}
+
+#[tokio::test]
+async fn startup_backfill_reservation_precedes_pipeline_started_event() {
+    let mut harness = TestHarness::new(MAINNET.clone());
+    harness.tree.writer_fence.enable_qualified_for_test();
+    let head = *harness.tree.state.tree_state.canonical_head();
+
+    let reserve = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.reserve_backfill_start().await }
+    });
+    let permit = drive_writer_fence(&mut harness, reserve).await.unwrap();
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::BackfillPending { .. });
+
+    let acquire = tokio::spawn({
+        let handle = harness.writer_fence.clone();
+        async move { handle.acquire_release(release_binding(head)).await }
+    });
+    assert_matches!(
+        drive_writer_fence(&mut harness, acquire).await,
+        Err(WriterFenceError::Busy { phase: "backfill-pending" })
+    );
+
+    // The permit is opaque and once-owned. Dropping it does not clear the actor's reservation;
+    // only the bound orchestrator may consume it before emitting Started.
+    drop(permit);
+    let result = harness
+        .tree
+        .on_engine_message(FromEngine::Event(FromOrchestrator::BackfillSyncStarted))
+        .unwrap();
+    assert_matches!(result, ops::ControlFlow::Continue(()));
+    assert_matches!(harness.tree.writer_fence.phase(), WriterFencePhase::BackfillActive { .. });
 }
 
 #[tokio::test]
@@ -360,6 +720,7 @@ async fn direct_insert_real_provider_restart_classifies_exact_canonical_identity
     );
     let (outgoing, mut events) = unbounded_channel();
     let (persistence_tx, _persistence_rx) = std::sync::mpsc::channel();
+    let (writer_fence_tx, writer_fence_rx) = crossbeam_channel::bounded(32);
     let canonical_head = canonical.recovered_block().num_hash();
     let mut tree = EngineApiTreeHandler::new(
         provider,
@@ -389,6 +750,9 @@ async fn direct_insert_real_provider_restart_classifies_exact_canonical_identity
         reth_tasks::Runtime::test(),
         false,
         Arc::new(std::sync::atomic::AtomicU64::new(canonical_head.number)),
+        WriterFenceState::ephemeral(),
+        writer_fence_tx,
+        writer_fence_rx,
     );
     let identity = direct_insert_identity(BlockNumHash::new(0, genesis.hash()), &canonical);
     let (request, response) = ExecutedBlockInsertRequest::new_for_test(identity, canonical);
@@ -545,64 +909,8 @@ async fn direct_insert_retry_after_response_drop_during_tree_processing_is_idemp
 }
 
 /// Mock engine validator for tests
-#[derive(Debug, Clone, Default)]
-struct MockEngineValidator {
-    conversion_calls: Option<Arc<AtomicUsize>>,
-}
+use super::release_harness::MockEngineValidator;
 
-impl MockEngineValidator {
-    fn with_conversion_counter(conversion_calls: Arc<AtomicUsize>) -> Self {
-        Self { conversion_calls: Some(conversion_calls) }
-    }
-}
-
-impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineValidator {
-    type Block = Block;
-
-    fn convert_payload_to_block(
-        &self,
-        payload: ExecutionData,
-    ) -> Result<
-        reth_primitives_traits::SealedBlock<Self::Block>,
-        reth_payload_primitives::NewPayloadError,
-    > {
-        if let Some(conversion_calls) = &self.conversion_calls {
-            conversion_calls.fetch_add(1, Ordering::Relaxed);
-        }
-        let block = reth_ethereum_primitives::Block::try_from(payload.payload).map_err(|e| {
-            reth_payload_primitives::NewPayloadError::Other(format!("{e:?}").into())
-        })?;
-        Ok(block.seal_slow())
-    }
-}
-
-impl EngineApiValidator<EthEngineTypes> for MockEngineValidator {
-    fn validate_version_specific_fields(
-        &self,
-        _version: reth_payload_primitives::EngineApiMessageVersion,
-        _payload_or_attrs: reth_payload_primitives::PayloadOrAttributes<
-            '_,
-            alloy_rpc_types_engine::ExecutionData,
-            alloy_rpc_types_engine::PayloadAttributes,
-        >,
-    ) -> Result<(), reth_payload_primitives::EngineObjectValidationError> {
-        // Mock implementation - always valid
-        Ok(())
-    }
-
-    fn ensure_well_formed_attributes(
-        &self,
-        _version: reth_payload_primitives::EngineApiMessageVersion,
-        _attributes: &alloy_rpc_types_engine::PayloadAttributes,
-    ) -> Result<(), reth_payload_primitives::EngineObjectValidationError> {
-        // Mock implementation - always valid
-        Ok(())
-    }
-}
-
-/// This is a test channel that allows you to `release` any value that is in the channel.
-///
-/// If nothing has been sent, then the next value will be immediately sent.
 struct TestChannel<T> {
     /// If an item is sent to this channel, an item will be released in the wrapped channel
     release: Receiver<()>,
@@ -671,6 +979,7 @@ struct TestHarness {
     action_rx: Receiver<PersistenceAction>,
     block_builder: TestBlockBuilder,
     provider: MockEthProvider,
+    writer_fence: WriterFenceHandle<EthEngineTypes>,
 }
 
 impl TestHarness {
@@ -735,6 +1044,10 @@ impl TestHarness {
 
         let (to_payload_service, payload_command_rx) = unbounded_channel();
         let payload_builder = PayloadBuilderHandle::new(to_payload_service);
+        let (writer_fence_tx, writer_fence_rx) = crossbeam_channel::bounded(32);
+        let writer_fence_state = WriterFenceState::ephemeral();
+        let writer_fence =
+            WriterFenceHandle::new(writer_fence_tx.clone(), writer_fence_state.actor());
 
         let evm_config = MockEvmConfig::default();
         let changeset_cache = ChangesetCache::new();
@@ -767,6 +1080,9 @@ impl TestHarness {
             runtime,
             provider.cached_storage_settings().use_hashed_state(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writer_fence_state,
+            writer_fence_tx.clone(),
+            writer_fence_rx,
         );
 
         let block_builder = TestBlockBuilder::default().with_chain_spec((*chain_spec).clone());
@@ -779,6 +1095,7 @@ impl TestHarness {
             action_rx,
             block_builder,
             provider,
+            writer_fence,
         }
     }
 

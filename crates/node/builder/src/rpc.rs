@@ -12,7 +12,15 @@ pub use reth_engine_tree::{
         ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
     },
     tree::{BasicEngineValidator, EngineValidator},
+    writer_fence::{
+        AbortableRelease, ArmedRelease, LocalReleaseRecovery, PendingReleaseRecovery,
+        PublicationSession, ReleaseBinding, ReleaseFenceReceipt, ReleaseRecoveryPhase,
+        ReleaseRecoveryQuery, ReleaseRecoverySource, WriterFenceBootstrap, WriterFenceError,
+        WriterFenceHandle, WriterFenceStartup,
+    },
 };
+#[cfg(feature = "test-utils")]
+pub use reth_engine_tree::tree::release_harness::{JoinedHarness, JoinedRestart};
 pub use reth_rpc_builder::{
     middleware::{RethAuthHttpMiddleware, RethRpcMiddleware},
     Identity, Stack,
@@ -368,6 +376,8 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     /// by the Diesis checkpoint snapshot producer. Populated by the engine
     /// launch loop.
     pub canonical_snapshot: Option<CanonicalSnapshotHandle>,
+    /// Actor-bound capability for tagged canonical publication and randomness release exclusion.
+    pub writer_fence: Option<WriterFenceHandle<<Node::Types as NodeTypes>::Payload>>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -381,6 +391,7 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             executed_block_tx: self.executed_block_tx.clone(),
             persisted_head: self.persisted_head.clone(),
             canonical_snapshot: self.canonical_snapshot.clone(),
+            writer_fence: self.writer_fence.clone(),
         }
     }
 }
@@ -1113,6 +1124,7 @@ where
             executed_block_tx: None,
             persisted_head: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             canonical_snapshot: None,
+            writer_fence: None,
         })
     }
 

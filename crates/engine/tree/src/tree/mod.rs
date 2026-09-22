@@ -8,6 +8,11 @@ use crate::{
     },
     persistence::PersistenceHandle,
     tree::{error::InsertPayloadError, payload_validator::TreeCtx},
+    writer_fence::{
+        production_writer_fence, ReleaseBinding, ReleaseFenceReceipt, WriterFenceBootstrap,
+        WriterFenceCommand, WriterFenceError, WriterFenceHandle, WriterFencePhase,
+        WriterFenceRequest, WriterFenceState,
+    },
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
@@ -33,9 +38,9 @@ use reth_primitives_traits::{
     FastInstant as Instant, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 use reth_provider::{
-    BalProvider, BlockExecutionOutput, BlockExecutionResult, BlockReader,
-    CanonicalSnapshotRequest, ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider,
-    ProviderError, StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
+    BalProvider, BlockExecutionOutput, BlockExecutionResult, BlockReader, CanonicalSnapshotRequest,
+    ChangeSetReader, DatabaseProviderFactory, HashedPostStateProvider, ProviderError,
+    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
     StorageChangeSetReader, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
@@ -64,6 +69,8 @@ pub mod payload_validator;
 mod persistence_state;
 pub mod precompile_cache;
 pub mod state_root_strategy;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod release_harness;
 #[cfg(test)]
 mod tests;
 mod trie_updates;
@@ -390,6 +397,10 @@ where
     incoming_tx: Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
     /// Incoming engine API requests.
     incoming: Receiver<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+    /// Bounded, prioritized control ingress for the actor-owned writer fence.
+    writer_fence_incoming: Receiver<WriterFenceRequest<T>>,
+    /// Keeps the private control ingress alive even if every public handle is dropped.
+    _writer_fence_liveness: Sender<WriterFenceRequest<T>>,
     /// Outgoing events that are emitted to the handler.
     outgoing: UnboundedSender<EngineApiEvent<N>>,
     /// Channels to the persistence layer.
@@ -430,6 +441,8 @@ where
     /// block number. Written here on persistence completion, read by the
     /// pipeline overlay eviction logic.
     persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
+    /// Single-thread-owned authority for canonical publication and release exclusion.
+    writer_fence: WriterFenceState,
     /// Test-only failure injected at the canonical provider lookup boundary.
     #[cfg(test)]
     test_canonical_provider_read_error: Option<ProviderError>,
@@ -487,7 +500,7 @@ where
 {
     /// Creates a new [`EngineApiTreeHandler`].
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         provider: P,
         consensus: Arc<dyn FullConsensus<N>>,
         payload_validator: V,
@@ -504,6 +517,9 @@ where
         runtime: reth_tasks::Runtime,
         use_hashed_state: bool,
         persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
+        writer_fence: WriterFenceState,
+        writer_fence_liveness: Sender<WriterFenceRequest<T>>,
+        writer_fence_incoming: Receiver<WriterFenceRequest<T>>,
     ) -> Self {
         let (incoming_tx, incoming) = crossbeam_channel::unbounded();
 
@@ -530,6 +546,9 @@ where
             runtime,
             use_hashed_state,
             persisted_head_notifier,
+            writer_fence,
+            _writer_fence_liveness: writer_fence_liveness,
+            writer_fence_incoming,
             #[cfg(test)]
             test_canonical_provider_read_error: None,
         }
@@ -556,8 +575,12 @@ where
         runtime: reth_tasks::Runtime,
         use_hashed_state: bool,
         persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
-    ) -> (Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>, UnboundedReceiver<EngineApiEvent<N>>)
-    {
+        writer_fence_bootstrap: WriterFenceBootstrap,
+    ) -> (
+        Sender<FromEngine<EngineApiRequest<T, N>, N::Block>>,
+        UnboundedReceiver<EngineApiEvent<N>>,
+        WriterFenceHandle<T>,
+    ) {
         let best_block_number = provider.best_block_number().unwrap_or(0);
         let header = provider.sealed_header(best_block_number).ok().flatten().unwrap_or_default();
 
@@ -576,6 +599,9 @@ where
             state_trie_overlays,
         );
 
+        let writer_fence = production_writer_fence(writer_fence_bootstrap);
+        let actor = writer_fence.actor();
+        let (writer_fence_tx, writer_fence_incoming) = crossbeam_channel::bounded(32);
         let task = Self::new(
             provider,
             consensus,
@@ -593,13 +619,17 @@ where
             runtime,
             use_hashed_state,
             persisted_head_notifier,
+            writer_fence,
+            writer_fence_tx.clone(),
+            writer_fence_incoming,
         );
         let incoming = task.incoming_tx.clone();
+        let writer_fence = WriterFenceHandle::new(writer_fence_tx, actor);
         spawn_os_thread("engine", || {
             increase_thread_priority();
             task.run()
         });
-        (incoming, outgoing)
+        (incoming, outgoing, writer_fence)
     }
 
     /// Returns a [`TreeOutcome`] indicating the forkchoice head is valid and canonical.
@@ -712,6 +742,12 @@ where
                         return
                     }
                 }
+                LoopEvent::WriterFence(request) => {
+                    if let Err(fatal) = self.on_writer_fence_request(request) {
+                        error!(target: "engine::tree", %fatal, "writer-fence request caused fatal tree error");
+                        return
+                    }
+                }
                 LoopEvent::Disconnected => {
                     error!(target: "engine::tree", "Channel disconnected");
                     return
@@ -738,9 +774,18 @@ where
         let maybe_persistence = self.persistence_state.rx.take();
 
         if let Some((persistence_rx, start_time, _action)) = maybe_persistence {
-            match persistence_rx.recv() {
-                Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
-                Err(_) => LoopEvent::Disconnected,
+            crossbeam_channel::select_biased! {
+                recv(self.writer_fence_incoming) -> request => match request {
+                    Ok(request) => {
+                        self.persistence_state.rx = Some((persistence_rx, start_time, _action));
+                        LoopEvent::WriterFence(request)
+                    }
+                    Err(_) => LoopEvent::Disconnected,
+                },
+                recv(persistence_rx) -> result => match result {
+                    Ok(result) => LoopEvent::PersistenceComplete { result, start_time },
+                    Err(_) => LoopEvent::Disconnected,
+                },
             }
         } else {
             self.wait_for_event()
@@ -760,6 +805,13 @@ where
             // Biased select prioritizes persistence completion to update in memory state and
             // unblock further writes
             crossbeam_channel::select_biased! {
+                recv(self.writer_fence_incoming) -> request => {
+                    self.persistence_state.rx = Some((persistence_rx, start_time, action));
+                    match request {
+                        Ok(request) => LoopEvent::WriterFence(request),
+                        Err(_) => LoopEvent::Disconnected,
+                    }
+                },
                 recv(persistence_rx) -> result => {
                     // Don't put it back - consumed (oneshot-like behavior)
                     match result {
@@ -780,10 +832,15 @@ where
                 },
             }
         } else {
-            // No persistence in progress - just wait on incoming
-            match self.incoming.recv() {
-                Ok(m) => LoopEvent::EngineMessage(m),
-                Err(_) => LoopEvent::Disconnected,
+            crossbeam_channel::select_biased! {
+                recv(self.writer_fence_incoming) -> request => match request {
+                    Ok(request) => LoopEvent::WriterFence(request),
+                    Err(_) => LoopEvent::Disconnected,
+                },
+                recv(self.incoming) -> msg => match msg {
+                    Ok(message) => LoopEvent::EngineMessage(message),
+                    Err(_) => LoopEvent::Disconnected,
+                },
             }
         }
     }
@@ -797,6 +854,10 @@ where
         &mut self,
         mut blocks: Vec<SealedBlock<N::Block>>,
     ) -> Result<Option<TreeEvent>, InsertBlockFatalError> {
+        if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+            debug!(target: "engine::tree", phase=self.writer_fence.phase().name(), "refusing downloaded blocks while canonical writer is reserved");
+            return Ok(None)
+        }
         if blocks.is_empty() {
             // nothing to execute
             return Ok(None)
@@ -1103,7 +1164,7 @@ where
         let new_head_hash = canonical_header.hash();
 
         // Update tree state with the new canonical head
-        self.state.tree_state.set_canonical_head(canonical_header.num_hash());
+        self.set_tree_canonical_head(canonical_header.num_hash());
 
         // Handle the state update based on whether this is an unwind scenario
         if new_head_number < current_head_number {
@@ -1531,9 +1592,16 @@ where
     /// This checks if we need to remove blocks (disk reorg) or save new blocks to disk.
     /// Persistence completion is handled separately via the `wait_for_event` method.
     fn advance_persistence(&mut self) -> Result<(), AdvancePersistenceError> {
+        if !self.writer_fence.ordinary_persistence_allowed() {
+            return Ok(())
+        }
         if !self.persistence_state.in_progress() {
             if let Some(new_tip_num) = self.find_disk_reorg()? {
                 self.remove_blocks(new_tip_num)
+            } else if self.writer_fence.admitted_publication_child().is_some() {
+                let blocks_to_persist =
+                    self.get_canonical_blocks_to_persist(PersistTarget::Head)?;
+                self.persist_blocks(blocks_to_persist);
             } else if self.should_persist() {
                 let blocks_to_persist =
                     self.get_canonical_blocks_to_persist(PersistTarget::Threshold)?;
@@ -1552,6 +1620,13 @@ where
         &mut self,
         pending_termination: oneshot::Sender<()>,
     ) -> Result<(), AdvancePersistenceError> {
+        if !self.writer_fence.ordinary_persistence_allowed() {
+            // Release/recovery phases retain their durable journal and persistence fence across
+            // shutdown. A replacement actor must reconcile that record before writer ingress
+            // opens; shutdown is never an implicit abort or completion.
+            let _ = pending_termination.send(());
+            return Ok(())
+        }
         trace!(target: "engine::tree", "finishing termination, persisting remaining blocks");
         let result = self.persist_until_complete();
         let _ = pending_termination.send(());
@@ -1595,6 +1670,43 @@ where
             }
 
             debug!(target: "engine::tree", count = blocks_to_persist.len(), "persisting remaining blocks before shutdown");
+            self.persist_blocks(blocks_to_persist);
+        }
+    }
+
+    /// Drain canonical saves for release acquisition without selecting an unwind. A completion
+    /// may enqueue another persistence action, so the receiver is always checked again before
+    /// reading canonical blocks.
+    fn persist_for_release(&mut self) -> Result<(), WriterFenceError> {
+        loop {
+            if let Some((rx, start_time, action)) = self.persistence_state.rx.take() {
+                debug!(target: "engine::tree", ?action, "waiting for in-flight persistence before release");
+                let result = rx.recv().map_err(|_| WriterFenceError::Persistence {
+                    message: "in-flight persistence acknowledgement channel closed".to_owned(),
+                })?;
+                self.on_persistence_complete(result, start_time).map_err(|error| {
+                    WriterFenceError::Persistence { message: error.to_string() }
+                })?;
+                continue
+            }
+
+            if let Some(remove_above) = self
+                .find_disk_reorg()
+                .map_err(|error| WriterFenceError::Provider { message: error.to_string() })?
+            {
+                return Err(WriterFenceError::Persistence {
+                    message: format!(
+                        "canonical disk divergence requires unwind above {remove_above}"
+                    ),
+                })
+            }
+
+            let blocks_to_persist = self
+                .get_canonical_blocks_to_persist(PersistTarget::Head)
+                .map_err(|error| WriterFenceError::Persistence { message: error.to_string() })?;
+            if blocks_to_persist.is_empty() {
+                return Ok(())
+            }
             self.persist_blocks(blocks_to_persist);
         }
     }
@@ -1765,6 +1877,300 @@ where
         Ok(None)
     }
 
+    fn writer_fence_refusal(&self) -> WriterFenceError {
+        match self.writer_fence.phase() {
+            WriterFencePhase::BootClosed => WriterFenceError::RecoveryFenced,
+            phase => WriterFenceError::Busy { phase: phase.name() },
+        }
+    }
+
+    fn set_tree_canonical_head(&mut self, head: BlockNumHash) {
+        assert!(
+            self.writer_fence.canonical_mutation_allowed(),
+            "canonical mutation attempted while writer fence is {}",
+            self.writer_fence.phase().name()
+        );
+        self.state.tree_state.set_canonical_head(head);
+    }
+
+    fn validate_publication_target(
+        &self,
+        parent: BlockNumHash,
+        child: BlockNumHash,
+    ) -> Result<(), WriterFenceError> {
+        let read_header = |target: BlockNumHash| {
+            self.sealed_header_by_hash(target.hash)
+                .map_err(|error| WriterFenceError::Provider { message: error.to_string() })?
+                .ok_or(WriterFenceError::UnknownPublicationTarget { target })
+        };
+        let header = read_header(child)?;
+        let actual = header.num_hash();
+        if actual != child {
+            return Err(WriterFenceError::PublicationTargetIdentityMismatch {
+                expected: child,
+                actual,
+            })
+        }
+        let mut cursor = if child.number >= parent.number { child } else { parent };
+        let target = if child.number >= parent.number { parent } else { child };
+        while cursor.number > target.number {
+            cursor = read_header(cursor)?.parent_num_hash();
+        }
+        if cursor != target {
+            return Err(WriterFenceError::PublicationParentMismatch {
+                expected: target.hash,
+                actual: cursor.hash,
+            })
+        }
+        Ok(())
+    }
+
+    fn exact_provider_head(&self) -> Result<BlockNumHash, WriterFenceError> {
+        let number = self
+            .provider
+            .best_block_number()
+            .map_err(|error| WriterFenceError::Provider { message: error.to_string() })?;
+        let hash = self
+            .provider
+            .block_hash(number)
+            .map_err(|error| WriterFenceError::Provider { message: error.to_string() })?
+            .ok_or_else(|| WriterFenceError::Provider {
+                message: format!("canonical hash missing at provider height {number}"),
+            })?;
+        Ok(BlockNumHash::new(number, hash))
+    }
+
+    fn release_persistence_fence(&mut self, operation: u64) -> Result<(), WriterFenceError> {
+        self.persistence
+            .release_release_fence(operation)
+            .recv()
+            .map_err(|_| WriterFenceError::Persistence {
+                message: "release acknowledgement channel closed".to_owned(),
+            })?
+            .map_err(|error| WriterFenceError::Persistence { message: error.to_string() })
+    }
+
+    fn acquire_release_fence(
+        &mut self,
+        actor: u64,
+        binding: ReleaseBinding,
+    ) -> Result<ReleaseFenceReceipt, WriterFenceError> {
+        if !self.backfill_sync_state.is_idle() {
+            return Err(WriterFenceError::Busy { phase: "backfill" })
+        }
+        let expected = binding.canonical_parent();
+        let actual = *self.state.tree_state.canonical_head();
+        let operation = self.writer_fence.begin_release_draining(actor, binding, actual)?;
+
+        let drained = self.persist_for_release();
+        if let Err(error) = drained {
+            self.writer_fence.fault();
+            return Err(error)
+        }
+
+        let pre_acquire = (|| {
+            let current = *self.state.tree_state.canonical_head();
+            if current != expected {
+                return Err(WriterFenceError::HeadMismatch { expected, actual: current })
+            }
+            if self.persistence_state.last_persisted_block != expected {
+                return Err(WriterFenceError::HeadMismatch {
+                    expected,
+                    actual: self.persistence_state.last_persisted_block,
+                })
+            }
+            let provider_head = self.exact_provider_head()?;
+            if provider_head != expected {
+                return Err(WriterFenceError::HeadMismatch { expected, actual: provider_head })
+            }
+            Ok(())
+        })();
+        if let Err(error) = pre_acquire {
+            if matches!(error, WriterFenceError::HeadMismatch { .. }) {
+                let _ = self.writer_fence.cancel_release_draining(operation, binding);
+            } else {
+                self.writer_fence.fault();
+            }
+            return Err(error)
+        }
+
+        let result = self
+            .persistence
+            .acquire_release_fence(operation, expected)
+            .recv()
+            .map_err(|_| WriterFenceError::Persistence {
+                message: "acquire acknowledgement channel closed".to_owned(),
+            })
+            .and_then(|result| {
+                result.map_err(|error| WriterFenceError::Persistence { message: error.to_string() })
+            })
+            .and_then(|()| self.writer_fence.grant_release(operation, binding));
+
+        if result.is_err() {
+            // Once persistence acquisition is dispatched, either a negative or lost
+            // acknowledgement is ambiguous to this actor. Keep all canonical ingress closed.
+            self.writer_fence.fault();
+        }
+        result
+    }
+
+    /// A mismatched capability or committed receipt is refused by the side-effect-free
+    /// pre-check and leaves the held release phase and journal unchanged. Every other
+    /// failure occurs after a journal or persistence transition began and is ambiguous
+    /// to this actor, so all canonical ingress stays closed until exact recovery.
+    fn fault_release_unless_refused(&mut self, result: &Result<(), WriterFenceError>) {
+        if !matches!(result, Ok(()) | Err(WriterFenceError::StaleCapability)) {
+            self.writer_fence.fault();
+        }
+    }
+
+    fn on_writer_fence_request(
+        &mut self,
+        request: WriterFenceRequest<T>,
+    ) -> Result<(), InsertBlockFatalError> {
+        let mut fatal_error = None;
+        match request.into_command() {
+            WriterFenceCommand::BeginPublication { actor, parent, child, forkchoice, response } => {
+                let actual = *self.state.tree_state.canonical_head();
+                let result = self.validate_publication_target(parent, child).and_then(|()| {
+                    self.writer_fence.begin_publication(actor, parent, child, forkchoice, actual)
+                });
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::TaggedForkchoice {
+                actor,
+                operation,
+                state,
+                payload_attrs,
+                response,
+            } => {
+                let result = if payload_attrs.is_some() {
+                    Err(WriterFenceError::PayloadAttributesUnsupported)
+                } else {
+                    self.writer_fence
+                        .publication_target(actor, operation, state)
+                        .and_then(|(parent, child)| self.validate_publication_target(parent, child))
+                }
+                .and_then(|()| {
+                    self.writer_fence.authorize_tagged_forkchoice(actor, operation, state)
+                })
+                .and_then(|()| {
+                    let mut output =
+                        self.on_forkchoice_updated(state, payload_attrs).map_err(|error| {
+                            WriterFenceError::Forkchoice { message: error.to_string() }
+                        })?;
+                    self.state
+                        .forkchoice_state_tracker
+                        .set_latest(state, output.outcome.forkchoice_status());
+                    self.emit_event(ConsensusEngineEvent::ForkchoiceUpdated(
+                        state,
+                        output.outcome.forkchoice_status(),
+                    ));
+                    if let Err(error) = self.on_maybe_tree_event(output.event.take()) {
+                        let message = error.to_string();
+                        fatal_error = Some(error);
+                        return Err(WriterFenceError::Provider { message })
+                    }
+                    if output.outcome.forkchoice_status().is_valid() {
+                        let actual = *self.state.tree_state.canonical_head();
+                        self.writer_fence.mark_publication_admitted(actor, operation, actual)?;
+                    }
+                    Ok(output)
+                });
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::FinishPublication { actor, operation, child, response } => {
+                let actual = *self.state.tree_state.canonical_head();
+                let _ = response
+                    .send(self.writer_fence.finish_publication(actor, operation, child, actual));
+            }
+            WriterFenceCommand::AcquireRelease { actor, binding, response } => {
+                let _ = response.send(self.acquire_release_fence(actor, binding));
+            }
+            WriterFenceCommand::AbortRelease { capability, response } => {
+                let operation = capability.operation();
+                let result = self
+                    .writer_fence
+                    .authorize_abort(capability)
+                    .and_then(|()| self.writer_fence.prepare_abort_release(capability))
+                    .and_then(|()| self.release_persistence_fence(operation))
+                    .and_then(|()| self.writer_fence.finish_resolved_release(capability));
+                self.fault_release_unless_refused(&result);
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::ArmRelease { capability, response } => {
+                let result = self.writer_fence.arm_release(capability);
+                self.fault_release_unless_refused(&result);
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::CompleteRelease { capability, committed, response } => {
+                let operation = capability.operation();
+                let actual = *self.state.tree_state.canonical_head();
+                let result = self
+                    .writer_fence
+                    .authorize_complete(capability, committed, actual)
+                    .and_then(|()| {
+                        self.writer_fence.prepare_complete_release(capability, committed, actual)
+                    })
+                    .and_then(|()| self.release_persistence_fence(operation))
+                    .and_then(|()| self.writer_fence.finish_resolved_release(capability));
+                self.fault_release_unless_refused(&result);
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::AbandonRelease { capability, abandoned, response } => {
+                let operation = capability.operation();
+                let result = self
+                    .writer_fence
+                    .authorize_abandon(capability, abandoned)
+                    .and_then(|()| self.writer_fence.prepare_abandon_release(capability, abandoned))
+                    .and_then(|()| self.release_persistence_fence(operation))
+                    .and_then(|()| self.writer_fence.finish_resolved_release(capability));
+                self.fault_release_unless_refused(&result);
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::ReserveBackfill { actor, response } => {
+                let result = if self.backfill_sync_state.is_idle() {
+                    self.writer_fence.reserve_backfill(actor)
+                } else {
+                    Err(WriterFenceError::Busy { phase: "backfill" })
+                };
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::OpenQualifiedIngress { actor, response } => {
+                let result = if self.backfill_sync_state.is_idle() {
+                    self.writer_fence.open_qualified(actor)
+                } else {
+                    Err(WriterFenceError::Busy { phase: "backfill" })
+                };
+                let _ = response.send(result);
+            }
+            WriterFenceCommand::CheckReleaseReplay { actor, expected, response } => {
+                let result = (|| {
+                    self.writer_fence.ensure_release_replay_ready(actor)?;
+                    if !self.backfill_sync_state.is_idle() || self.persistence_state.in_progress() {
+                        return Err(WriterFenceError::Busy { phase: "replay persistence" });
+                    }
+                    for actual in [
+                        *self.state.tree_state.canonical_head(),
+                        self.persistence_state.last_persisted_block,
+                        self.exact_provider_head()?,
+                    ] {
+                        if actual != expected {
+                            return Err(WriterFenceError::HeadMismatch { expected, actual });
+                        }
+                    }
+                    Ok(())
+                })();
+                let _ = response.send(result);
+            }
+        }
+        if let Some(error) = fatal_error {
+            self.writer_fence.fault();
+            return Err(error.into())
+        }
+        Ok(())
+    }
+
     /// Handles a message from the engine.
     ///
     /// Returns `ControlFlow::Break(())` if the engine should terminate.
@@ -1776,9 +2182,19 @@ where
             FromEngine::Event(event) => match event {
                 FromOrchestrator::BackfillSyncStarted => {
                     debug!(target: "engine::tree", "received backfill sync started event");
+                    if let Err(error) = self.writer_fence.backfill_started() {
+                        error!(target: "engine::tree", %error, "backfill started without actor permit");
+                        self.writer_fence.fault();
+                        return Ok(ops::ControlFlow::Break(()))
+                    }
                     self.backfill_sync_state = BackfillSyncState::Active;
                 }
                 FromOrchestrator::BackfillSyncFinished(ctrl) => {
+                    if let Err(error) = self.writer_fence.backfill_finished() {
+                        error!(target: "engine::tree", %error, "backfill completion violated writer-fence phase");
+                        self.writer_fence.fault();
+                        return Ok(ops::ControlFlow::Break(()))
+                    }
                     self.on_backfill_sync_finished(ctrl)?;
                 }
                 FromOrchestrator::Terminate { tx } => {
@@ -1792,6 +2208,10 @@ where
             FromEngine::Request(request) => {
                 match request {
                     EngineApiRequest::InsertExecutedBlock(payload) => {
+                        if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+                            debug!(target: "engine::tree", phase=self.writer_fence.phase().name(), "refusing built payload insertion while canonical writer is reserved");
+                            return Ok(ops::ControlFlow::Continue(()))
+                        }
                         let block_num_hash = payload.recovered_block.num_hash();
                         if block_num_hash.number <= self.state.tree_state.canonical_block_number() {
                             // outdated block that can be skipped
@@ -1831,6 +2251,12 @@ where
                         ));
                     }
                     EngineApiRequest::InsertExecutedBlockIfCanonical(request) => {
+                        if !self.writer_fence.direct_insert_allowed() {
+                            request.reject(ExecutedBlockInsertError::WriterFenced {
+                                phase: self.writer_fence.phase().name(),
+                            });
+                            return Ok(ops::ControlFlow::Continue(()))
+                        }
                         let (identity, block, response, permit) = request.into_parts();
                         let actual_head = *self.state.tree_state.canonical_head();
                         let result = match self.classify_direct_insert(identity, &block) {
@@ -1858,49 +2284,55 @@ where
                     EngineApiRequest::Beacon(request) => {
                         match request {
                             BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs, tx } => {
-                                let has_attrs = payload_attrs.is_some();
+                                if !self.writer_fence.untagged_forkchoice_allowed() {
+                                    drop(payload_attrs);
+                                    let _ = tx.send(Err(reth_errors::RethError::msg(
+                                        "untagged forkchoice update refused in release-capable writer mode",
+                                    )));
+                                    debug!(target: "engine::tree", ?state, phase=self.writer_fence.phase().name(), "refused untagged forkchoice update before mutation");
+                                    return Ok(ops::ControlFlow::Continue(()))
+                                }
 
+                                let has_attrs = payload_attrs.is_some();
                                 let start = Instant::now();
                                 let mut output = self.on_forkchoice_updated(state, payload_attrs);
 
                                 if let Ok(res) = &mut output {
-                                    // track last received forkchoice state
                                     self.state
                                         .forkchoice_state_tracker
                                         .set_latest(state, res.outcome.forkchoice_status());
-
-                                    // emit an event about the handled FCU
                                     self.emit_event(ConsensusEngineEvent::ForkchoiceUpdated(
                                         state,
                                         res.outcome.forkchoice_status(),
                                     ));
-
-                                    // handle the event if any
                                     self.on_maybe_tree_event(res.event.take())?;
                                 }
-
-                                if let Err(ref err) = output {
-                                    error!(target: "engine::tree", %err, ?state, "Error processing forkchoice update");
+                                if let Err(ref error) = output {
+                                    error!(target: "engine::tree", %error, ?state, "Error processing forkchoice update");
                                 }
-
                                 self.metrics.engine.forkchoice_updated.update_response_metrics(
                                     start,
                                     &mut self.metrics.engine.new_payload.latest_finish_at,
                                     has_attrs,
                                     &output,
                                 );
-
-                                if let Err(err) =
-                                    tx.send(output.map(|o| o.outcome).map_err(Into::into))
+                                if tx
+                                    .send(output.map(|result| result.outcome).map_err(Into::into))
+                                    .is_err()
                                 {
                                     self.metrics
                                         .engine
                                         .failed_forkchoice_updated_response_deliveries
                                         .increment(1);
-                                    warn!(target: "engine::tree", ?state, elapsed=?start.elapsed(), "Failed to deliver forkchoiceUpdated response, receiver dropped (request cancelled): {err:?}");
                                 }
                             }
                             BeaconEngineMessage::NewPayload { payload, tx } => {
+                                if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+                                    let _ = tx.send(Err(BeaconOnNewPayloadError::internal(
+                                        self.writer_fence_refusal(),
+                                    )));
+                                    return Ok(ops::ControlFlow::Continue(()))
+                                }
                                 let start = Instant::now();
                                 let gas_used = payload.gas_used();
                                 let num_hash = payload.num_hash();
@@ -1938,6 +2370,12 @@ where
                                 tx,
                                 enqueued_at,
                             } => {
+                                if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+                                    let _ = tx.send(Err(BeaconOnNewPayloadError::internal(
+                                        self.writer_fence_refusal(),
+                                    )));
+                                    return Ok(ops::ControlFlow::Continue(()))
+                                }
                                 debug!(
                                     target: "engine::tree",
                                     wait_for_persistence,
@@ -2027,6 +2465,10 @@ where
                 }
             }
             FromEngine::DownloadedBlocks(blocks) => {
+                if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+                    debug!(target: "engine::tree", phase=self.writer_fence.phase().name(), "refusing downloaded canonical work while writer is reserved");
+                    return Ok(ops::ControlFlow::Continue(()))
+                }
                 if let Some(event) = self.on_downloaded(blocks)? {
                     self.on_tree_event(event)?;
                 }
@@ -2137,7 +2579,7 @@ where
         if let Ok(Some(new_head)) = self.provider.sealed_header(backfill_height) {
             // update the tracked chain height, after backfill sync both the canonical height and
             // persisted height are the same
-            self.state.tree_state.set_canonical_head(new_head.num_hash());
+            self.set_tree_canonical_head(new_head.num_hash());
             self.persistence_state.finish(new_head.hash(), new_head.number());
 
             // update the tracked canonical head
@@ -2277,6 +2719,10 @@ where
         match event {
             TreeEvent::TreeAction(action) => match action {
                 TreeAction::MakeCanonical { sync_target_head } => {
+                    if !matches!(self.writer_fence.phase(), WriterFencePhase::Idle) {
+                        debug!(target: "engine::tree", phase=self.writer_fence.phase().name(), %sync_target_head, "refusing autonomous canonical transition while writer is reserved");
+                        return Ok(())
+                    }
                     self.make_canonical(sync_target_head)?;
                 }
             },
@@ -2346,6 +2792,11 @@ where
                 return
             }
 
+            if let Err(error) = self.writer_fence.reserve_backfill(self.writer_fence.actor()) {
+                debug!(target: "engine::tree", %error, "refusing backfill emission while canonical writer is reserved");
+                return
+            }
+
             self.backfill_sync_state = BackfillSyncState::Pending;
             self.metrics.engine.pipeline_runs.increment(1);
             debug!(target: "engine::tree", "emitting backfill action event");
@@ -2360,6 +2811,9 @@ where
     /// block is greater than the persistence threshold,
     /// backfill is not running, and no payload is currently being built.
     pub const fn should_persist(&self) -> bool {
+        if !self.writer_fence.ordinary_persistence_allowed() {
+            return false
+        }
         if self.building_payload {
             return false
         }
@@ -2965,7 +3419,7 @@ where
         let start = Instant::now();
 
         // update the tracked canonical head
-        self.state.tree_state.set_canonical_head(chain_update.tip().num_hash());
+        self.set_tree_canonical_head(chain_update.tip().num_hash());
 
         let tip = chain_update.tip().clone_sealed_header();
         let notification = chain_update.to_chain_notification();
@@ -3678,6 +4132,8 @@ where
 {
     /// An engine API message was received.
     EngineMessage(FromEngine<EngineApiRequest<T, N>, N::Block>),
+    /// A bounded writer-fence control request was received.
+    WriterFence(WriterFenceRequest<T>),
     /// A persistence task completed.
     PersistenceComplete {
         /// The unified result of the persistence operation.

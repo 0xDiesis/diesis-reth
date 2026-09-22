@@ -41,8 +41,8 @@ pub trait CommitmentValidator: Send + Sync {
     ///
     /// # Parameters
     ///
-    /// - `parent_block`: the block number of the parent block (i.e. the block whose
-    ///   post-state is the starting point for this computation).
+    /// - `parent_block`: the block number of the parent block (i.e. the block whose post-state is
+    ///   the starting point for this computation).
     /// - `bundle_state`: the EVM state diff produced by executing the block.
     ///
     /// [`write_updates`]: CommitmentValidator::write_updates

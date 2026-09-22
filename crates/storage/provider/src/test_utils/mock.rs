@@ -439,6 +439,11 @@ pub struct ExtendedAccount {
 }
 
 impl ExtendedAccount {
+    /// Snapshot exact account data for a test that restarts in another process.
+    pub fn snapshot(&self) -> (Account, Option<Bytes>, HashMap<StorageKey, StorageValue>) {
+        (self.account, self.bytecode.as_ref().map(|code| code.original_bytes()), self.storage.clone())
+    }
+
     /// Create new instance of extended account
     pub fn new(nonce: u64, balance: U256) -> Self {
         Self {
