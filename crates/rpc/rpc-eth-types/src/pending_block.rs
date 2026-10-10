@@ -18,6 +18,10 @@ use reth_primitives_traits::{
 use reth_rpc_convert::{RpcConvert, RpcTypes};
 
 /// Configured [`reth_evm::EvmEnv`] for a pending block.
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more Constructor emits explicit field names in generated code"
+)]
 #[derive(Debug, Clone, Constructor)]
 pub struct PendingBlockEnv<Evm: ConfigureEvm> {
     /// Configured [`reth_evm::EvmEnv`] for the pending block.
@@ -83,6 +87,10 @@ impl<B: Block, R> PendingBlockEnvOrigin<B, R> {
 pub type PendingBlockAndReceipts<N> = BlockAndReceipts<N>;
 
 /// Locally built pending block for `pending` tag.
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more Constructor emits explicit field names in generated code"
+)]
 #[derive(Debug, Clone, Constructor)]
 pub struct PendingBlock<N: NodePrimitives> {
     /// Timestamp when the pending block is considered outdated.

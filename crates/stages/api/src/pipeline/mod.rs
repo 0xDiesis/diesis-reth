@@ -608,10 +608,6 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
                     // fails, we bail entirely,
                     // otherwise we restart the execution loop from the
                     // beginning.
-                    Ok(Some(ControlFlow::Unwind {
-                        target: prev_checkpoint.unwrap_or_default().block_number,
-                        bad_block: block,
-                    }))
                 }
                 BlockErrorKind::Execution(execution_error) => {
                     error!(
@@ -625,12 +621,12 @@ impl<N: ProviderNodeTypes> Pipeline<N> {
                     // fails, we bail entirely,
                     // otherwise we restart
                     // the execution loop from the beginning.
-                    Ok(Some(ControlFlow::Unwind {
-                        target: prev_checkpoint.unwrap_or_default().block_number,
-                        bad_block: block,
-                    }))
                 }
             }
+            Ok(Some(ControlFlow::Unwind {
+                target: prev_checkpoint.unwrap_or_default().block_number,
+                bad_block: block,
+            }))
         } else if let StageError::MissingStaticFileData { block, segment } = err {
             error!(
                 target: "sync::pipeline",

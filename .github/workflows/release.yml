@@ -49,7 +49,7 @@ jobs:
       - name: Extract version
         env:
           REF: ${{ env.RELEASE_REF }}
-        run: echo "VERSION=${REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
         id: extract_version
     outputs:
       VERSION: ${{ steps.extract_version.outputs.VERSION }}
@@ -66,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_REF }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Verify crate version matches tag
         # Check that the Cargo version starts with the tag,
         # so that Cargo version 1.4.8 can be matched against both v1.4.8 and v1.4.8-rc.1
@@ -113,7 +113,7 @@ jobs:
           persist-credentials: false
           ref: ${{ env.RELEASE_REF }}
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           target: ${{ matrix.configs.target }}
       - name: Install LLVM
@@ -133,8 +133,8 @@ jobs:
       - name: Apple M1 setup
         if: matrix.configs.target == 'aarch64-apple-darwin'
         run: |
-          echo "SDKROOT=$(xcrun -sdk macosx --show-sdk-path)" >> $GITHUB_ENV
-          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx --show-sdk-platform-version)" >> $GITHUB_ENV
+          echo "SDKROOT=$(xcrun -sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx --show-sdk-platform-version)" >> "$GITHUB_ENV"
 
       - name: Build Reth
         env:
@@ -157,12 +157,16 @@ jobs:
           GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          export GPG_TTY=$(tty)
+          if GPG_TTY=$(tty); then
+            export GPG_TTY
+          else
+            unset GPG_TTY
+          fi
           echo -n "$GPG_SIGNING_KEY" | base64 --decode | gpg --batch --import
           cd artifacts
           tar -czf ${{ matrix.build.binary }}-${{ needs.extract-version.outputs.VERSION }}-${{ matrix.configs.target }}.tar.gz ${{ matrix.build.binary }}* LICENSES README.md
           echo "$GPG_PASSPHRASE" | gpg --passphrase-fd 0 --pinentry-mode loopback --batch -ab ${{ matrix.build.binary }}-${{ needs.extract-version.outputs.VERSION }}-${{ matrix.configs.target }}.tar.gz
-          mv *tar.gz* ..
+          mv ./*tar.gz* ..
         shell: bash
 
       - name: Upload artifact
@@ -203,9 +207,12 @@ jobs:
       - name: Generate full changelog
         id: changelog
         run: |
-          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
-          echo "$(git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 ${{ env.VERSION }}^)..${{ env.VERSION }})" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          previous_tag=$(git describe --tags --abbrev=0 "${VERSION}^")
+          {
+            printf 'CHANGELOG<<EOF\n'
+            git log --pretty=format:"- %s" "${previous_tag}..${VERSION}"
+            printf '\nEOF\n'
+          } >> "$GITHUB_OUTPUT"
       - name: Create release draft
         env:
           GITHUB_USER: ${{ github.repository_owner }}
@@ -214,7 +221,7 @@ jobs:
         # https://github.com/openethereum/openethereum/blob/6c2d392d867b058ff867c4373e40850ca3f96969/.github/workflows/build.yml
         run: |
           prerelease_flag=""
-          if [[ "${{ env.VERSION }}" == *-rc* ]]; then
+          if [[ "$VERSION" == *-rc* ]]; then
             prerelease_flag="--prerelease"
           fi
 

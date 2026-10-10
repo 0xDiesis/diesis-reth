@@ -37,7 +37,7 @@ jobs:
             exit 1
           fi
 
-          echo "VERSION=$TAG" >> $GITHUB_OUTPUT
+          echo "VERSION=$TAG" >> "$GITHUB_OUTPUT"
     outputs:
       VERSION: ${{ steps.extract_version.outputs.VERSION }}
 
@@ -54,6 +54,8 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.extract-version.outputs.VERSION }}
 
+      - uses: dtolnay/rust-toolchain@1.99.0
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -68,7 +70,7 @@ jobs:
         id: rust_version
         run: |
           RUST_TOOLCHAIN=$(rustc --version | cut -d' ' -f2)
-          echo "RUST_TOOLCHAIN=$RUST_TOOLCHAIN" >> $GITHUB_OUTPUT
+          echo "RUST_TOOLCHAIN=$RUST_TOOLCHAIN" >> "$GITHUB_OUTPUT"
 
       - name: Build reproducible artifacts
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -113,7 +115,11 @@ jobs:
           GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          export GPG_TTY=$(tty)
+          if GPG_TTY=$(tty); then
+            export GPG_TTY
+          else
+            unset GPG_TTY
+          fi
           echo -n "$GPG_SIGNING_KEY" | base64 --decode | gpg --batch --import
 
           cd reproducible-artifacts

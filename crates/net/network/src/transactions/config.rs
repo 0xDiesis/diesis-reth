@@ -124,6 +124,10 @@ impl FromStr for TransactionPropagationMode {
 }
 
 /// Configuration for fetching transactions.
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more Constructor emits explicit field names in generated code"
+)]
 #[derive(Debug, Constructor, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TransactionFetcherConfig {

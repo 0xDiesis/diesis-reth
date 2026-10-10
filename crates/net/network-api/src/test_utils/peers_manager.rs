@@ -18,6 +18,10 @@ pub trait PeersHandleProvider {
 }
 
 /// A communication channel to the `PeersManager` to apply manual changes to the peer set.
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more Constructor emits explicit field names in generated code"
+)]
 #[derive(Clone, Debug, Constructor)]
 pub struct PeersHandle {
     /// Sender half of command channel back to the `PeersManager`

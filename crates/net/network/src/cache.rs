@@ -219,6 +219,10 @@ mod test {
     #[derive(Debug, Hash, PartialEq, Eq, Display, Clone, Copy)]
     struct Key(i8);
 
+    #[allow(
+        clippy::redundant_field_names,
+        reason = "derive_more Constructor emits explicit field names in generated code"
+    )]
     #[derive(Debug, Eq, Constructor, Clone, Copy)]
     struct CompoundKey {
         // type unique for id

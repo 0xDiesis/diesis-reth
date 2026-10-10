@@ -13,6 +13,10 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(
+    clippy::double_must_use,
+    reason = "jsonrpsee adds must_use to generated methods returning already must-use Futures"
+)]
 
 mod admin;
 mod anvil;

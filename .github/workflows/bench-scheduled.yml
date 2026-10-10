@@ -348,7 +348,7 @@ jobs:
             core.exportVariable('BENCH_JOB_URL', jobUrl);
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         continue-on-error: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -418,15 +418,21 @@ jobs:
         run: |
           FEATURE_SHORT=$(echo "$FEATURE_REF" | cut -c1-8)
           if [ "$BENCH_MODE" = "release" ] && [ -n "$RELEASE_TAG" ]; then
-            echo "baseline-name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-            echo "baseline-ref=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+            {
+              echo "baseline-name=${RELEASE_TAG}"
+              echo "baseline-ref=${RELEASE_TAG}"
+            } >> "$GITHUB_OUTPUT"
           else
             BASELINE_SHORT=$(echo "$BASELINE_REF" | cut -c1-8)
-            echo "baseline-name=${BENCH_MODE}-${BASELINE_SHORT}" >> "$GITHUB_OUTPUT"
-            echo "baseline-ref=$BASELINE_REF" >> "$GITHUB_OUTPUT"
+            {
+              echo "baseline-name=${BENCH_MODE}-${BASELINE_SHORT}"
+              echo "baseline-ref=$BASELINE_REF"
+            } >> "$GITHUB_OUTPUT"
           fi
-          echo "feature-name=${BENCH_MODE}-${FEATURE_SHORT}" >> "$GITHUB_OUTPUT"
-          echo "feature-ref=$FEATURE_REF" >> "$GITHUB_OUTPUT"
+          {
+            echo "feature-name=${BENCH_MODE}-${FEATURE_SHORT}"
+            echo "feature-ref=$FEATURE_REF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare source dirs
         run: |
@@ -630,14 +636,18 @@ jobs:
               fi
               printf '<details><summary><b>%s</b>: %d panic(s), %d error(s)</summary>\n\n' "$run_dir" "$panics" "$errors" >> "$ERRORS_FILE"
               if [ "$panics" -gt 0 ]; then
-                printf '**Panics:**\n```\n' >> "$ERRORS_FILE"
-                grep -E 'panicked at' "$LOG" | head -10 >> "$ERRORS_FILE"
-                printf '```\n' >> "$ERRORS_FILE"
+                {
+                  printf '**Panics:**\n```\n'
+                  grep -E 'panicked at' "$LOG" | head -10
+                  printf '```\n'
+                } >> "$ERRORS_FILE"
               fi
               if [ "$errors" -gt 0 ]; then
-                printf '**Errors (first 20):**\n```\n' >> "$ERRORS_FILE"
-                grep ' ERROR ' "$LOG" | head -20 >> "$ERRORS_FILE"
-                printf '```\n' >> "$ERRORS_FILE"
+                {
+                  printf '**Errors (first 20):**\n```\n'
+                  grep ' ERROR ' "$LOG" | head -20
+                  printf '```\n'
+                } >> "$ERRORS_FILE"
               fi
               printf '\n</details>\n\n' >> "$ERRORS_FILE"
             fi

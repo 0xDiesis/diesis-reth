@@ -25,6 +25,10 @@ impl FilterOutcome {
 }
 
 /// Filter requiring that peers advertise that they belong to some fork of a certain key.
+#[allow(
+    clippy::redundant_field_names,
+    reason = "derive_more Constructor emits explicit field names in generated code"
+)]
 #[derive(Debug, Constructor, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MustIncludeKey {
     /// Kv-pair key which node record must advertise.

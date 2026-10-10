@@ -196,7 +196,7 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
         continue-on-error: true
@@ -259,6 +259,8 @@ jobs:
           set -euo pipefail
 
           replay_path="$BENCHMARKOOR_REPLAY_PATH"
+          # Match literal tilde prefixes before expanding them ourselves.
+          # shellcheck disable=SC2088
           case "$replay_path" in
             "~") replay_path="$HOME" ;;
             "~/"*) replay_path="$HOME/${replay_path#"~/"}" ;;
@@ -306,6 +308,8 @@ jobs:
           set -euo pipefail
 
           metadata_root="$BENCHMARKOOR_METADATA_ROOT"
+          # Match literal tilde prefixes before expanding them ourselves.
+          # shellcheck disable=SC2088
           case "$metadata_root" in
             "~") metadata_root="$HOME" ;;
             "~/"*) metadata_root="$HOME/${metadata_root#"~/"}" ;;
