@@ -1,0 +1,12 @@
+# cargo audit exceptions. Each one has no fixed version reachable without a major upgrade.
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5 via elliptic-curve 0.13 (k256). Fixed only in 0.7.6+, which needs
+    # elliptic-curve 0.14; alloy-signer, enr, libp2p-identity and revm-precompile still require
+    # k256 0.13. Mirrors deny.toml.
+    "RUSTSEC-2026-0387",
+    # tracing-subscriber 0.2.25 is recorded in Cargo.lock through revm-precompile 41's optional
+    # ark-relations 0.5 dependency but is never compiled. ark-relations 0.6 arrives with
+    # revm-precompile 42+.
+    "RUSTSEC-2025-0055",
+]
