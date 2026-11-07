@@ -32,7 +32,7 @@ trap 'rm -rf -- "$tmpdir"' EXIT INT TERM
 
 for crate in "${crates_to_check[@]}"; do
   outfile="$tmpdir/$crate.log"
-  if cargo +1.99.0 build -p "$crate" --target riscv32imac-unknown-none-elf --no-default-features --color never >"$outfile" 2>&1; then
+  if cargo +1.99.1 build -p "$crate" --target riscv32imac-unknown-none-elf --no-default-features --color never >"$outfile" 2>&1; then
     echo "✅ $crate"
   else
     echo "❌ $crate"

@@ -51,7 +51,7 @@ case "$MODE" in
 
   feature|branch)
     echo "Building feature ${NODE_BIN} (${COMMIT}) from source for txgen benchmark..."
-    rustup show active-toolchain || rustup default 1.99.0
+    rustup show active-toolchain || rustup default 1.99.1
     build_node_binary
     ;;
 

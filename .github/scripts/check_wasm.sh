@@ -109,7 +109,7 @@ for crate in "${crates[@]}"; do
   fi
 
   outfile="$tmpdir/$crate.log"
-  if cargo +1.99.0 build -p "$crate" --target wasm32-wasip1 --no-default-features --color never >"$outfile" 2>&1; then
+  if cargo +1.99.1 build -p "$crate" --target wasm32-wasip1 --no-default-features --color never >"$outfile" 2>&1; then
     echo "✅ $crate"
   else
     echo "❌ $crate"

@@ -46,7 +46,7 @@ jobs:
         uses: rui314/setup-mold@v1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
 
