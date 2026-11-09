@@ -4060,7 +4060,7 @@ mod tests {
         // insert a bunch of transactions into the queued pool
         for _ in 0..queued_limit.max_txs {
             let tx = MockTransaction::eip1559().inc_price_by(10).inc_nonce();
-            let validated = f.validated(tx.clone());
+            let validated = f.validated(tx);
             let _id = *validated.id();
             pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
         }
@@ -4070,7 +4070,7 @@ mod tests {
 
         for _ in 0..queued_limit.max_txs {
             let tx = MockTransaction::eip1559().inc_price_by(10).inc_nonce();
-            let validated = f.validated(tx.clone());
+            let validated = f.validated(tx);
             let _id = *validated.id();
             pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
@@ -4090,7 +4090,7 @@ mod tests {
         // insert a bunch of transactions into the queued pool
         for _ in 0..blob_limit.max_txs {
             let tx = MockTransaction::eip4844().inc_price_by(100).with_blob_fee(100);
-            let validated = f.validated(tx.clone());
+            let validated = f.validated(tx);
             let _id = *validated.id();
             pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
         }
@@ -4100,7 +4100,7 @@ mod tests {
 
         for _ in 0..blob_limit.max_txs {
             let tx = MockTransaction::eip4844().inc_price_by(100).with_blob_fee(100);
-            let validated = f.validated(tx.clone());
+            let validated = f.validated(tx);
             let _id = *validated.id();
             pool.add_transaction(validated, U256::from(1_000), 0, None).unwrap();
 
@@ -4769,8 +4769,7 @@ mod tests {
             tx6.clone(),
             tx7.clone(),
         ] {
-            pool.add_transaction(f.validated(tx.clone()), on_chain_balance, on_chain_nonce, None)
-                .unwrap();
+            pool.add_transaction(f.validated(tx), on_chain_balance, on_chain_nonce, None).unwrap();
         }
 
         let base_fee = base_fee as u64;

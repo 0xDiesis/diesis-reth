@@ -602,6 +602,99 @@ pub enum CanonicalSnapshotExportError {
     Export(#[from] CanonicalSnapshotError),
 }
 
+impl<T: PayloadTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {
+    fn from(msg: BeaconEngineMessage<T>) -> Self {
+        Self::Beacon(msg)
+    }
+}
+
+impl<T: PayloadTypes, N: NodePrimitives> From<EngineApiRequest<T, N>>
+    for FromEngine<EngineApiRequest<T, N>, N::Block>
+{
+    fn from(req: EngineApiRequest<T, N>) -> Self {
+        Self::Request(req)
+    }
+}
+
+/// Events emitted by the engine API handler.
+#[derive(Debug)]
+pub enum EngineApiEvent<N: NodePrimitives = EthPrimitives> {
+    /// Event from the consensus engine.
+    // TODO(mattsse): find a more appropriate name for this variant, consider phasing it out.
+    BeaconConsensus(ConsensusEngineEvent<N>),
+    /// Backfill action is needed.
+    BackfillAction(BackfillAction),
+    /// Block download is needed.
+    Download(DownloadRequest),
+}
+
+impl<N: NodePrimitives> EngineApiEvent<N> {
+    /// Returns `true` if the event is a backfill action.
+    pub const fn is_backfill_action(&self) -> bool {
+        matches!(self, Self::BackfillAction(_))
+    }
+}
+
+impl<N: NodePrimitives> From<ConsensusEngineEvent<N>> for EngineApiEvent<N> {
+    fn from(event: ConsensusEngineEvent<N>) -> Self {
+        Self::BeaconConsensus(event)
+    }
+}
+
+/// Events received from the engine.
+#[derive(Debug)]
+pub enum FromEngine<Req, B: Block> {
+    /// Event from the top level orchestrator.
+    Event(FromOrchestrator),
+    /// Request from the engine.
+    Request(Req),
+    /// Downloaded blocks from the network.
+    DownloadedBlocks(Vec<SealedBlock<B>>),
+}
+
+impl<Req: Display, B: Block> Display for FromEngine<Req, B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Event(ev) => write!(f, "Event({ev:?})"),
+            Self::Request(req) => write!(f, "Request({req})"),
+            Self::DownloadedBlocks(blocks) => {
+                write!(f, "DownloadedBlocks({} blocks)", blocks.len())
+            }
+        }
+    }
+}
+
+impl<Req, B: Block> From<FromOrchestrator> for FromEngine<Req, B> {
+    fn from(event: FromOrchestrator) -> Self {
+        Self::Event(event)
+    }
+}
+
+/// Requests produced by a [`EngineRequestHandler`].
+#[derive(Debug)]
+pub enum RequestHandlerEvent<T> {
+    /// An event emitted by the handler.
+    HandlerEvent(HandlerEvent<T>),
+    /// Request to download blocks.
+    Download(DownloadRequest),
+}
+
+/// A request to download blocks from the network.
+#[derive(Debug)]
+pub enum DownloadRequest {
+    /// Download the given set of blocks.
+    BlockSet(B256Set),
+    /// Download the given range of blocks.
+    BlockRange(B256, u64),
+}
+
+impl DownloadRequest {
+    /// Returns a [`DownloadRequest`] for a single block.
+    pub fn single_block(hash: B256) -> Self {
+        Self::BlockSet(B256Set::from_iter([hash]))
+    }
+}
+
 #[cfg(test)]
 mod direct_insert_sender_tests {
     use super::*;
@@ -813,98 +906,5 @@ mod direct_insert_sender_tests {
 
         assert_eq!(insert.await.unwrap(), Err(ExecutedBlockInsertError::EngineUnavailable));
         assert_eq!(sender.available_capacity(), 1);
-    }
-}
-
-impl<T: PayloadTypes, N: NodePrimitives> From<BeaconEngineMessage<T>> for EngineApiRequest<T, N> {
-    fn from(msg: BeaconEngineMessage<T>) -> Self {
-        Self::Beacon(msg)
-    }
-}
-
-impl<T: PayloadTypes, N: NodePrimitives> From<EngineApiRequest<T, N>>
-    for FromEngine<EngineApiRequest<T, N>, N::Block>
-{
-    fn from(req: EngineApiRequest<T, N>) -> Self {
-        Self::Request(req)
-    }
-}
-
-/// Events emitted by the engine API handler.
-#[derive(Debug)]
-pub enum EngineApiEvent<N: NodePrimitives = EthPrimitives> {
-    /// Event from the consensus engine.
-    // TODO(mattsse): find a more appropriate name for this variant, consider phasing it out.
-    BeaconConsensus(ConsensusEngineEvent<N>),
-    /// Backfill action is needed.
-    BackfillAction(BackfillAction),
-    /// Block download is needed.
-    Download(DownloadRequest),
-}
-
-impl<N: NodePrimitives> EngineApiEvent<N> {
-    /// Returns `true` if the event is a backfill action.
-    pub const fn is_backfill_action(&self) -> bool {
-        matches!(self, Self::BackfillAction(_))
-    }
-}
-
-impl<N: NodePrimitives> From<ConsensusEngineEvent<N>> for EngineApiEvent<N> {
-    fn from(event: ConsensusEngineEvent<N>) -> Self {
-        Self::BeaconConsensus(event)
-    }
-}
-
-/// Events received from the engine.
-#[derive(Debug)]
-pub enum FromEngine<Req, B: Block> {
-    /// Event from the top level orchestrator.
-    Event(FromOrchestrator),
-    /// Request from the engine.
-    Request(Req),
-    /// Downloaded blocks from the network.
-    DownloadedBlocks(Vec<SealedBlock<B>>),
-}
-
-impl<Req: Display, B: Block> Display for FromEngine<Req, B> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Event(ev) => write!(f, "Event({ev:?})"),
-            Self::Request(req) => write!(f, "Request({req})"),
-            Self::DownloadedBlocks(blocks) => {
-                write!(f, "DownloadedBlocks({} blocks)", blocks.len())
-            }
-        }
-    }
-}
-
-impl<Req, B: Block> From<FromOrchestrator> for FromEngine<Req, B> {
-    fn from(event: FromOrchestrator) -> Self {
-        Self::Event(event)
-    }
-}
-
-/// Requests produced by a [`EngineRequestHandler`].
-#[derive(Debug)]
-pub enum RequestHandlerEvent<T> {
-    /// An event emitted by the handler.
-    HandlerEvent(HandlerEvent<T>),
-    /// Request to download blocks.
-    Download(DownloadRequest),
-}
-
-/// A request to download blocks from the network.
-#[derive(Debug)]
-pub enum DownloadRequest {
-    /// Download the given set of blocks.
-    BlockSet(B256Set),
-    /// Download the given range of blocks.
-    BlockRange(B256, u64),
-}
-
-impl DownloadRequest {
-    /// Returns a [`DownloadRequest`] for a single block.
-    pub fn single_block(hash: B256) -> Self {
-        Self::BlockSet(B256Set::from_iter([hash]))
     }
 }
