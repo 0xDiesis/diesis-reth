@@ -807,6 +807,55 @@ fn multiproof_targets_from_withdrawals(withdrawals: &[Withdrawal]) -> MultiProof
     }
 }
 
+/// The events the pre-warm task can handle.
+///
+/// Generic over `R` (receipt type) to allow sharing `Arc<ExecutionOutcome<R>>` with the main
+/// execution path without cloning the expensive `BundleState`.
+#[derive(Debug)]
+pub enum PrewarmTaskEvent<R> {
+    /// Forcefully terminate all remaining transaction execution.
+    TerminateTransactionExecution,
+    /// Forcefully terminate the task on demand and update the shared cache with the given output
+    /// before exiting.
+    Terminate {
+        /// The final execution outcome. Using `Arc` allows sharing with the main execution
+        /// path without cloning the expensive `BundleState`.
+        execution_outcome: Option<Arc<BlockExecutionOutput<R>>>,
+        /// Receiver for the block validation result.
+        ///
+        /// Cache saving is racing the state root validation. We optimistically construct the
+        /// updated cache but only save it once we know the block is valid.
+        valid_block_rx: mpsc::Receiver<()>,
+    },
+    /// Finished executing all transactions
+    FinishedTxExecution {
+        /// Number of transactions executed
+        executed_transactions: usize,
+    },
+}
+
+/// Metrics for transactions prewarming.
+#[derive(Metrics, Clone)]
+#[metrics(scope = "sync.prewarm")]
+pub struct PrewarmMetrics {
+    /// The number of transactions to prewarm
+    pub(crate) transactions: Gauge,
+    /// A histogram of the number of transactions to prewarm
+    pub(crate) transactions_histogram: Histogram,
+    /// A histogram of duration per transaction prewarming
+    pub(crate) total_runtime: Histogram,
+    /// A histogram of EVM execution duration per transaction prewarming
+    pub(crate) execution_duration: Histogram,
+    /// A histogram for prefetch targets per transaction prewarming
+    pub(crate) prefetch_storage_targets: Histogram,
+    /// A histogram of duration for cache saving
+    pub(crate) cache_saving_duration: Gauge,
+    /// Counter for transaction execution errors during prewarming
+    pub(crate) transaction_errors: Counter,
+    /// A histogram of BAL slot iteration duration during prefetching
+    pub(crate) bal_slot_iteration_duration: Histogram,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,53 +915,4 @@ mod tests {
         assert_eq!(account.nonce, 3);
         assert_eq!(account.bytecode_hash, Some(B256::repeat_byte(0xaa)));
     }
-}
-
-/// The events the pre-warm task can handle.
-///
-/// Generic over `R` (receipt type) to allow sharing `Arc<ExecutionOutcome<R>>` with the main
-/// execution path without cloning the expensive `BundleState`.
-#[derive(Debug)]
-pub enum PrewarmTaskEvent<R> {
-    /// Forcefully terminate all remaining transaction execution.
-    TerminateTransactionExecution,
-    /// Forcefully terminate the task on demand and update the shared cache with the given output
-    /// before exiting.
-    Terminate {
-        /// The final execution outcome. Using `Arc` allows sharing with the main execution
-        /// path without cloning the expensive `BundleState`.
-        execution_outcome: Option<Arc<BlockExecutionOutput<R>>>,
-        /// Receiver for the block validation result.
-        ///
-        /// Cache saving is racing the state root validation. We optimistically construct the
-        /// updated cache but only save it once we know the block is valid.
-        valid_block_rx: mpsc::Receiver<()>,
-    },
-    /// Finished executing all transactions
-    FinishedTxExecution {
-        /// Number of transactions executed
-        executed_transactions: usize,
-    },
-}
-
-/// Metrics for transactions prewarming.
-#[derive(Metrics, Clone)]
-#[metrics(scope = "sync.prewarm")]
-pub struct PrewarmMetrics {
-    /// The number of transactions to prewarm
-    pub(crate) transactions: Gauge,
-    /// A histogram of the number of transactions to prewarm
-    pub(crate) transactions_histogram: Histogram,
-    /// A histogram of duration per transaction prewarming
-    pub(crate) total_runtime: Histogram,
-    /// A histogram of EVM execution duration per transaction prewarming
-    pub(crate) execution_duration: Histogram,
-    /// A histogram for prefetch targets per transaction prewarming
-    pub(crate) prefetch_storage_targets: Histogram,
-    /// A histogram of duration for cache saving
-    pub(crate) cache_saving_duration: Gauge,
-    /// Counter for transaction execution errors during prewarming
-    pub(crate) transaction_errors: Counter,
-    /// A histogram of BAL slot iteration duration during prefetching
-    pub(crate) bal_slot_iteration_duration: Histogram,
 }
