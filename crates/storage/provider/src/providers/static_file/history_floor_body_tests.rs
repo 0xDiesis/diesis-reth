@@ -65,37 +65,75 @@ fn populated_provider() -> (TempDir, StaticFileProvider<EthPrimitives>, TxHash, 
 }
 
 #[test]
-fn direct_static_transaction_reads_obey_the_body_floor() {
-    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+fn direct_static_transaction_number_reads_obey_the_body_floor() {
+    let (_static_dir, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.transaction_by_id(1), 1, 2);
     assert_expired(provider.transaction_by_id_unhashed(1), 1, 2);
+
+    assert!(provider.transaction_by_id(2).unwrap().is_some());
+    assert!(provider.transaction_by_id_unhashed(2).unwrap().is_some());
+}
+
+#[test]
+fn direct_static_transaction_ranges_obey_the_body_floor() {
+    let (_static_dir, provider, _, _) = populated_provider();
+    provider.raise_history_floor(2);
+
     assert_expired(provider.transactions_by_tx_range(1..2), 1, 2);
     assert_expired(provider.transaction_hashes_by_range(1..2), 1, 2);
     assert_expired(provider.senders_by_tx_range(1..2), 1, 2);
-    assert_expired(provider.transaction_sender(1), 1, 2);
+
+    assert_eq!(provider.transactions_by_tx_range(2..3).unwrap().len(), 1);
+    assert_eq!(provider.transaction_hashes_by_range(2..3).unwrap().len(), 1);
+    assert_eq!(provider.senders_by_tx_range(2..3).unwrap().len(), 1);
+}
+
+#[test]
+fn direct_static_transaction_hash_reads_obey_the_body_floor() {
+    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+    provider.raise_history_floor(2);
+
     assert!(provider.transaction_id(expired_hash).unwrap().is_none());
     assert!(provider.transaction_by_hash(expired_hash).unwrap().is_none());
 
     assert_eq!(provider.transaction_id(available_hash).unwrap(), Some(2));
-    assert!(provider.transaction_by_id(2).unwrap().is_some());
-    assert_eq!(provider.transactions_by_tx_range(2..3).unwrap().len(), 1);
-    assert_eq!(provider.transaction_hashes_by_range(2..3).unwrap().len(), 1);
-    assert_eq!(provider.senders_by_tx_range(2..3).unwrap().len(), 1);
+    assert!(provider.transaction_by_hash(available_hash).unwrap().is_some());
+}
+
+#[test]
+fn direct_static_transaction_sender_obeys_the_body_floor() {
+    let (_static_dir, provider, _, _) = populated_provider();
+    provider.raise_history_floor(2);
+
+    assert_expired(provider.transaction_sender(1), 1, 2);
     assert!(provider.transaction_sender(2).unwrap().is_some());
 }
 
 #[test]
-fn direct_static_receipt_reads_obey_the_body_floor() {
-    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+fn direct_static_receipt_number_reads_obey_the_body_floor() {
+    let (_static_dir, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.receipt(1), 1, 2);
-    assert_expired(provider.receipts_by_tx_range(1..2), 1, 2);
-    assert!(provider.receipt_by_hash(expired_hash).unwrap().is_none());
-
     assert!(provider.receipt(2).unwrap().is_some());
+}
+
+#[test]
+fn direct_static_receipt_ranges_obey_the_body_floor() {
+    let (_static_dir, provider, _, _) = populated_provider();
+    provider.raise_history_floor(2);
+
+    assert_expired(provider.receipts_by_tx_range(1..2), 1, 2);
     assert_eq!(provider.receipts_by_tx_range(2..3).unwrap().len(), 1);
+}
+
+#[test]
+fn direct_static_receipt_hash_reads_obey_the_body_floor() {
+    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+    provider.raise_history_floor(2);
+
+    assert!(provider.receipt_by_hash(expired_hash).unwrap().is_none());
     assert!(provider.receipt_by_hash(available_hash).unwrap().is_some());
 }

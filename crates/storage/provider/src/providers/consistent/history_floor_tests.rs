@@ -40,19 +40,29 @@ fn tagged_provider(
     ConsistentProvider::new(factory, state).unwrap()
 }
 
-#[test]
-fn in_memory_header_tags_obey_the_header_floor() {
+fn assert_in_memory_header_tag_obeys_the_header_floor(tag: BlockNumberOrTag) {
     let expired = tagged_provider(1, 2);
-    for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
-        assert_expired(expired.header_by_number_or_tag(tag), 1, 2);
-        assert_expired(expired.sealed_header_by_number_or_tag(tag), 1, 2);
-    }
+    assert_expired(expired.header_by_number_or_tag(tag), 1, 2);
+    assert_expired(expired.sealed_header_by_number_or_tag(tag), 1, 2);
 
     let available = tagged_provider(2, 2);
-    for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe, BlockNumberOrTag::Finalized] {
-        assert!(available.header_by_number_or_tag(tag).unwrap().is_some());
-        assert!(available.sealed_header_by_number_or_tag(tag).unwrap().is_some());
-    }
+    assert!(available.header_by_number_or_tag(tag).unwrap().is_some());
+    assert!(available.sealed_header_by_number_or_tag(tag).unwrap().is_some());
+}
+
+#[test]
+fn latest_in_memory_header_obeys_the_header_floor() {
+    assert_in_memory_header_tag_obeys_the_header_floor(BlockNumberOrTag::Latest);
+}
+
+#[test]
+fn safe_in_memory_header_obeys_the_header_floor() {
+    assert_in_memory_header_tag_obeys_the_header_floor(BlockNumberOrTag::Safe);
+}
+
+#[test]
+fn finalized_in_memory_header_obeys_the_header_floor() {
+    assert_in_memory_header_tag_obeys_the_header_floor(BlockNumberOrTag::Finalized);
 }
 
 #[test]

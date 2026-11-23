@@ -181,18 +181,33 @@ async fn assert_cached_history_available(client: &impl ClientT, hash: B256) {
     assert!(!transaction.is_null());
 }
 
-async fn assert_cached_history_expired(client: &impl ClientT, hash: B256) {
-    for (method, params) in [
-        ("eth_getBlockByHash", rpc_params![hash, false]),
-        ("eth_getBlockReceipts", rpc_params![hash]),
-        ("eth_getTransactionByBlockHashAndIndex", rpc_params![hash, "0x0"]),
-    ] {
-        let error = client.request::<Value, _>(method, params).await.unwrap_err();
-        match error {
-            ClientError::Call(error) => assert_eq!(error.code(), 4444),
-            other => panic!("expected history-floor call error, got {other:?}"),
-        }
+fn assert_pruned_history_error(error: ClientError) {
+    match error {
+        ClientError::Call(error) => assert_eq!(error.code(), 4444),
+        other => panic!("expected history-floor call error, got {other:?}"),
     }
+}
+
+async fn assert_cached_block_expired(client: &impl ClientT, hash: B256) {
+    let error = client
+        .request::<Value, _>("eth_getBlockByHash", rpc_params![hash, false])
+        .await
+        .unwrap_err();
+    assert_pruned_history_error(error);
+}
+
+async fn assert_cached_receipts_expired(client: &impl ClientT, hash: B256) {
+    let error =
+        client.request::<Value, _>("eth_getBlockReceipts", rpc_params![hash]).await.unwrap_err();
+    assert_pruned_history_error(error);
+}
+
+async fn assert_cached_transaction_expired(client: &impl ClientT, hash: B256) {
+    let error = client
+        .request::<Value, _>("eth_getTransactionByBlockHashAndIndex", rpc_params![hash, "0x0"])
+        .await
+        .unwrap_err();
+    assert_pruned_history_error(error);
 }
 
 #[cfg(unix)]
@@ -210,14 +225,46 @@ async fn provider_backed_cached_history_keeps_the_floor_boundary_over_every_tran
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn provider_backed_stale_cached_history_returns_4444_over_every_transport() {
+async fn provider_backed_stale_cached_block_returns_4444_over_http() {
     let (handle, _ipc_dir, expired_hash, _) = launch_provider_history_server().await;
     let http = handle.http_client().unwrap();
+    assert_cached_block_expired(&http, expired_hash).await;
+    handle.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_backed_stale_cached_receipts_return_4444_over_http() {
+    let (handle, _ipc_dir, expired_hash, _) = launch_provider_history_server().await;
+    let http = handle.http_client().unwrap();
+    assert_cached_receipts_expired(&http, expired_hash).await;
+    handle.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_backed_stale_cached_transaction_returns_4444_over_http() {
+    let (handle, _ipc_dir, expired_hash, _) = launch_provider_history_server().await;
+    let http = handle.http_client().unwrap();
+    assert_cached_transaction_expired(&http, expired_hash).await;
+    handle.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_backed_stale_cached_block_returns_4444_over_ws() {
+    let (handle, _ipc_dir, expired_hash, _) = launch_provider_history_server().await;
     let ws = handle.ws_client().await.unwrap();
+    assert_cached_block_expired(&ws, expired_hash).await;
+    handle.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_backed_stale_cached_block_returns_4444_over_ipc() {
+    let (handle, _ipc_dir, expired_hash, _) = launch_provider_history_server().await;
     let ipc = handle.ipc_client().await.unwrap();
-    assert_cached_history_expired(&http, expired_hash).await;
-    assert_cached_history_expired(&ws, expired_hash).await;
-    assert_cached_history_expired(&ipc, expired_hash).await;
+    assert_cached_block_expired(&ipc, expired_hash).await;
     handle.stop().unwrap();
 }
 
