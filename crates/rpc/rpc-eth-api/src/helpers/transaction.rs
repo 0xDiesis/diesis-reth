@@ -1,7 +1,10 @@
 //! Database access for `eth_` transaction RPC methods. Loads transaction and receipt data w.r.t.
 //! network.
 
-use super::{EthApiSpec, EthSigner, LoadBlock, LoadFee, LoadReceipt, LoadState, SpawnBlocking};
+use super::{
+    history_floor::{body_history_is_expired, ensure_body_history},
+    EthApiSpec, EthSigner, LoadBlock, LoadFee, LoadReceipt, LoadState, SpawnBlocking,
+};
 use crate::{
     helpers::{estimate::EstimateCall, spec::SignersForRpc},
     FromEthApiError, FullEthApiTypes, IntoEthApiError, RpcNodeCore, RpcNodeCoreExt, RpcReceipt,
@@ -218,6 +221,15 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     ) -> impl Future<Output = Result<Option<Vec<ProviderTx<Self::Provider>>>, Self::Error>> + Send
     {
         async move {
+            if let Some(number) =
+                self.provider().block_number(block).map_err(Self::Error::from_eth_err)?
+            {
+                let earliest = self
+                    .provider()
+                    .earliest_block_number()
+                    .map_err(Self::Error::from_eth_err)?;
+                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
+            }
             self.cache()
                 .get_recovered_block(block)
                 .await
@@ -320,6 +332,13 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
             if let Some(cached) = self.cache().get_transaction_by_hash(hash).await &&
                 let Some(tx) = cached.recovered_transaction().map(|tx| tx.cloned())
             {
+                let earliest = self
+                    .provider()
+                    .earliest_block_number()
+                    .map_err(Self::Error::from_eth_err)?;
+                if body_history_is_expired(cached.block.number(), earliest) {
+                    return Ok(None)
+                }
                 let meta = cached.transaction_meta(hash);
 
                 // Best case: receipts are also cached.
@@ -818,10 +837,17 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
     > + Send {
         async move {
             // First, try the RPC cache
-            if let Some(cached) = self.cache().get_transaction_by_hash(hash).await &&
-                let Some(source) = cached.to_transaction_source()
-            {
-                return Ok(Some(source));
+            if let Some(cached) = self.cache().get_transaction_by_hash(hash).await {
+                let earliest = self
+                    .provider()
+                    .earliest_block_number()
+                    .map_err(Self::Error::from_eth_err)?;
+                if body_history_is_expired(cached.block.number(), earliest) {
+                    return Ok(None)
+                }
+                if let Some(source) = cached.to_transaction_source() {
+                    return Ok(Some(source));
+                }
             }
 
             // Cache miss - try to find the transaction on disk

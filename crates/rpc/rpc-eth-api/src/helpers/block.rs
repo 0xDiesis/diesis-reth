@@ -1,6 +1,6 @@
 //! Database access for `eth_` block RPC methods. Loads block and receipt data w.r.t. network.
 
-use super::{LoadPendingBlock, LoadReceipt, SpawnBlocking};
+use super::{history_floor::ensure_body_history, LoadPendingBlock, LoadReceipt, SpawnBlocking};
 use crate::{
     node::RpcNodeCoreExt, EthApiTypes, FromEthApiError, FullEthApiTypes, RpcBlock, RpcNodeCore,
     RpcReceipt,
@@ -181,15 +181,31 @@ pub trait EthBlocks: LoadBlock<RpcConvert: RpcConvert<Primitives = Self::Primiti
                 }
             }
 
-            if let Some(block_hash) =
-                self.provider().block_hash_for_id(block_id).map_err(Self::Error::from_eth_err)? &&
-                let Some((block, receipts)) = self
+            if let Some(number) = self
+                .provider()
+                .block_number_for_id(block_id)
+                .map_err(Self::Error::from_eth_err)?
+            {
+                let earliest = self
+                    .provider()
+                    .earliest_block_number()
+                    .map_err(Self::Error::from_eth_err)?;
+                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
+            }
+
+            if let Some(block_hash) = self
+                .provider()
+                .block_hash_for_id(block_id)
+                .map_err(Self::Error::from_eth_err)?
+            {
+                if let Some((block, receipts)) = self
                     .cache()
                     .get_block_and_receipts(block_hash)
                     .await
                     .map_err(Self::Error::from_eth_err)?
-            {
-                return Ok(Some((block, receipts.into())));
+                {
+                    return Ok(Some((block, receipts.into())));
+                }
             }
 
             Ok(None)
@@ -295,6 +311,18 @@ pub trait LoadBlock: LoadPendingBlock + SpawnBlocking + RpcNodeCoreExt {
                 Some(block_hash) => block_hash,
                 None => return Ok(None),
             };
+
+            if let Some(number) = self
+                .provider()
+                .block_number_for_id(block_id)
+                .map_err(Self::Error::from_eth_err)?
+            {
+                let earliest = self
+                    .provider()
+                    .earliest_block_number()
+                    .map_err(Self::Error::from_eth_err)?;
+                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
+            }
 
             self.cache().get_recovered_block(block_hash).await.map_err(Self::Error::from_eth_err)
         }

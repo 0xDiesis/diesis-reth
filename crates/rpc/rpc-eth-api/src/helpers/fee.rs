@@ -1,6 +1,6 @@
 //! Loads fee history from database. Helper trait for `eth_` fee and transaction RPC methods.
 
-use super::LoadBlock;
+use super::{history_floor::ensure_body_history, LoadBlock};
 use crate::FromEthApiError;
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip7840::BlobParams, BlockId};
@@ -143,6 +143,9 @@ pub trait EthFees:
             // otherwise `newest_block - 2`
             // NOTE: We ensured that block count is capped
             let start_block = end_block_plus - block_count;
+            let earliest_block =
+                self.provider().earliest_block_number().map_err(Self::Error::from_eth_err)?;
+            ensure_body_history(start_block, earliest_block).map_err(Self::Error::from_eth_err)?;
 
             // Collect base fees, gas usage ratios and (optionally) reward percentile data
             // Pre-allocate capacity: base_fee and blob_fee need +1 for the next block's fee
