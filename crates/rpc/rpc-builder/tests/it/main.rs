@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 
 mod auth;
+mod history_floor;
 mod http;
 mod middleware;
 mod serde;
