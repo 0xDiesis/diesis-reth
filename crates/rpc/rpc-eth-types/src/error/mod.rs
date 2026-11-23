@@ -1182,6 +1182,17 @@ mod tests {
     }
 
     #[test]
+    fn expired_provider_history_uses_error_code_4444() {
+        let error = EthApiError::from(reth_errors::ProviderError::BlockExpired {
+            requested: 44,
+            earliest_available: 45,
+        });
+        let error: jsonrpsee_types::error::ErrorObject<'static> = error.into();
+        assert_eq!(error.code(), 4444);
+        assert_eq!(error.message(), "Pruned history unavailable");
+    }
+
+    #[test]
     fn tracing_lookup_errors_use_call_execution_failed_code() {
         let cases = [
             (EthApiError::TracingTransactionNotFound, "transaction not found"),

@@ -21,6 +21,7 @@ pub mod call;
 pub mod config;
 pub mod estimate;
 pub mod fee;
+mod history_floor;
 pub mod pending_block;
 pub mod receipt;
 pub mod signer;
