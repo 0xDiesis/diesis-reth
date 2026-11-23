@@ -2,7 +2,7 @@ use crate::{
     test_utils::{blocks::BlockchainTestData, create_test_provider_factory, MockNodeTypesWithDB},
     BlockBodyIndicesProvider, BlockReader, BlockSource, BlockWriter, OriginalValuesKnown,
     ProviderFactory, ReceiptProvider, StaticFileProviderFactory, TransactionVariant,
-    TransactionsProvider,
+    TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::{BlockNumber, TxNumber};
@@ -98,11 +98,14 @@ fn transaction_read_families_enforce_the_body_floor_without_hash_errors() {
     assert_expired(provider.transaction_by_id(expired_id), 1, 2);
     assert_expired(provider.transaction_by_id_unhashed(expired_id), 1, 2);
     assert_expired(provider.transactions_by_tx_range(expired_id..=expired_id), 1, 2);
+    assert_expired(provider.transaction_hashes_by_range(expired_id..expired_id + 1), 1, 2);
     assert_expired(provider.senders_by_tx_range(expired_id..=expired_id), 1, 2);
     assert_expired(provider.transaction_sender(expired_id), 1, 2);
 
+    assert!(provider.transaction_id(expired_hash).unwrap().is_none());
     assert!(provider.transaction_by_hash(expired_hash).unwrap().is_none());
     assert!(provider.transaction_by_hash_with_meta(expired_hash).unwrap().is_none());
+    assert_eq!(provider.transaction_id(available_hash).unwrap(), Some(available_id));
     assert!(provider.transaction_by_hash(available_hash).unwrap().is_some());
     assert!(provider.transaction_by_id(available_id).unwrap().is_some());
     assert!(provider.transactions_by_block(2.into()).unwrap().is_some());

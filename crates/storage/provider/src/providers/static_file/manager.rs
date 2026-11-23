@@ -1,5 +1,5 @@
 use super::{
-    history_floor::raise_floor,
+    history_floor::{ensure_available, raise_floor},
     metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
     StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
 };
@@ -1302,15 +1302,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             indexes.get(StaticFileSegment::Transactions).and_then(|index| index.min_block_range)
         {
             // the earliest height is the lowest available block number
-            self.earliest_history_height
-                .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
+            raise_floor(&self.earliest_history_height, lowest_range.start());
         }
 
         if let Some(lowest_range) =
             indexes.get(StaticFileSegment::Headers).and_then(|index| index.min_block_range)
         {
-            self.earliest_header_height
-                .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
+            raise_floor(&self.earliest_header_height, lowest_range.start());
         }
 
         Ok(())
@@ -2051,6 +2049,19 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         raise_floor(&self.earliest_header_height, first_available);
     }
 
+    /// Rejects a body-history request below the first available body.
+    pub(crate) fn ensure_history_available(&self, requested: BlockNumber) -> ProviderResult<()> {
+        ensure_available(requested, self.earliest_history_height())
+    }
+
+    /// Rejects a header-history request below the first available header.
+    pub(crate) fn ensure_header_history_available(
+        &self,
+        requested: BlockNumber,
+    ) -> ProviderResult<()> {
+        ensure_available(requested, self.earliest_header_height())
+    }
+
     /// Gets the lowest static file's block range if it exists for a static file segment.
     ///
     /// If there is nothing on disk for the given segment, this will return [`None`].
@@ -2719,7 +2730,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
     type Header = N::BlockHeader;
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        self.find_static_file(StaticFileSegment::Headers, |jar_provider| {
+        let header = self.find_static_file(StaticFileSegment::Headers, |jar_provider| {
             Ok(jar_provider
                 .cursor()?
                 .get_two::<HeaderWithHashMask<Self::Header>>((&block_hash).into())?
@@ -2729,10 +2740,15 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
                     }
                     None
                 }))
-        })
+        })?;
+        if let Some(header) = &header {
+            self.ensure_header_history_available(header.number())?;
+        }
+        Ok(header)
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
+        self.ensure_header_history_available(num)?;
         self.get_segment_provider_for_block(StaticFileSegment::Headers, num, None)
             .and_then(|provider| provider.header_by_number(num))
             .or_else(|err| {
@@ -2748,9 +2764,14 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Self::Header>> {
+        let range = to_range(range);
+        if range.is_empty() {
+            return Ok(Vec::new())
+        }
+        self.ensure_header_history_available(range.start)?;
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
-            to_range(range),
+            range,
             |cursor, number| cursor.get_one::<HeaderMask<Self::Header>>(number.into()),
             |_| true,
         )
@@ -2760,6 +2781,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
         &self,
         num: BlockNumber,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
+        self.ensure_header_history_available(num)?;
         self.get_segment_provider_for_block(StaticFileSegment::Headers, num, None)
             .and_then(|provider| provider.sealed_header(num))
             .or_else(|err| {
@@ -2776,9 +2798,14 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
         range: impl RangeBounds<BlockNumber>,
         predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
+        let range = to_range(range);
+        if range.is_empty() {
+            return Ok(Vec::new())
+        }
+        self.ensure_header_history_available(range.start)?;
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
-            to_range(range),
+            range,
             |cursor, number| {
                 Ok(cursor
                     .get_two::<HeaderWithHashMask<Self::Header>>(number.into())?
@@ -2791,6 +2818,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
 
 impl<N: NodePrimitives> BlockHashReader for StaticFileProvider<N> {
     fn block_hash(&self, num: u64) -> ProviderResult<Option<B256>> {
+        self.ensure_header_history_available(num)?;
         self.get_segment_provider_for_block(StaticFileSegment::Headers, num, None)
             .and_then(|provider| provider.block_hash(num))
             .or_else(|err| {
@@ -2807,6 +2835,10 @@ impl<N: NodePrimitives> BlockHashReader for StaticFileProvider<N> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
+        if start >= end {
+            return Ok(Vec::new())
+        }
+        self.ensure_header_history_available(start)?;
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
             start..end,

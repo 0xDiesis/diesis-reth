@@ -3,7 +3,6 @@ use crate::{
         state::latest::LatestStateProvider, NodeTypesForProvider, RocksDBProvider,
         StaticFileProvider, StaticFileProviderRWRefMut,
     },
-    to_range,
     traits::{BlockSource, ReceiptProvider},
     BalProvider, BalStoreHandle, BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider,
     DatabaseProviderFactory, EitherWriterDestination, HeaderProvider, HeaderSyncGapProvider,
@@ -60,6 +59,8 @@ pub use metrics::DatabaseProviderMetrics;
 
 mod chain;
 pub use chain::*;
+
+mod history_floor;
 
 #[cfg(test)]
 mod history_floor_tests;
@@ -787,14 +788,14 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {
     }
 
     fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.caught_up_static_file_provider()?.transaction_by_id(id)
+        self.provider()?.transaction_by_id(id)
     }
 
     fn transaction_by_id_unhashed(
         &self,
         id: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.caught_up_static_file_provider()?.transaction_by_id_unhashed(id)
+        self.provider()?.transaction_by_id_unhashed(id)
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
@@ -826,26 +827,18 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
-        self.caught_up_static_file_provider()?.transactions_by_tx_range(range)
+        self.provider()?.transactions_by_tx_range(range)
     }
 
     fn senders_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Address>> {
-        if EitherWriterDestination::senders(self).is_static_file() {
-            self.caught_up_static_file_provider()?.senders_by_tx_range(range)
-        } else {
-            self.provider()?.senders_by_tx_range(range)
-        }
+        self.provider()?.senders_by_tx_range(range)
     }
 
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
-        if EitherWriterDestination::senders(self).is_static_file() {
-            self.caught_up_static_file_provider()?.transaction_sender(id)
-        } else {
-            self.provider()?.transaction_sender(id)
-        }
+        self.provider()?.transaction_sender(id)
     }
 }
 
@@ -853,12 +846,7 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
     type Receipt = ReceiptTy<N>;
 
     fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
-        self.caught_up_static_file_provider()?.get_with_static_file_or_database(
-            StaticFileSegment::Receipts,
-            id,
-            |static_file| static_file.receipt(id),
-            || self.provider()?.receipt(id),
-        )
+        self.provider()?.receipt(id)
     }
 
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
@@ -876,13 +864,7 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
-        self.caught_up_static_file_provider()?.get_range_with_static_file_or_database(
-            StaticFileSegment::Receipts,
-            to_range(range),
-            |static_file, range, _| static_file.receipts_by_tx_range(range),
-            |range, _| self.provider()?.receipts_by_tx_range(range),
-            |_| true,
-        )
+        self.provider()?.receipts_by_tx_range(range)
     }
 
     fn receipts_by_block_range(

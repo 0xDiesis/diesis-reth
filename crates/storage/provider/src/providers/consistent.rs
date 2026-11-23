@@ -51,7 +51,29 @@ pub struct ConsistentProvider<N: ProviderNodeTypes> {
     canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
 }
 
+#[derive(Clone, Copy)]
+enum HistoryKind {
+    Body,
+    Header,
+}
+
 impl<N: ProviderNodeTypes> ConsistentProvider<N> {
+    fn ensure_history(&self, number: BlockNumber, kind: HistoryKind) -> ProviderResult<()> {
+        let static_files = self.storage_provider.static_file_provider();
+        match kind {
+            HistoryKind::Body => static_files.ensure_history_available(number),
+            HistoryKind::Header => static_files.ensure_header_history_available(number),
+        }
+    }
+
+    fn history_is_expired(&self, number: BlockNumber, kind: HistoryKind) -> bool {
+        let static_files = self.storage_provider.static_file_provider();
+        number < match kind {
+            HistoryKind::Body => static_files.earliest_history_height(),
+            HistoryKind::Header => static_files.earliest_header_height(),
+        }
+    }
+
     /// Create a new provider using [`ProviderFactory`] and [`CanonicalInMemoryState`],
     ///
     /// Underneath it will take a snapshot by fetching [`CanonicalInMemoryState::head_state`] and
@@ -118,6 +140,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
     fn get_in_memory_or_storage_by_block_range_while<T, F, G, P>(
         &self,
         range: impl RangeBounds<BlockNumber>,
+        history: HistoryKind,
         fetch_db_range: F,
         map_block_state_item: G,
         mut predicate: P,
@@ -153,6 +176,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         if start > end {
             return Ok(vec![])
         }
+        self.ensure_history(start, history)?;
 
         // Split range into storage_range and in-memory range. If the in-memory range is not
         // necessary drop it early.
@@ -248,7 +272,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         // Get the next tx number for the last block stored in the storage, which marks the start of
         // the in-memory state.
         let last_block_body_index = provider
-            .block_body_indices(last_database_block_number)?
+            .block_body_indices_unchecked(last_database_block_number)?
             .ok_or(ProviderError::BlockBodyIndicesNotFound(last_database_block_number))?;
         let mut in_memory_tx_num = last_block_body_index.next_tx_num();
 
@@ -301,6 +325,8 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
             // This should only be more than 0 once, in case of a partial range inside a block.
             let skip = (tx_range.start() - in_memory_tx_num) as usize;
 
+            self.ensure_history(block_state.number(), HistoryKind::Body)?;
+
             items.extend(fetch_from_block_state(
                 skip..=skip + (remaining.min(block_tx_count - skip) - 1),
                 block_state,
@@ -345,7 +371,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         // Get the next tx number for the last block stored in the database and consider it the
         // first tx number of the in-memory state
         let last_block_body_index = provider
-            .block_body_indices(last_database_block_number)?
+            .block_body_indices_unchecked(last_database_block_number)?
             .ok_or(ProviderError::BlockBodyIndicesNotFound(last_database_block_number))?;
         let mut in_memory_tx_num = last_block_body_index.next_tx_num();
 
@@ -366,11 +392,15 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
                 match id {
                     HashOrNumber::Hash(tx_hash) => {
                         if tx_hash == *block.body().transactions()[tx_index].tx_hash() {
+                            if self.history_is_expired(block_state.number(), HistoryKind::Body) {
+                                return Ok(None)
+                            }
                             return fetch_from_block_state(tx_index, in_memory_tx_num, block_state)
                         }
                     }
                     HashOrNumber::Number(id) => {
                         if id == in_memory_tx_num {
+                            self.ensure_history(block_state.number(), HistoryKind::Body)?;
                             return fetch_from_block_state(tx_index, in_memory_tx_num, block_state)
                         }
                     }
@@ -404,6 +434,23 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         }
         fetch_from_db(&self.storage_provider)
     }
+
+    fn get_history_in_memory_or_storage_by_block<S, M, R>(
+        &self,
+        id: BlockHashOrNumber,
+        history: HistoryKind,
+        fetch_from_db: S,
+        fetch_from_block_state: M,
+    ) -> ProviderResult<R>
+    where
+        S: FnOnce(&DatabaseProviderRO<N::DB, N>) -> ProviderResult<R>,
+        M: Fn(&BlockState<N::Primitives>) -> ProviderResult<R>,
+    {
+        if let Some(number) = self.convert_hash_or_number(id)? {
+            self.ensure_history(number, history)?;
+        }
+        self.get_in_memory_or_storage_by_block(id, fetch_from_db, fetch_from_block_state)
+    }
 }
 
 impl<N: ProviderNodeTypes> NodePrimitivesProvider for ConsistentProvider<N> {
@@ -428,16 +475,18 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
     type Header = HeaderTy<N>;
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             block_hash.into(),
+            HistoryKind::Header,
             |db_provider| db_provider.header(block_hash),
             |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_header())),
         )
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             num.into(),
+            HistoryKind::Header,
             |db_provider| db_provider.header_by_number(num),
             |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_header())),
         )
@@ -449,6 +498,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<Self::Header>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Header,
             |db_provider, range, _| db_provider.headers_range(range),
             |block_state, _| Some(block_state.block_ref().recovered_block().header().clone()),
             |_| true,
@@ -459,8 +509,9 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
         &self,
         number: BlockNumber,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             number.into(),
+            HistoryKind::Header,
             |db_provider| db_provider.sealed_header(number),
             |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_sealed_header())),
         )
@@ -472,6 +523,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Header,
             |db_provider, range, _| db_provider.sealed_headers_range(range),
             |block_state, _| Some(block_state.block_ref().recovered_block().clone_sealed_header()),
             |_| true,
@@ -485,6 +537,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Header,
             |db_provider, range, predicate| db_provider.sealed_headers_while(range, predicate),
             |block_state, predicate| {
                 let header = block_state.block_ref().recovered_block().sealed_header();
@@ -497,8 +550,9 @@ impl<N: ProviderNodeTypes> HeaderProvider for ConsistentProvider<N> {
 
 impl<N: ProviderNodeTypes> BlockHashReader for ConsistentProvider<N> {
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             number.into(),
+            HistoryKind::Header,
             |db_provider| db_provider.block_hash(number),
             |block_state| Ok(Some(block_state.hash())),
         )
@@ -511,6 +565,7 @@ impl<N: ProviderNodeTypes> BlockHashReader for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<B256>> {
         self.get_in_memory_or_storage_by_block_range_while(
             start..end,
+            HistoryKind::Header,
             |db_provider, inclusive_range, _| {
                 db_provider
                     .canonical_hashes_range(*inclusive_range.start(), *inclusive_range.end() + 1)
@@ -567,8 +622,9 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         source: BlockSource,
     ) -> ProviderResult<Option<Self::Block>> {
         if source.is_canonical() &&
-            let Some(block) = self.get_in_memory_or_storage_by_block(
+            let Some(block) = self.get_history_in_memory_or_storage_by_block(
                 hash.into(),
+                HistoryKind::Body,
                 |db_provider| db_provider.find_block_by_hash(hash, BlockSource::Canonical),
                 |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_block())),
             )?
@@ -593,8 +649,9 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         source: BlockSource,
     ) -> ProviderResult<Option<SealedOrRecoveredBlock<Self::Block>>> {
         if source.is_canonical() &&
-            let Some(block) = self.get_in_memory_or_storage_by_block(
+            let Some(block) = self.get_history_in_memory_or_storage_by_block(
                 hash.into(),
+                HistoryKind::Body,
                 |db_provider| {
                     db_provider.find_sealed_or_recovered_block(hash, BlockSource::Canonical)
                 },
@@ -621,8 +678,9 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
     }
 
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             id,
+            HistoryKind::Body,
             |db_provider| db_provider.block(id),
             |block_state| Ok(Some(block_state.block_ref().recovered_block().clone_block())),
         )
@@ -649,8 +707,9 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             id,
+            HistoryKind::Body,
             |db_provider| db_provider.recovered_block(id, transaction_kind),
             |block_state| Ok(Some(block_state.block().recovered_block().clone())),
         )
@@ -661,8 +720,9 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             id,
+            HistoryKind::Body,
             |db_provider| db_provider.sealed_block_with_senders(id, transaction_kind),
             |block_state| Ok(Some(block_state.block().recovered_block().clone())),
         )
@@ -671,6 +731,7 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Body,
             |db_provider, range, _| db_provider.block_range(range),
             |block_state, _| Some(block_state.block_ref().recovered_block().clone_block()),
             |_| true,
@@ -683,6 +744,7 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Body,
             |db_provider, range, _| db_provider.block_with_senders_range(range),
             |block_state, _| Some(block_state.block().recovered_block().clone()),
             |_| true,
@@ -695,6 +757,7 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Body,
             |db_provider, range, _| db_provider.recovered_block_range(range),
             |block_state, _| Some(block_state.block().recovered_block().clone()),
             |_| true,
@@ -757,7 +820,12 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        if let Some(tx) = self.head_block.as_ref().and_then(|b| b.transaction_on_chain(hash)) {
+        if let Some((tx, meta)) =
+            self.head_block.as_ref().and_then(|b| b.transaction_meta_on_chain(hash))
+        {
+            if self.history_is_expired(meta.block_number, HistoryKind::Body) {
+                return Ok(None)
+            }
             return Ok(Some(tx))
         }
 
@@ -771,6 +839,9 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
         if let Some((tx, meta)) =
             self.head_block.as_ref().and_then(|b| b.transaction_meta_on_chain(tx_hash))
         {
+            if self.history_is_expired(meta.block_number, HistoryKind::Body) {
+                return Ok(None)
+            }
             return Ok(Some((tx, meta)))
         }
 
@@ -781,8 +852,9 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             id,
+            HistoryKind::Body,
             |provider| provider.transactions_by_block(id),
             |block_state| {
                 Ok(Some(block_state.block_ref().recovered_block().body().transactions().to_vec()))
@@ -796,6 +868,7 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
     ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
         self.get_in_memory_or_storage_by_block_range_while(
             range,
+            HistoryKind::Body,
             |db_provider, range, _| db_provider.transactions_by_block_range(range),
             |block_state, _| {
                 Some(block_state.block_ref().recovered_block().body().transactions().to_vec())
@@ -871,6 +944,9 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ConsistentProvider<N> {
             if let Some(tx_index) =
                 block.body().transactions_iter().position(|tx| *tx.tx_hash() == hash)
             {
+                if self.history_is_expired(block_state.number(), HistoryKind::Body) {
+                    return Ok(None)
+                }
                 // safe to use tx_index for receipts due to 1:1 correspondence
                 return Ok(receipts.get(tx_index).cloned());
             }
@@ -883,8 +959,9 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ConsistentProvider<N> {
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             block,
+            HistoryKind::Body,
             |db_provider| db_provider.receipts_by_block(block),
             |block_state| Ok(Some(block_state.executed_block_receipts())),
         )
@@ -949,15 +1026,16 @@ impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ConsistentProvider<N> {
         &self,
         number: BlockNumber,
     ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
-        self.get_in_memory_or_storage_by_block(
+        self.get_history_in_memory_or_storage_by_block(
             number.into(),
+            HistoryKind::Body,
             |db_provider| db_provider.block_body_indices(number),
             |block_state| {
                 // Find the last block indices on database
                 let last_storage_block_number = block_state.anchor().number;
                 let mut stored_indices = self
                     .storage_provider
-                    .block_body_indices(last_storage_block_number)?
+                    .block_body_indices_unchecked(last_storage_block_number)?
                     .ok_or(ProviderError::BlockBodyIndicesNotFound(last_storage_block_number))?;
 
                 // Prepare our block indices
