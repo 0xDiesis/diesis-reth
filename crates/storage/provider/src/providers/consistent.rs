@@ -1494,6 +1494,9 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
 }
 
 #[cfg(test)]
+mod history_floor_tests;
+
+#[cfg(test)]
 #[allow(clippy::clone_on_copy)]
 mod tests {
     use crate::{
