@@ -4,6 +4,8 @@ pub use manager::{
     StaticFileWriter,
 };
 
+mod history_floor;
+
 mod jar;
 pub use jar::StaticFileJarProvider;
 
@@ -14,6 +16,9 @@ mod metrics;
 
 #[cfg(test)]
 mod writer_tests;
+
+#[cfg(test)]
+mod history_floor_tests;
 
 use reth_nippy_jar::NippyJar;
 use reth_static_file_types::{ChangesetOffsetReader, SegmentHeader, StaticFileSegment};

@@ -1,4 +1,5 @@
 use super::{
+    history_floor::raise_floor,
     metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
     StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
 };
@@ -322,6 +323,8 @@ pub struct StaticFileProviderInner<N> {
     /// This additional tracker exists for more efficient lookups because the node must be aware of
     /// the expired height.
     earliest_history_height: AtomicU64,
+    /// First block whose header is available to provider readers.
+    earliest_header_height: AtomicU64,
     /// Directory where `static_files` are located
     path: PathBuf,
     /// Maintains a writer set of [`StaticFileSegment`].
@@ -362,6 +365,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             indexes: Default::default(),
             writers: Default::default(),
             earliest_history_height: Default::default(),
+            earliest_header_height: Default::default(),
             path: path.as_ref().to_path_buf(),
             metrics: None,
             access,
@@ -1302,6 +1306,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
         }
 
+        if let Some(lowest_range) =
+            indexes.get(StaticFileSegment::Headers).and_then(|index| index.min_block_range)
+        {
+            self.earliest_header_height
+                .store(lowest_range.start(), std::sync::atomic::Ordering::Relaxed);
+        }
+
         Ok(())
     }
 
@@ -2023,6 +2034,21 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Sets the earliest available block number, matching what [`Self::initialize_index`] derives.
     pub(crate) fn set_earliest_history_height(&self, block: BlockNumber) {
         self.earliest_history_height.store(block, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Raises the first block whose body history may be returned.
+    pub fn raise_history_floor(&self, first_available: BlockNumber) {
+        raise_floor(&self.earliest_history_height, first_available);
+    }
+
+    /// Returns the first block whose header may be returned.
+    pub fn earliest_header_height(&self) -> BlockNumber {
+        self.earliest_header_height.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Raises the first block whose header history may be returned.
+    pub fn raise_header_history_floor(&self, first_available: BlockNumber) {
+        raise_floor(&self.earliest_header_height, first_available);
     }
 
     /// Gets the lowest static file's block range if it exists for a static file segment.

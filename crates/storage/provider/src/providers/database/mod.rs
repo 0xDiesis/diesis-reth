@@ -61,6 +61,9 @@ pub use metrics::DatabaseProviderMetrics;
 mod chain;
 pub use chain::*;
 
+#[cfg(test)]
+mod history_floor_tests;
+
 /// Sync state for read-only [`ProviderFactory`] instances.
 struct ReadOnlySyncState {
     /// Last MDBX txn ID we synced `RocksDB` secondary / static file indexes to.
