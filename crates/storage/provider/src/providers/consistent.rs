@@ -1420,7 +1420,9 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
 mod tests {
     use crate::{
         providers::blockchain_provider::BlockchainProvider,
-        test_utils::create_test_provider_factory, BlockWriter,
+        test_utils::create_test_provider_factory, BlockBodyIndicesProvider, BlockHashReader,
+        BlockWriter, HeaderProvider, ProviderError, ReceiptProvider, StaticFileProviderFactory,
+        TransactionsProvider,
     };
     use alloy_eips::BlockHashOrNumber;
     use alloy_primitives::{B256, U256};
@@ -1432,7 +1434,7 @@ mod tests {
         tables,
         transaction::DbTxMut,
     };
-    use reth_ethereum_primitives::Block;
+    use reth_ethereum_primitives::{Block, Receipt};
     use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult, ExecutionOutcome};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock, StorageEntry};
     use reth_storage_api::{
@@ -1450,6 +1452,89 @@ mod tests {
     };
 
     const TEST_BLOCKS_COUNT: usize = 5;
+
+    #[test]
+    fn history_floors_cover_in_memory_blocks_without_hiding_the_anchor() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let factory = create_test_provider_factory();
+        let static_files = factory.static_file_provider();
+        let (database_blocks, in_memory_blocks) =
+            random_blocks(&mut rng, 1, 2, None, None, 1..2);
+
+        let provider_rw = factory.provider_rw()?;
+        provider_rw.insert_block(
+            &database_blocks[0].clone().try_recover().expect("database block has senders"),
+        )?;
+        provider_rw.commit()?;
+
+        let provider = BlockchainProvider::new(factory)?;
+        provider.canonical_in_memory_state.update_chain(NewCanonicalChain::Commit {
+            new: in_memory_blocks
+                .iter()
+                .map(|block| {
+                    let senders = block.senders().expect("in-memory block has senders");
+                    let receipts = vec![Receipt::default(); block.body().transactions.len()];
+                    ExecutedBlock {
+                        recovered_block: Arc::new(RecoveredBlock::new_sealed(
+                            block.clone(),
+                            senders,
+                        )),
+                        execution_output: Arc::new(BlockExecutionOutput {
+                            state: BundleState::default(),
+                            result: BlockExecutionResult {
+                                receipts,
+                                requests: Default::default(),
+                                gas_used: 0,
+                                blob_gas_used: 0,
+                            },
+                        }),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+        });
+
+        let before = provider.consistent_provider()?;
+        let expired_hash = *in_memory_blocks[0].body().transactions[0].tx_hash();
+        let available_hash = *in_memory_blocks[1].body().transactions[0].tx_hash();
+        let expired_id = before.transaction_id(expired_hash)?.expect("expired tx is indexed");
+        let available_id = before.transaction_id(available_hash)?.expect("available tx is indexed");
+        drop(before);
+
+        static_files.raise_history_floor(2);
+        static_files.raise_header_history_floor(1);
+        let provider = provider.consistent_provider()?;
+
+        assert!(matches!(
+            provider.block(1.into()),
+            Err(ProviderError::BlockExpired { requested: 1, earliest_available: 2 })
+        ));
+        assert!(matches!(
+            provider.block_body_indices(1),
+            Err(ProviderError::BlockExpired { requested: 1, earliest_available: 2 })
+        ));
+        assert!(matches!(
+            provider.transaction_by_id(expired_id),
+            Err(ProviderError::BlockExpired { requested: 1, earliest_available: 2 })
+        ));
+        assert!(provider.transaction_by_hash(expired_hash)?.is_none());
+        assert!(provider.receipt_by_hash(expired_hash)?.is_none());
+
+        assert!(matches!(
+            provider.header_by_number(0),
+            Err(ProviderError::BlockExpired { requested: 0, earliest_available: 1 })
+        ));
+        assert!(provider.header_by_number(1)?.is_some());
+        assert!(provider.block_hash(1)?.is_some());
+        assert!(provider.block(2.into())?.is_some());
+        assert!(provider.block_body_indices(2)?.is_some());
+        assert_eq!(provider.transactions_by_block_range(2..=2)?.len(), 1);
+        assert_eq!(provider.transactions_by_tx_range(available_id..=available_id)?.len(), 1);
+        assert!(provider.transaction_by_hash(available_hash)?.is_some());
+        assert!(provider.receipt(available_id)?.is_some());
+
+        Ok(())
+    }
 
     fn random_blocks(
         rng: &mut impl Rng,
