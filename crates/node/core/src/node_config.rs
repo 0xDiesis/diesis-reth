@@ -196,7 +196,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
 
     /// Creates a [`TreeConfig`] from all node arguments that affect the engine tree.
     pub fn tree_config(&self) -> TreeConfig {
-        self.engine.tree_config().with_skip_state_root(self.debug.skip_state_root)
+        self.engine.tree_config()
     }
 
     /// Sets --dev mode for the node.
@@ -636,19 +636,5 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             storage: self.storage,
             jit: self.jit.clone(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tree_config_applies_debug_skip_state_root() {
-        let config = NodeConfig::default();
-        assert!(!config.tree_config().skip_state_root());
-
-        let config = config.with_debug(DebugArgs { skip_state_root: true, ..Default::default() });
-        assert!(config.tree_config().skip_state_root());
     }
 }

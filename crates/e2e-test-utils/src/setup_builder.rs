@@ -60,9 +60,9 @@ use tracing::{span, Instrument, Level};
 ///
 /// Configuration and tree configuration modifiers are applied in the order they are added. Like
 /// for a node launched from the command line, the tree configuration of a node is derived from its
-/// final node configuration, see [`NodeConfig::tree_config`], so the engine arguments and
-/// `--debug.skip-state-root` set by node configuration modifiers take effect. Tree configuration
-/// modifiers are applied last and take precedence over them.
+/// final node configuration, see [`NodeConfig::tree_config`], so the engine arguments set by node
+/// configuration modifiers take effect. Tree configuration modifiers are applied last and take
+/// precedence over them.
 ///
 /// Use [`E2ETestSetupExt::test_setup_for`] to set up nodes on the [`test_chain_spec`] at a
 /// hardfork, or [`E2ETestSetupExt::test_setup`] for any other chain spec:
@@ -191,7 +191,7 @@ impl<N: NodeBuilderHelper> E2ETestSetupBuilder<N> {
     /// Adds a modifier for the node configuration.
     ///
     /// The closure receives the current node config and returns a modified version. Its engine
-    /// arguments and `debug.skip_state_root` configure the engine tree, unless a
+    /// arguments configure the engine tree, unless a
     /// [tree configuration modifier](Self::with_tree_config_modifier) overrides them.
     pub fn with_node_config_modifier<G>(mut self, modifier: G) -> Self
     where
@@ -819,13 +819,11 @@ mod tests {
             .with_node_config_modifier(|mut config| {
                 config.engine.cross_block_cache_size = 2;
                 config.engine.persistence_threshold = 0;
-                config.debug.skip_state_root = true;
                 config
             })
             .node_and_tree_config();
         assert_eq!(tree_config.cross_block_cache_size(), 2 * 1024 * 1024);
         assert_eq!(tree_config.persistence_threshold(), 0);
-        assert!(tree_config.skip_state_root());
     }
 
     #[test]

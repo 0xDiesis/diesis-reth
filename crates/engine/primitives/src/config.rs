@@ -227,11 +227,6 @@ pub struct TreeConfig {
     disable_bal_batch_io: bool,
     /// Whether block execution reuses transaction prewarming results.
     prewarm_reuse: bool,
-    /// Whether to skip trie state-root computation during engine validation.
-    ///
-    /// This trusts the block header's state root. It is intended for experiments that measure
-    /// execution without trie state-root work.
-    skip_state_root: bool,
     /// Maximum random jitter applied before each proof computation (trie-debug only).
     /// When set, each proof worker sleeps for a random duration up to this value
     /// before starting a proof calculation.
@@ -284,7 +279,6 @@ impl Default for TreeConfig {
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
             prewarm_reuse: false,
-            skip_state_root: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -374,7 +368,6 @@ impl TreeConfig {
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
             prewarm_reuse: false,
-            skip_state_root: false,
             #[cfg(feature = "trie-debug")]
             proof_jitter: None,
         }
@@ -644,7 +637,7 @@ impl TreeConfig {
     /// The state root task requires at least 5 parallel threads, see
     /// [`has_enough_parallelism`].
     pub const fn use_state_root_task(&self) -> bool {
-        !self.skip_state_root && !self.state_root_fallback && self.has_enough_parallelism
+        !self.state_root_fallback && self.has_enough_parallelism
     }
 
     /// Setter for state provider metrics.
@@ -837,17 +830,6 @@ impl TreeConfig {
     /// Setter for whether block execution reuses transaction prewarming results.
     pub const fn with_prewarm_reuse(mut self, prewarm_reuse: bool) -> Self {
         self.prewarm_reuse = prewarm_reuse;
-        self
-    }
-
-    /// Returns whether trie state-root computation is skipped during engine validation.
-    pub const fn skip_state_root(&self) -> bool {
-        self.skip_state_root
-    }
-
-    /// Setter for whether to skip trie state-root computation during engine validation.
-    pub const fn with_skip_state_root(mut self, skip_state_root: bool) -> Self {
-        self.skip_state_root = skip_state_root;
         self
     }
 

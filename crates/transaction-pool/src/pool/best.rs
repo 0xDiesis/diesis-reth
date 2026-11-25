@@ -60,6 +60,10 @@ impl<I: crate::traits::BestTransactions> crate::traits::BestTransactions
         self.inner.no_updates()
     }
 
+    fn allow_updates_out_of_order(&mut self) {
+        self.inner.allow_updates_out_of_order()
+    }
+
     fn skip_blobs(&mut self) {
         self.inner.skip_blobs()
     }
@@ -1191,6 +1195,26 @@ mod tests {
         pool.add_transaction(valid_tx, 0);
 
         assert_eq!(*best.next().expect("new transaction should be yielded").hash(), expected_hash);
+    }
+
+    #[test]
+    fn refresh_guard_yields_higher_priority_updates_when_enabled() {
+        let mut pool = PendingPool::new(MockOrdering::default());
+        let mut factory = MockTransactionFactory::default();
+        let first = MockTransaction::eip1559().with_gas_price(100);
+        let first = Arc::new(factory.validated(first));
+        pool.add_transaction(first.clone(), 0);
+
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut best = RefreshGuardedBestTransactions::new(pool.best(), Some((generation, 0)));
+        best.allow_updates_out_of_order();
+        assert_eq!(best.next().unwrap().hash(), first.hash());
+
+        let update = MockTransaction::eip1559().with_gas_price(200);
+        let update = Arc::new(factory.validated(update));
+        pool.add_transaction(update.clone(), 0);
+
+        assert_eq!(best.next().unwrap().hash(), update.hash());
     }
 
     #[test]

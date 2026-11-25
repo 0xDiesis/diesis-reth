@@ -9185,7 +9185,6 @@ dependencies = [
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-transaction-pool",
- "reth-trie-common",
  "tracing",
 ]
 

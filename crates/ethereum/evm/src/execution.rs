@@ -47,10 +47,13 @@ mod tests {
     };
     use reth_chainspec::{Chain, ChainSpec, MAINNET};
     use reth_ethereum_forks::{EthereumHardfork, ForkCondition};
-    use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned, TxType};
-    use reth_evm::{BlockExecutorFactory, ConfigureEvm, Executor};
+    use reth_ethereum_primitives::{
+        Block, BlockBody, Receipt, Transaction, TransactionSigned, TxMlDsa, TxType,
+        ML_DSA_TX_TYPE_ID,
+    };
+    use reth_evm::{execute::BasicBlockExecutor, BlockExecutorFactory, ConfigureEvm, Executor};
     use reth_execution_types::BlockExecutionOutput;
-    use reth_primitives_traits::RecoveredBlock;
+    use reth_primitives_traits::{transaction::error::InvalidTransactionError, RecoveredBlock};
     use reth_trie_common::{HashedPostState, KeccakKeyHasher};
     use std::sync::{mpsc, Arc};
 
@@ -65,6 +68,51 @@ mod tests {
     }
 
     type BlockEnv = EvmBlockEnv<evm2::BaseEvmTypes>;
+
+    #[test]
+    fn stock_block_executor_rejects_ml_dsa_transactions() {
+        let sender = Address::with_last_byte(1);
+        let transaction = Transaction::MlDsa(TxMlDsa {
+            chain_id: 1,
+            nonce: 0,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::with_last_byte(2)),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            access_list: Default::default(),
+            sender,
+            ml_dsa_level: 44,
+            pubkey: Bytes::new(),
+            ml_dsa_signature: Bytes::new(),
+        });
+        let transaction =
+            TransactionSigned::new(transaction, Signature::test_signature(), B256::ZERO);
+        assert_eq!(transaction.ty(), ML_DSA_TX_TYPE_ID);
+        let block = RecoveredBlock::new_unhashed(
+            Block {
+                header: Header { number: 1, gas_limit: 30_000_000, ..Default::default() },
+                body: BlockBody { transactions: vec![transaction], ..Default::default() },
+            },
+            vec![sender],
+        );
+
+        let config = crate::EthEvmConfig::new(MAINNET.clone());
+        let error =
+            BasicBlockExecutor::new(config, InMemoryDB::default()).execute(&block).unwrap_err();
+        assert!(
+            matches!(
+                error.as_validation(),
+                Some(BlockValidationError::Other(error))
+                    if matches!(
+                        error.downcast_ref::<InvalidTransactionError>(),
+                        Some(InvalidTransactionError::TxTypeNotSupported)
+                    )
+            ),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn detached_commits_preserve_storage_hooks_and_bal() {

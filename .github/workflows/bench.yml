@@ -349,7 +349,7 @@ jobs:
             const jsonObjectValid = (value) => {
               try { const parsed = JSON.parse(value); return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed); } catch { return false; }
             };
-            const usage = '`@decofe bench [mode=engine|rpc|call] [blocks=N] [big-blocks[=true|false|100M|2G]] [reorg[=N]] [bal=true|false|feature|baseline] [warmup=N] [baseline=REF] [feature=REF] [samply] [tracing-chrome] [skip-state-root] [slack=always|on-win|on-error|never] [cores=N] [run-pairs=N] [otlp=true|false] [metrics[=true|false]] [wait-time=DURATION] [mempool[=DELAY[,FRACTION]]] [block-time=DURATION] [baseline-args="..."] [feature-args="..."] [corpus=static|NAME] [class=call|tracecall|tracetx|traceblock] [namespace=debug|trace] [methods=a,b] [rps=N] [duration=DUR] [passes=N] [concurrency=N] [top-gas=N] [tracer=SPEC[,SPEC]] [tracer-config=JSON] [trace-options=JSON] [txgen-ref=REF]`';
+            const usage = '`@decofe bench [mode=engine|rpc|call] [blocks=N] [big-blocks[=true|false|100M|2G]] [reorg[=N]] [bal=true|false|feature|baseline] [warmup=N] [baseline=REF] [feature=REF] [samply] [tracing-chrome] [slack=always|on-win|on-error|never] [cores=N] [run-pairs=N] [otlp=true|false] [metrics[=true|false]] [wait-time=DURATION] [mempool[=DELAY[,FRACTION]]] [block-time=DURATION] [baseline-args="..."] [feature-args="..."] [corpus=static|NAME] [class=call|tracecall|tracetx|traceblock] [namespace=debug|trace] [methods=a,b] [rps=N] [duration=DUR] [passes=N] [concurrency=N] [top-gas=N] [tracer=SPEC[,SPEC]] [tracer-config=JSON] [trace-options=JSON] [txgen-ref=REF]`';
             let pr, actor, blocks, warmup, baseline, feature, samply, tracingChrome, cores, bigBlocks, bal;
             let corpus, callClass, callMethods, callRps, callDuration, callPasses, callConcurrency, callTopGas;
             let callTracer, callTracerConfig, callTraceOptions, callNamespace;
@@ -430,7 +430,6 @@ jobs:
               var blockTime = (process.env.INPUT_BLOCK_TIME || '') || '';
               var baselineNodeArgs = (process.env.INPUT_BASELINE_ARGS || '') || '';
               var featureNodeArgs = (process.env.INPUT_FEATURE_ARGS || '') || '';
-              var skipStateRoot = 'false';
               var txgenRef = (process.env.INPUT_TXGEN_REF || '') || '';
               // call_args carries the call-mode keys a comment would, validated the same way.
               const callArgErrors = [];
@@ -505,11 +504,11 @@ jobs:
               const body = context.payload.comment.body.trim();
               const intArgs = new Set(['warmup', 'cores', 'blocks', 'run-pairs', 'rps', 'passes', 'concurrency', 'top-gas']);
               const refArgs = new Set(['baseline', 'feature']);
-              const boolArgs = new Set(['samply', 'tracing-chrome', 'otlp', 'metrics', 'skip-state-root']);
+              const boolArgs = new Set(['samply', 'tracing-chrome', 'otlp', 'metrics']);
               const enumArgs = new Map([['bal', validBalModes], ['slack', validSlackModes], ['mode', validModes], ['class', validCallClasses], ['namespace', validNamespaces]]);
               const durationArgs = new Set(['wait-time', 'block-time', 'duration']);
               const stringArgs = new Set(['baseline-args', 'feature-args', 'txgen-ref']);
-              const defaults = { mode: 'engine', blocks: '', warmup: '', baseline: '', feature: '', samply: 'false', 'tracing-chrome': 'false', slack: 'always', 'big-blocks': 'false', reorg: '', mempool: '', bal: 'false', cores: '0', 'run-pairs': '', otlp: 'true', metrics: 'false', 'skip-state-root': 'false', 'wait-time': '', 'block-time': '', 'baseline-args': '', 'feature-args': '', 'txgen-ref': '', corpus: '', class: '', methods: '', rps: '', duration: '', passes: '', concurrency: '', 'top-gas': '', tracer: '', 'tracer-config': '', 'trace-options': '', namespace: '' };
+              const defaults = { mode: 'engine', blocks: '', warmup: '', baseline: '', feature: '', samply: 'false', 'tracing-chrome': 'false', slack: 'always', 'big-blocks': 'false', reorg: '', mempool: '', bal: 'false', cores: '0', 'run-pairs': '', otlp: 'true', metrics: 'false', 'wait-time': '', 'block-time': '', 'baseline-args': '', 'feature-args': '', 'txgen-ref': '', corpus: '', class: '', methods: '', rps: '', duration: '', passes: '', concurrency: '', 'top-gas': '', tracer: '', 'tracer-config': '', 'trace-options': '', namespace: '' };
               const unknown = [];
               const invalid = [];
               const args = body.replace(/^(?:@decofe|derek) bench\s*/, '');
@@ -665,7 +664,6 @@ jobs:
               var baselineNodeArgs = defaults['baseline-args'];
               var featureNodeArgs = defaults['feature-args'];
               var txgenRef = defaults['txgen-ref'];
-              var skipStateRoot = defaults['skip-state-root'];
               corpus = defaults.corpus;
               callClass = defaults.class;
               callMethods = defaults.methods;
@@ -678,11 +676,6 @@ jobs:
               callTracerConfig = defaults['tracer-config'];
               callTraceOptions = defaults['trace-options'];
               callNamespace = defaults.namespace;
-            }
-
-            if (skipStateRoot === 'true') {
-              baselineNodeArgs = [baselineNodeArgs, '--debug.skip-state-root'].filter(Boolean).join(' ');
-              featureNodeArgs = [featureNodeArgs, '--debug.skip-state-root'].filter(Boolean).join(' ');
             }
 
             const useBigBlockDefaults = bigBlocks === 'true';

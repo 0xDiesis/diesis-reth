@@ -13,8 +13,8 @@
 //!    blocks and runs header, parent-header, and pre-execution consensus validation.
 //! 2. Build the parent state provider, EVM environment, transaction iterator, lazy ancestor
 //!    overlay, and optional decoded EIP-7928 block access list (BAL).
-//! 3. Prepare the per-block state-root job. The default strategy picks a skipped, synchronous, or
-//!    sparse-trie job from [`TreeConfig`].
+//! 3. Prepare the per-block state-root job. The default strategy picks a synchronous or sparse-trie
+//!    job from [`TreeConfig`].
 //! 4. Spawn the payload processor. This always prepares transaction conversion and prewarming; a
 //!    streaming state-root job can provide a sink for prewarm and execution updates.
 //! 5. Execute the block. BAL payloads use the parallel BAL execute path only when state caching and

@@ -39,7 +39,6 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
 };
-use reth_trie_common::updates::TrieUpdates;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -168,7 +167,6 @@ where
         best_payload,
     } = args;
     let PayloadConfig { parent_header, attributes, payload_id, .. } = config;
-    let skip_state_root = builder_config.skip_state_root;
 
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let evm_state_provider = (&state_provider).into_evm_state_provider();
@@ -203,7 +201,7 @@ where
 
     let cached_db = cached_reads.as_db_mut(state);
     let evm_config = evm_config.with_jit_support();
-    let stream_state_updates = state_root_handle.is_some() && !skip_state_root;
+    let stream_state_updates = state_root_handle.is_some();
     let next_block_env_attributes = NextBlockEnvAttributes {
         timestamp: attributes.timestamp(),
         suggested_fee_recipient: attributes.suggested_fee_recipient,
@@ -450,19 +448,7 @@ where
         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
     }
 
-    let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = if skip_state_root
-    {
-        debug!(
-            target: "payload_builder",
-            id = %payload_id,
-            state_root = ?parent_header.state_root,
-            "skipping payload state-root computation"
-        );
-        builder.finish(
-            state_provider.as_ref(),
-            Some((parent_header.state_root, TrieUpdates::default())),
-        )?
-    } else if use_state_root_task {
+    let outcome = if use_state_root_task {
         let mut task = state_root_handle.expect("state-root task exists if hook was installed");
         // The state-root task has been computing incrementally alongside tx execution.
         // This recv() waits for the final root hash — most work is already done.
@@ -486,6 +472,7 @@ where
     } else {
         builder.finish(state_provider.as_ref(), None)?
     };
+    let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = outcome;
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp())

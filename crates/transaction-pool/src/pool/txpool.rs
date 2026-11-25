@@ -2135,7 +2135,7 @@ impl<T: PoolTransaction> AllTransactions<T> {
 
             // check if any of descendant blob transactions should be shifted into overdraft
             for (_, tx) in descendants {
-                cumulative_cost += tx.transaction.cost();
+                cumulative_cost += tx.sender_cost();
                 if tx.transaction.is_eip4844() && cumulative_cost > on_chain_balance {
                     // the transaction would shift
                     return Err(InsertErr::Overdraft { transaction: Arc::new(new_blob_tx) })
@@ -5030,6 +5030,46 @@ mod tests {
 
         assert_eq!(pool.pending_transactions().len(), 1);
         assert!(pool.queued_transactions().is_empty());
+    }
+
+    #[test]
+    fn blob_replacement_counts_only_the_sponsored_descendants_sender_cost() {
+        let overlay = Arc::new(ValueOnlyCostOverlay::default());
+        let mut pool = TxPool::new_with_sender_cost_overlay(
+            MockOrdering::default(),
+            Default::default(),
+            overlay.clone(),
+        );
+        let mut factory = MockTransactionFactory::default();
+        let head = MockTransaction::eip4844()
+            .with_max_fee(100)
+            .with_priority_fee(100)
+            .with_nonce(0)
+            .with_gas_limit(21_000);
+        let descendant = head.next().with_value(U256::from(7));
+        let blob_fee = 3 * head.max_fee_per_blob_gas().unwrap();
+        let replacement = head
+            .clone()
+            .rng_hash()
+            .with_max_fee(400)
+            .with_priority_fee(400)
+            .with_blob_fee(blob_fee)
+            .with_gas_limit(21_000);
+        let balance = *replacement.cost() + U256::from(7);
+        assert!(*replacement.cost() + *descendant.cost() > balance);
+        let head = factory.validated(head);
+        let descendant = factory.validated(descendant);
+        let replacement = factory.validated(replacement);
+
+        for tx in [&head, &descendant, &replacement] {
+            overlay.begin_attempt(*tx.hash());
+            pool.add_transaction(tx.clone(), balance, 0, None).unwrap();
+        }
+
+        assert!(!pool.contains(head.hash()));
+        assert!(pool.contains(replacement.hash()));
+        assert!(pool.contains(descendant.hash()));
+        assert_eq!(pool.pending_transactions().len(), 2);
     }
 
     #[test]

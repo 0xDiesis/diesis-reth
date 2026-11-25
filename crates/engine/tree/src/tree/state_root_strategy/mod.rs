@@ -460,8 +460,8 @@ type SerialFallbackRx = mpsc::Receiver<ProviderResult<(B256, TrieUpdates, Arc<Ha
 
 /// Default state-root strategy used by engine-tree validation.
 ///
-/// Covers the built-in modes: the sparse-trie state-root task, plus the skipped and
-/// synchronous modes selected by [`TreeConfig`].
+/// Uses either the sparse-trie state-root task or synchronous computation according to
+/// [`TreeConfig`].
 ///
 /// Custom strategies can hold this type and delegate to it for blocks where they want the
 /// default behavior.
@@ -904,10 +904,6 @@ where
         &self,
         mut ctx: StateRootJobContext<'_, N, P, Evm>,
     ) -> ProviderResult<PreparedStateRootJob<N>> {
-        if ctx.config.skip_state_root() {
-            return Ok(PreparedStateRootJob::new(Box::new(SkippedStateRootJob {}), None))
-        }
-
         if !ctx.config.use_state_root_task() {
             return Ok(PreparedStateRootJob::new(
                 Box::new(SynchronousStateRootJob {
@@ -986,7 +982,6 @@ where
         // Sharing the engine state-root task with the payload builder is opt-in, and needs a
         // host that can run the task pipeline at all.
         if !ctx.config.share_sparse_trie_with_payload_builder() ||
-            ctx.config.skip_state_root() ||
             !ctx.config.has_enough_parallelism()
         {
             return Ok(None)
@@ -1015,24 +1010,6 @@ where
                 publish_sparse_trie(&pending_trie_rx, &overlay_manager, block_hash, state_root);
             },
         )))
-    }
-}
-
-#[derive(Debug)]
-struct SkippedStateRootJob {}
-
-impl<N: NodePrimitives> StateRootJob<N> for SkippedStateRootJob {
-    fn name(&self) -> &'static str {
-        "skipped"
-    }
-
-    fn finish(
-        &mut self,
-        block: &RecoveredBlock<N::Block>,
-        _output: Arc<BlockExecutionOutput<N::Receipt>>,
-        _hashed_state: &LazyHashedPostState,
-    ) -> ProviderResult<StateRootJobOutcome> {
-        Ok(StateRootJobOutcome::new(block.header().state_root(), Arc::new(TrieUpdates::default())))
     }
 }
 

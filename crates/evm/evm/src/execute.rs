@@ -29,7 +29,7 @@ use evm2::evm::{CacheDB, Db};
 #[cfg(feature = "std")]
 use reth_execution_types::BundleSource;
 #[cfg(feature = "std")]
-use reth_primitives_traits::BlockTy;
+use reth_primitives_traits::{transaction::error::InvalidTransactionError, BlockTy};
 
 pub use evm2::block::{
     map_database_error, map_handler_error, BlockTransactionResult, CommitChanges, GasOutput,
@@ -1141,6 +1141,11 @@ where
 
         executor.apply_pre_execution_changes()?;
         for transaction in block.transactions_recovered() {
+            if !evm_config.supports_transaction_type(transaction.inner().ty()) {
+                return Err(
+                    BlockValidationError::other(InvalidTransactionError::TxTypeNotSupported).into()
+                )
+            }
             executor.execute_transaction(transaction)?;
         }
         let (output, block_access_list) = executor.finish_with_block_access_list()?;

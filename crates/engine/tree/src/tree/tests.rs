@@ -1776,7 +1776,6 @@ fn on_new_persisted_block_skips_sparse_trie_prune_when_state_root_task_disabled(
     let configs = [
         TreeConfig::default().with_has_enough_parallelism(false),
         TreeConfig::default().with_has_enough_parallelism(true).with_state_root_fallback(true),
-        TreeConfig::default().with_has_enough_parallelism(true).with_skip_state_root(true),
     ];
 
     for config in configs {
@@ -3437,6 +3436,34 @@ fn default_engine_path_runs_ordinary_parent_validation_exactly_once() {
     assert!(result.is_ok(), "valid default-path candidate must complete validation: {result:?}");
     assert!(!consensus.requires_parent_state_validation());
     assert_eq!(consensus.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn default_engine_path_rejects_an_incorrect_state_root() {
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let canonical_head = parent.recovered_block().num_hash();
+    let candidate = branch.get_executed_block_with_number(2, canonical_head.hash);
+    let mut candidate = empty_child_candidate(&candidate, &parent).unseal();
+    let correct_root = candidate.header.state_root;
+    let incorrect_root = B256::repeat_byte(0xee);
+    candidate.header.state_root = incorrect_root;
+
+    let result = validate_block_with_real_provider(
+        chain_spec,
+        Arc::new(DefaultParentValidationConsensus::default()),
+        vec![parent],
+        canonical_head,
+        candidate.seal_slow(),
+    );
+
+    assert_matches!(result, Err(InsertPayloadError::Block(error)) if matches!(
+        error.kind(),
+        InsertBlockErrorKind::Consensus(ConsensusError::BodyStateRootDiff(diff))
+            if diff.0.got == correct_root && diff.0.expected == incorrect_root
+    ));
 }
 
 #[test]
