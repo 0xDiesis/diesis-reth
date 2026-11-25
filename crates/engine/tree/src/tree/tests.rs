@@ -3,13 +3,14 @@ use crate::{
     persistence::PersistenceAction,
     tree::{
         error::{BlockAccessListDecodeError, InsertBlockErrorKind},
-        payload_validator::{BasicEngineValidator, TreeCtx, ValidationOutcome},
+        payload_validator::{BasicEngineValidator, BlockOrPayload, TreeCtx, ValidationOutcome},
         persistence_state::CurrentPersistenceAction,
         PersistTarget, TreeConfig,
     },
 };
 use reth_storage_overlay::OverlayManager;
 
+use alloy_consensus::{Header, EMPTY_ROOT_HASH};
 use alloy_eip7928::bal::DecodedBal;
 use alloy_eips::eip1898::BlockWithParent;
 use alloy_primitives::{
@@ -18,14 +19,15 @@ use alloy_primitives::{
 };
 use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{
-    ExecutionData, ExecutionPayloadSidecar, ExecutionPayloadV1, ForkchoiceState,
-    ForkchoiceUpdateError,
+    ExecutionData, ExecutionPayloadSidecar, ExecutionPayloadV1, ExecutionPayloadV4,
+    ForkchoiceState, ForkchoiceUpdateError,
 };
 use assert_matches::assert_matches;
 use evm2::evm::Bal as EvmBal;
 use futures::FutureExt as _;
 use reth_chain_state::test_utils::TestBlockBuilder;
-use reth_chainspec::{ChainSpec, HOLESKY, MAINNET};
+use reth_chainspec::{Chain, ChainSpec, HOLESKY, MAINNET};
+use reth_consensus::{HeaderValidator, ReceiptRootBloom};
 use reth_engine_primitives::{
     BeaconForkChoiceUpdateError, ConsensusEngineHandle, EngineApiValidator, ForkchoiceStatus,
     NoopInvalidBlockHook, DEFAULT_BACKFILL_RUN_THRESHOLD,
@@ -37,7 +39,9 @@ use reth_evm_ethereum::MockEvmConfig;
 use reth_payload_builder::PayloadServiceCommand;
 use reth_primitives_traits::Block as _;
 use reth_provider::{
-    test_utils::MockEthProvider, BalStoreHandle, HeaderProvider, InMemoryBalStore, RawBal,
+    providers::BlockchainProvider,
+    test_utils::{create_test_provider_factory_with_chain_spec, insert_genesis, MockEthProvider},
+    BalStoreHandle, BlockWriter, HeaderProvider, InMemoryBalStore, RawBal, StateProvider,
 };
 use reth_tasks::spawn_os_thread;
 use reth_trie_common::SortedTrieData;
@@ -46,7 +50,7 @@ use std::{
     str::FromStr,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -61,9 +65,21 @@ fn downloaded_blocks<B: reth_primitives_traits::Block>(
     blocks.into_iter().map(SealedBlockWithAccessList::from_block).collect()
 }
 
-/// Mock engine validator for tests
-#[derive(Debug, Clone)]
-struct MockEngineValidator;
+#[path = "tests/payload_validator.rs"]
+mod payload_validator;
+
+/// Payload validator that accepts every well-formed payload; the harness never executes one.
+#[derive(Debug, Clone, Default)]
+pub struct MockEngineValidator {
+    conversion_calls: Option<Arc<AtomicUsize>>,
+}
+
+impl MockEngineValidator {
+    /// Count payload conversions through the shared counter.
+    pub fn with_conversion_counter(conversion_calls: Arc<AtomicUsize>) -> Self {
+        Self { conversion_calls: Some(conversion_calls) }
+    }
+}
 
 impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineValidator {
     type Block = Block;
@@ -75,8 +91,10 @@ impl reth_engine_primitives::PayloadValidator<EthEngineTypes> for MockEngineVali
         reth_primitives_traits::SealedBlock<Self::Block>,
         reth_payload_primitives::NewPayloadError,
     > {
-        let ExecutionData { payload, sidecar } = payload;
-        let block = payload.try_into_block_with_sidecar(&sidecar).map_err(|e| {
+        if let Some(conversion_calls) = &self.conversion_calls {
+            conversion_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let block = payload.payload.try_into_block_with_sidecar(&payload.sidecar).map_err(|e| {
             reth_payload_primitives::NewPayloadError::Other(format!("{e:?}").into())
         })?;
         Ok(block.seal_slow())
@@ -93,7 +111,6 @@ impl EngineApiValidator<EthEngineTypes> for MockEngineValidator {
             alloy_rpc_types_engine::PayloadAttributes,
         >,
     ) -> Result<(), reth_payload_primitives::EngineObjectValidationError> {
-        // Mock implementation - always valid
         Ok(())
     }
 
@@ -102,7 +119,6 @@ impl EngineApiValidator<EthEngineTypes> for MockEngineValidator {
         _version: reth_payload_primitives::EngineApiMessageVersion,
         _attributes: &alloy_rpc_types_engine::PayloadAttributes,
     ) -> Result<(), reth_payload_primitives::EngineObjectValidationError> {
-        // Mock implementation - always valid
         Ok(())
     }
 }
@@ -220,7 +236,7 @@ impl TestHarness {
 
         let provider = MockEthProvider::default();
 
-        let payload_validator = MockEngineValidator;
+        let payload_validator = MockEngineValidator::default();
 
         let (from_tree_tx, from_tree_rx) = unbounded_channel();
         let runtime = reth_tasks::Runtime::test();
@@ -456,12 +472,19 @@ pub(crate) struct ValidatorTestHarness {
 
 impl ValidatorTestHarness {
     fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        let harness = TestHarness::new(chain_spec.clone());
+        let consensus = Arc::new(EthBeaconConsensus::new(Arc::clone(&chain_spec)));
+        Self::new_with_consensus(chain_spec, consensus)
+    }
 
-        // Create validator identical to the one in TestHarness
-        let consensus = Arc::new(EthBeaconConsensus::new(chain_spec));
+    fn new_with_consensus(
+        chain_spec: Arc<ChainSpec>,
+        consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    ) -> Self {
+        let harness = TestHarness::new(chain_spec);
+
+        // Create validator identical to the one in TestHarness.
         let provider = harness.provider.clone();
-        let payload_validator = MockEngineValidator;
+        let payload_validator = MockEngineValidator::default();
         let evm_config = MockEvmConfig::default();
         let overlay_manager = harness.tree.state.tree_state.overlay_manager.clone();
 
@@ -477,6 +500,36 @@ impl ValidatorTestHarness {
         );
 
         Self { harness, validator, metrics: TestMetrics::default() }
+    }
+
+    fn with_unpersisted_fork_blocks(
+        mut self,
+        blocks: Vec<ExecutedBlock>,
+        canonical_head: BlockNumHash,
+    ) -> Self {
+        let mut blocks_by_hash = B256Map::default();
+        let mut blocks_by_number = BTreeMap::new();
+        let mut parent_to_child: B256Map<B256Set> = B256Map::default();
+
+        let overlay_manager = self.harness.tree.state.tree_state.overlay_manager.clone();
+        for block in blocks {
+            overlay_manager.insert_block(block.clone());
+            let recovered = block.recovered_block();
+            let hash = recovered.hash();
+            blocks_by_number.entry(recovered.number).or_insert_with(Vec::new).push(block.clone());
+            parent_to_child.entry(recovered.parent_hash()).or_default().insert(hash);
+            blocks_by_hash.insert(hash, block);
+        }
+
+        self.harness.tree.state.tree_state = TreeState {
+            blocks_by_hash,
+            blocks_by_number,
+            current_canonical_head: canonical_head,
+            parent_to_child,
+            engine_kind: EngineApiKind::Ethereum,
+            overlay_manager,
+        };
+        self
     }
 
     /// Configure `PersistenceState` for specific persistence scenarios
@@ -516,6 +569,249 @@ impl ValidatorTestHarness {
     /// Get validation metrics for testing
     fn validation_call_count(&self) -> usize {
         self.metrics.total_calls()
+    }
+}
+
+fn execution_test_chain_spec() -> Arc<ChainSpec> {
+    Arc::new(
+        ChainSpec::builder()
+            .chain(Chain::from(1_u64))
+            .genesis(Default::default())
+            .cancun_activated()
+            .build(),
+    )
+}
+
+fn validate_block_with_real_provider(
+    chain_spec: Arc<ChainSpec>,
+    consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    unpersisted_blocks: Vec<ExecutedBlock>,
+    canonical_head: BlockNumHash,
+    block: SealedBlock<Block>,
+) -> ValidationOutcome<EthPrimitives> {
+    validate_input_with_real_provider(
+        chain_spec,
+        consensus,
+        unpersisted_blocks,
+        canonical_head,
+        BlockOrPayload::Block(block.into()),
+        MockEngineValidator::default(),
+    )
+}
+
+fn validate_payload_with_real_provider(
+    chain_spec: Arc<ChainSpec>,
+    consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    unpersisted_blocks: Vec<ExecutedBlock>,
+    canonical_head: BlockNumHash,
+    payload: ExecutionData,
+    payload_validator: MockEngineValidator,
+) -> ValidationOutcome<EthPrimitives> {
+    validate_input_with_real_provider(
+        chain_spec,
+        consensus,
+        unpersisted_blocks,
+        canonical_head,
+        BlockOrPayload::Payload(payload),
+        payload_validator,
+    )
+}
+
+fn validate_input_with_real_provider(
+    chain_spec: Arc<ChainSpec>,
+    consensus: Arc<dyn FullConsensus<EthPrimitives>>,
+    unpersisted_blocks: Vec<ExecutedBlock>,
+    canonical_head: BlockNumHash,
+    input: BlockOrPayload<EthEngineTypes>,
+    payload_validator: MockEngineValidator,
+) -> ValidationOutcome<EthPrimitives> {
+    let mut tree_harness =
+        ValidatorTestHarness::new_with_consensus(Arc::clone(&chain_spec), Arc::clone(&consensus))
+            .with_unpersisted_fork_blocks(unpersisted_blocks, canonical_head);
+    let provider = create_test_provider_factory_with_chain_spec(Arc::clone(&chain_spec));
+    insert_genesis(&provider, Arc::clone(&chain_spec)).expect("insert empty genesis state");
+    let genesis_block =
+        SealedBlock::<Block>::seal_parts(chain_spec.genesis_header().clone(), BlockBody::default());
+    let genesis_block = RecoveredBlock::new_sealed(genesis_block, Vec::new());
+    let provider_rw = provider.provider_rw().expect("open test provider for genesis block");
+    provider_rw.insert_block(&genesis_block).expect("insert genesis block");
+    provider_rw.commit().expect("commit genesis block");
+    let provider = BlockchainProvider::new(provider).expect("open blockchain provider");
+
+    let mut validator = BasicEngineValidator::new(
+        provider,
+        consensus,
+        EthEvmConfig::new(chain_spec),
+        payload_validator,
+        TreeConfig::default(),
+        Box::new(NoopInvalidBlockHook::default()),
+        tree_harness.harness.tree.state.tree_state.overlay_manager.clone(),
+        reth_tasks::Runtime::test(),
+    );
+    let ctx = TreeCtx::new(
+        &mut tree_harness.harness.tree.state,
+        &tree_harness.harness.tree.canonical_in_memory_state,
+    );
+    validator.validate_block_with_state(input, ctx)
+}
+
+fn empty_child_candidate(candidate: &ExecutedBlock, parent: &ExecutedBlock) -> SealedBlock<Block> {
+    let mut block = candidate.recovered_block().clone().into_sealed_block().unseal();
+    block.body.transactions.clear();
+    block.header.transactions_root = EMPTY_ROOT_HASH;
+    block.header.receipts_root = EMPTY_ROOT_HASH;
+    block.header.gas_used = 0;
+    block.header.state_root = parent.recovered_block().header().state_root;
+    block.seal_slow()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactParentStateObservation {
+    parent_hash: B256,
+    first_branch_nonce: Option<u64>,
+    second_branch_nonce: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ExactParentStateConsensus {
+    first_branch: Address,
+    second_branch: Address,
+    reject_standalone_header: bool,
+    reject_after_observation: bool,
+    observations: Arc<Mutex<Vec<ExactParentStateObservation>>>,
+}
+
+impl HeaderValidator<Header> for ExactParentStateConsensus {
+    fn requires_parent_state_validation(&self) -> bool {
+        true
+    }
+
+    fn validate_header(&self, _header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
+        if self.reject_standalone_header {
+            Err(ConsensusError::BaseFeeMissing)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_header_against_parent(
+        &self,
+        _header: &SealedHeader<Header>,
+        _parent: &SealedHeader<Header>,
+    ) -> Result<(), ConsensusError> {
+        panic!("engine validation must supply the exact parent state")
+    }
+
+    fn validate_header_against_parent_with_state(
+        &self,
+        _header: &SealedHeader<Header>,
+        parent: &SealedHeader<Header>,
+        parent_state: &dyn StateProvider,
+    ) -> Result<(), ConsensusError> {
+        let first_branch_nonce = parent_state
+            .basic_account(&self.first_branch)
+            .map_err(ConsensusError::other)?
+            .map(|account| account.nonce);
+        let second_branch_nonce = parent_state
+            .basic_account(&self.second_branch)
+            .map_err(ConsensusError::other)?
+            .map(|account| account.nonce);
+        self.observations.lock().expect("exact-parent observation lock is not poisoned").push(
+            ExactParentStateObservation {
+                parent_hash: parent.hash(),
+                first_branch_nonce,
+                second_branch_nonce,
+            },
+        );
+        if self.reject_after_observation {
+            Err(ConsensusError::other(StopAfterObservation))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DefaultParentValidationConsensus {
+    calls: AtomicUsize,
+}
+
+impl HeaderValidator<Header> for DefaultParentValidationConsensus {
+    fn validate_header(&self, _header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn validate_header_against_parent(
+        &self,
+        _header: &SealedHeader<Header>,
+        _parent: &SealedHeader<Header>,
+    ) -> Result<(), ConsensusError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Consensus<Block> for ExactParentStateConsensus {
+    fn validate_body_against_header(
+        &self,
+        _body: &<Block as reth_primitives_traits::Block>::Body,
+        _header: &SealedHeader<Header>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn validate_block_pre_execution(
+        &self,
+        _block: &SealedBlock<Block>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+}
+
+/// Halts validation once the observation under test has been recorded, so the test can assert on
+/// what the validator saw rather than letting the block proceed.
+#[derive(Debug, thiserror::Error)]
+#[error("stop after observing exact parent state")]
+struct StopAfterObservation;
+
+impl FullConsensus<EthPrimitives> for ExactParentStateConsensus {
+    fn validate_block_post_execution(
+        &self,
+        _block: &RecoveredBlock<Block>,
+        _result: &BlockExecutionResult<Receipt>,
+        _receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+}
+
+impl Consensus<Block> for DefaultParentValidationConsensus {
+    fn validate_body_against_header(
+        &self,
+        _body: &<Block as reth_primitives_traits::Block>::Body,
+        _header: &SealedHeader<Header>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn validate_block_pre_execution(
+        &self,
+        _block: &SealedBlock<Block>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+}
+
+impl FullConsensus<EthPrimitives> for DefaultParentValidationConsensus {
+    fn validate_block_post_execution(
+        &self,
+        _block: &RecoveredBlock<Block>,
+        _result: &BlockExecutionResult<Receipt>,
+        _receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
     }
 }
 
@@ -2303,6 +2599,266 @@ fn test_validate_block_multiple_scenarios() {
         total_calls >= 2,
         "At least invalid block validations should have executed (got {})",
         total_calls
+    );
+}
+
+#[test]
+fn default_engine_path_runs_ordinary_parent_validation_exactly_once() {
+    let consensus = Arc::new(DefaultParentValidationConsensus::default());
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let candidate = branch.get_executed_block_with_number(2, parent.recovered_block().hash());
+    let candidate = empty_child_candidate(&candidate, &parent);
+    let canonical_head = parent.recovered_block().num_hash();
+    let result = validate_block_with_real_provider(
+        chain_spec,
+        Arc::clone(&consensus) as Arc<dyn FullConsensus<EthPrimitives>>,
+        vec![parent],
+        canonical_head,
+        candidate,
+    );
+
+    assert!(result.is_ok(), "valid default-path candidate must complete validation: {result:?}");
+    assert!(!consensus.requires_parent_state_validation());
+    assert_eq!(consensus.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn validate_block_supplies_unpersisted_canonical_parent_state() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let marker = branch.signer;
+    let block_one = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let block_two = branch.get_executed_block_with_number(2, block_one.recovered_block().hash());
+    let candidate = branch.get_executed_block_with_number(3, block_two.recovered_block().hash());
+    let canonical_head = block_two.recovered_block().num_hash();
+    let expected_nonce = branch
+        .post_block_state
+        .get(&canonical_head.hash)
+        .expect("canonical parent post-state was recorded")
+        .0
+        .nonce;
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: marker,
+        second_branch: Address::repeat_byte(0xee),
+        reject_standalone_header: false,
+        reject_after_observation: true,
+        observations: Arc::clone(&observations),
+    });
+    let result = validate_block_with_real_provider(
+        chain_spec,
+        consensus,
+        vec![block_one, block_two],
+        canonical_head,
+        candidate.recovered_block().clone().into_sealed_block(),
+    );
+    assert!(result.is_err(), "consensus rejects after observing the parent: {result:?}");
+
+    assert_eq!(
+        *observations.lock().expect("observation lock is not poisoned"),
+        vec![ExactParentStateObservation {
+            parent_hash: canonical_head.hash,
+            first_branch_nonce: Some(expected_nonce),
+            second_branch_nonce: None,
+        }]
+    );
+}
+
+#[test]
+fn standalone_header_failure_precedes_parent_state_validation() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let marker = branch.signer;
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let candidate = branch.get_executed_block_with_number(2, parent.recovered_block().hash());
+    let canonical_head = parent.recovered_block().num_hash();
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: marker,
+        second_branch: Address::repeat_byte(0xee),
+        reject_standalone_header: true,
+        reject_after_observation: true,
+        observations: Arc::clone(&observations),
+    });
+    let result = validate_block_with_real_provider(
+        chain_spec,
+        consensus,
+        vec![parent],
+        canonical_head,
+        candidate.recovered_block().clone().into_sealed_block(),
+    );
+
+    assert!(result.is_err());
+    assert!(
+        observations.lock().expect("observation lock is not poisoned").is_empty(),
+        "authority state must not be consulted after standalone header rejection"
+    );
+}
+
+#[test]
+fn validate_block_supplies_exact_state_for_competing_multi_block_forks() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let chain_spec = execution_test_chain_spec();
+    let mut first =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let mut second =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let first_marker = first.signer;
+    let second_marker = second.signer;
+
+    let first_one = first.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let first_two = first.get_executed_block_with_number(2, first_one.recovered_block().hash());
+    let first_candidate =
+        first.get_executed_block_with_number(3, first_two.recovered_block().hash());
+    let second_one = second.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let second_two = second.get_executed_block_with_number(2, second_one.recovered_block().hash());
+    let second_candidate =
+        second.get_executed_block_with_number(3, second_two.recovered_block().hash());
+    let canonical_head = first_two.recovered_block().num_hash();
+    let first_parent_hash = first_two.recovered_block().hash();
+    let second_parent_hash = second_two.recovered_block().hash();
+    let first_expected_nonce = first
+        .post_block_state
+        .get(&first_parent_hash)
+        .expect("first fork parent post-state was recorded")
+        .0
+        .nonce;
+    let second_expected_nonce = second
+        .post_block_state
+        .get(&second_parent_hash)
+        .expect("second fork parent post-state was recorded")
+        .0
+        .nonce;
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: first_marker,
+        second_branch: second_marker,
+        reject_standalone_header: false,
+        reject_after_observation: true,
+        observations: Arc::clone(&observations),
+    });
+    let fork = vec![first_one, first_two, second_one, second_two];
+    for candidate in [first_candidate, second_candidate] {
+        let result = validate_block_with_real_provider(
+            chain_spec.clone(),
+            consensus.clone(),
+            fork.clone(),
+            canonical_head,
+            candidate.recovered_block().clone().into_sealed_block(),
+        );
+        assert!(result.is_err(), "consensus rejects after observing the parent: {result:?}");
+    }
+
+    assert_eq!(
+        *observations.lock().expect("observation lock is not poisoned"),
+        vec![
+            ExactParentStateObservation {
+                parent_hash: first_parent_hash,
+                first_branch_nonce: Some(first_expected_nonce),
+                second_branch_nonce: None,
+            },
+            ExactParentStateObservation {
+                parent_hash: second_parent_hash,
+                first_branch_nonce: None,
+                second_branch_nonce: Some(second_expected_nonce),
+            },
+        ]
+    );
+}
+
+#[test]
+fn opt_in_parent_state_success_continues_through_execution_and_post_validation() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let marker = branch.signer;
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let candidate = branch.get_executed_block_with_number(2, parent.recovered_block().hash());
+    let candidate = empty_child_candidate(&candidate, &parent);
+    let parent_hash = parent.recovered_block().hash();
+    let expected_nonce =
+        branch.post_block_state.get(&parent_hash).expect("parent post-state was recorded").0.nonce;
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: marker,
+        second_branch: Address::repeat_byte(0xee),
+        reject_standalone_header: false,
+        reject_after_observation: false,
+        observations: Arc::clone(&observations),
+    });
+    let result = validate_block_with_real_provider(
+        chain_spec,
+        consensus,
+        vec![parent],
+        BlockNumHash::new(1, parent_hash),
+        candidate,
+    );
+
+    assert!(result.is_ok(), "valid opt-in candidate must complete validation: {result:?}");
+    assert_eq!(
+        *observations.lock().expect("observation lock is not poisoned"),
+        vec![ExactParentStateObservation {
+            parent_hash,
+            first_branch_nonce: Some(expected_nonce),
+            second_branch_nonce: None,
+        }]
+    );
+}
+
+#[test]
+fn opt_in_malformed_block_access_list_returns_error_after_single_conversion() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let conversion_calls = Arc::new(AtomicUsize::new(0));
+    let chain_spec = execution_test_chain_spec();
+    let mut branch =
+        TestBlockBuilder::eth().with_chain_spec(chain_spec.as_ref().clone()).with_state();
+    let marker = branch.signer;
+    let parent = branch.get_executed_block_with_number(1, chain_spec.genesis_hash());
+    let candidate = branch.get_executed_block_with_number(2, parent.recovered_block().hash());
+    let canonical_head = parent.recovered_block().num_hash();
+    let consensus = Arc::new(ExactParentStateConsensus {
+        first_branch: marker,
+        second_branch: Address::repeat_byte(0xee),
+        reject_standalone_header: false,
+        reject_after_observation: false,
+        observations,
+    });
+    let payload_validator =
+        MockEngineValidator::with_conversion_counter(Arc::clone(&conversion_calls));
+    let candidate = candidate.recovered_block().clone().into_sealed_block();
+    let candidate_hash = candidate.hash();
+    let candidate = candidate.into_block();
+    let payload = ExecutionData {
+        payload: ExecutionPayloadV4::from_block_unchecked_with_bal(
+            candidate_hash,
+            &candidate,
+            Bytes::from_static(&[0xff]),
+        )
+        .into(),
+        sidecar: ExecutionPayloadSidecar::none(),
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_payload_with_real_provider(
+            chain_spec,
+            consensus,
+            vec![parent],
+            canonical_head,
+            payload,
+            payload_validator,
+        )
+    }));
+
+    assert_eq!(conversion_calls.load(Ordering::Relaxed), 1);
+    let outcome = outcome.expect("malformed block access list must return an error, not panic");
+    assert_matches!(
+        outcome,
+        Err(InsertPayloadError::Block(error))
+            if matches!(error.kind(), crate::tree::error::InsertBlockErrorKind::BlockAccessListDecode(_))
     );
 }
 
