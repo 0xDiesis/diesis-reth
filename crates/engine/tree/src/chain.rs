@@ -1,8 +1,11 @@
-use crate::backfill::{BackfillAction, BackfillEvent, BackfillSync};
+use crate::{
+    backfill::{BackfillAction, BackfillEvent, BackfillSync},
+    writer_fence::{BackfillStartPermit, WriterFenceError},
+};
 use futures::Stream;
 use reth_stages_api::{ControlFlow, PipelineTarget};
 use std::{
-    fmt::{Display, Formatter, Result},
+    fmt::{Display, Formatter, Result as FmtResult},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -39,6 +42,8 @@ where
     handler: T,
     /// Controls backfill sync.
     backfill_sync: P,
+    /// Exact engine actor allowed to authorize a direct startup pipeline spawn.
+    writer_fence_actor: Option<u64>,
 }
 
 impl<T, P> ChainOrchestrator<T, P>
@@ -48,7 +53,13 @@ where
 {
     /// Creates a new [`ChainOrchestrator`] with the given handler and backfill sync.
     pub const fn new(handler: T, backfill_sync: P) -> Self {
-        Self { handler, backfill_sync }
+        Self { handler, backfill_sync, writer_fence_actor: None }
+    }
+
+    /// Bind startup pipeline authorization to one concrete engine actor incarnation.
+    pub(crate) const fn with_writer_fence_actor(mut self, actor: u64) -> Self {
+        self.writer_fence_actor = Some(actor);
+        self
     }
 
     /// Returns the handler
@@ -64,8 +75,15 @@ where
     /// Triggers a backfill sync for the __valid__ given target.
     ///
     /// CAUTION: This function should be used with care and with a valid target.
-    pub fn start_backfill_sync(&mut self, target: impl Into<PipelineTarget>) {
+    pub fn start_backfill_sync(
+        &mut self,
+        target: impl Into<PipelineTarget>,
+        permit: BackfillStartPermit,
+    ) -> Result<(), WriterFenceError> {
+        let actor = self.writer_fence_actor.ok_or(WriterFenceError::RecoveryFenced)?;
+        permit.authorize(actor)?;
         self.backfill_sync.on_action(BackfillAction::Start(target.into()));
+        Ok(())
     }
 
     /// Internal function used to advance the chain.
@@ -167,7 +185,7 @@ pub enum ChainEvent<T> {
 }
 
 impl<T: Display> Display for ChainEvent<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::BackfillSyncStarted => {
                 write!(f, "BackfillSyncStarted")
@@ -234,4 +252,53 @@ pub enum FromOrchestrator {
         /// Channel to signal termination completion.
         tx: tokio::sync::oneshot::Sender<()>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        backfill::PipelineSync, test_utils::TestPipelineBuilder, writer_fence::BackfillStartPermit,
+    };
+    use alloy_primitives::B256;
+    use assert_matches::assert_matches;
+    use futures::{poll, StreamExt};
+    use reth_chainspec::MAINNET;
+    use reth_tasks::Runtime;
+    use std::task::Poll;
+
+    #[derive(Debug, Default)]
+    struct IdleHandler;
+
+    impl ChainHandler for IdleHandler {
+        type Event = ();
+
+        fn on_event(&mut self, _event: FromOrchestrator) {}
+
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<HandlerEvent<Self::Event>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_pipeline_spawn_requires_permit_from_bound_actor() {
+        const ACTOR: u64 = 41;
+        let pipeline = TestPipelineBuilder::new().build(MAINNET.clone());
+        let pipeline_sync = PipelineSync::new(pipeline, Runtime::test());
+        let mut orchestrator =
+            ChainOrchestrator::new(IdleHandler, pipeline_sync).with_writer_fence_actor(ACTOR);
+        let target = PipelineTarget::Sync(B256::repeat_byte(0x42));
+
+        assert_matches!(
+            orchestrator
+                .start_backfill_sync(target, BackfillStartPermit::new_for_test(ACTOR + 1, 1),),
+            Err(WriterFenceError::StaleCapability)
+        );
+        assert_matches!(poll!(orchestrator.next()), Poll::Pending);
+
+        orchestrator
+            .start_backfill_sync(target, BackfillStartPermit::new_for_test(ACTOR, 2))
+            .unwrap();
+        assert_matches!(orchestrator.next().await, Some(ChainEvent::BackfillSyncStarted));
+    }
 }

@@ -6,13 +6,15 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
 use reth_provider::{
     providers::ProviderNodeTypes, BalProvider, BlockExecutionWriter, BlockHashReader,
-    ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderFactory, SaveBlocksInput,
+    BlockNumReader, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderFactory,
+    SaveBlocksInput, StageCheckpointReader,
 };
 use reth_prune::{PrunerError, PrunerWithFactory};
-use reth_stages_api::{MetricEvent, MetricEventsSender};
+use reth_stages_api::{MetricEvent, MetricEventsSender, StageId};
 use reth_tasks::spawn_os_thread;
 use std::{
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SendError, Sender},
         Arc,
     },
@@ -61,6 +63,12 @@ where
     /// Pending safe block number to be committed with the next block save.
     /// This avoids triggering a separate fsync for each safe block update.
     pending_safe_block: Option<u64>,
+    /// Exactly one owner may hold the writer. Dropped acknowledgements do not release it.
+    release_fence: Option<(u64, BlockNumHash)>,
+    /// A storage fault cannot be cleared by an ordinary release request.
+    release_fence_fault: Option<ReleaseFenceError>,
+    /// Fast admission refusal shared with production handle clones. The service checks again.
+    writer_closed: Arc<AtomicBool>,
 }
 
 impl<N> PersistenceService<N>
@@ -82,6 +90,9 @@ where
             sync_metrics_tx,
             pending_finalized_block: None,
             pending_safe_block: None,
+            release_fence: None,
+            release_fence_fault: None,
+            writer_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -95,7 +106,27 @@ where
     pub fn run(mut self) -> Result<(), PersistenceError> {
         // If the receiver errors then senders have disconnected, so the loop should then end.
         while let Ok(action) = self.incoming.recv() {
+            if self.writer_is_closed() && action.mutates_canonical_storage() {
+                // Existing save/remove acknowledgements cannot carry errors. Disconnect them,
+                // which the tree already treats as persistence failure, without touching storage.
+                warn!(target: "engine::persistence", "Refusing mutation while release writer is fenced");
+                continue;
+            }
             match action {
+                PersistenceAction::ReleaseFence(PersistenceReleaseFenceRequest {
+                    operation,
+                    tx,
+                }) => {
+                    let result = match operation {
+                        ReleaseFenceOperation::Acquire { id, expected } => {
+                            self.on_acquire_release_fence(id, expected)
+                        }
+                        ReleaseFenceOperation::Release { id } => self.on_release_release_fence(id),
+                    };
+                    // A lost acquisition receiver leaves the fence held. Only an explicit
+                    // engine-owned release command may reopen it.
+                    let _ = tx.try_send(result);
+                }
                 PersistenceAction::RemoveBlocksAbove(new_tip_num, sender) => {
                     let result = self.on_remove_blocks_above(new_tip_num)?;
                     // send new sync metrics based on removed blocks
@@ -129,11 +160,120 @@ where
         Ok(())
     }
 
+    fn writer_is_closed(&self) -> bool {
+        self.release_fence.is_some() || self.release_fence_fault.is_some()
+    }
+
+    fn fence_storage_fault(&mut self, error: ReleaseFenceError) -> ReleaseFenceError {
+        self.writer_closed.store(true, Ordering::Release);
+        self.release_fence_fault = Some(error.clone());
+        error
+    }
+
+    fn verify_release_head(&self, expected: BlockNumHash) -> Result<(), ReleaseFenceError> {
+        let provider = self.provider.provider().map_err(ReleaseFenceError::storage)?;
+        let best = provider.best_block_number().map_err(ReleaseFenceError::storage)?;
+        let actual = provider
+            .block_hash(best)
+            .map_err(ReleaseFenceError::storage)?
+            .map(|hash| BlockNumHash::new(best, hash));
+        let static_tip = provider.last_block_number().map_err(ReleaseFenceError::storage)?;
+        let state_trie_tip = provider
+            .get_stage_checkpoint(StageId::Finish)
+            .map_err(ReleaseFenceError::storage)?
+            .map(|checkpoint| {
+                checkpoint
+                    .finish_stage_checkpoint()
+                    .and_then(|finish| finish.partial_state_trie())
+                    .unwrap_or(checkpoint.block_number)
+            });
+        if state_trie_tip.is_some_and(|tip| tip != expected.number) {
+            return Err(ReleaseFenceError::StateTrieHeadMismatch {
+                expected,
+                actual: state_trie_tip,
+            });
+        }
+        if actual != Some(expected) || static_tip != expected.number {
+            return Err(ReleaseFenceError::HeadMismatch { expected, actual, static_tip });
+        }
+        Ok(())
+    }
+
+    fn on_acquire_release_fence(
+        &mut self,
+        id: u64,
+        expected: BlockNumHash,
+    ) -> Result<(), ReleaseFenceError> {
+        if let Some(error) = &self.release_fence_fault {
+            return Err(error.clone());
+        }
+        if self.release_fence.is_some() {
+            return Err(ReleaseFenceError::Busy);
+        }
+        if self.pending_finalized_block.is_some_and(|n| n > expected.number) ||
+            self.pending_safe_block.is_some_and(|n| n > expected.number)
+        {
+            return Err(ReleaseFenceError::PendingMetadataAhead);
+        }
+        self.writer_closed.store(true, Ordering::Release);
+        if let Err(error) = self.verify_release_head(expected) {
+            if matches!(error, ReleaseFenceError::Storage(_)) {
+                return Err(self.fence_storage_fault(error));
+            }
+            self.writer_closed.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        // Safe/finalized updates are normally deferred until the next save. A successful fence
+        // instead commits all preceding metadata here; values ahead of the head were refused.
+        if self.pending_finalized_block.is_some() || self.pending_safe_block.is_some() {
+            let result = (|| -> Result<(), ProviderError> {
+                let provider = self.provider.database_provider_rw()?;
+                if let Some(number) = self.pending_finalized_block {
+                    provider.save_finalized_block_number(number)?;
+                }
+                if let Some(number) = self.pending_safe_block {
+                    provider.save_safe_block_number(number)?;
+                }
+                provider.commit()?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return Err(self.fence_storage_fault(ReleaseFenceError::storage(error)));
+            }
+            self.pending_finalized_block = None;
+            self.pending_safe_block = None;
+        }
+        self.release_fence = Some((id, expected));
+        Ok(())
+    }
+
+    fn on_release_release_fence(&mut self, id: u64) -> Result<(), ReleaseFenceError> {
+        if let Some(error) = &self.release_fence_fault {
+            return Err(error.clone());
+        }
+        let Some((held_id, expected)) = self.release_fence else {
+            return Err(ReleaseFenceError::NotHeld);
+        };
+        if held_id != id {
+            return Err(ReleaseFenceError::WrongOwner);
+        }
+        if let Err(error) = self.verify_release_head(expected) {
+            return Err(self.fence_storage_fault(error));
+        }
+        self.release_fence = None;
+        self.writer_closed.store(false, Ordering::Release);
+        Ok(())
+    }
+
     #[instrument(level = "debug", target = "engine::persistence", skip_all, fields(%new_tip_num))]
     fn on_remove_blocks_above(
         &self,
         new_tip_num: u64,
     ) -> Result<PersistenceResult, PersistenceError> {
+        if self.writer_is_closed() {
+            return Err(PersistenceError::ReleaseFenceClosed);
+        }
         debug!(target: "engine::persistence", ?new_tip_num, "Removing blocks");
         let start_time = Instant::now();
         let provider_rw = self.provider.database_provider_rw()?;
@@ -164,13 +304,13 @@ where
         &mut self,
         input: SaveBlocksInput<N::Primitives>,
     ) -> Result<PersistenceResult, PersistenceError> {
+        if self.writer_is_closed() {
+            return Err(PersistenceError::ReleaseFenceClosed);
+        }
         let first_block =
             input.first_persist_rest_block().map(|block| block.recovered_block().num_hash());
         let last_block = input.last_block();
         let block_count = input.persist_rest_blocks().len();
-
-        let pending_finalized = self.pending_finalized_block.take();
-        let pending_safe = self.pending_safe_block.take();
 
         debug!(target: "engine::persistence", ?block_count, first=?first_block, last=?last_block, "Saving range of blocks");
 
@@ -197,13 +337,13 @@ where
         };
         provider_rw.save_blocks(&input)?;
 
-        if let Some(finalized) = pending_finalized {
+        if let Some(finalized) = self.pending_finalized_block.take() {
             provider_rw.save_finalized_block_number(finalized.min(last_block.number))?;
             if finalized > last_block.number {
                 self.pending_finalized_block = Some(finalized);
             }
         }
-        if let Some(safe) = pending_safe {
+        if let Some(safe) = self.pending_safe_block.take() {
             provider_rw.save_safe_block_number(safe.min(last_block.number))?;
             if safe > last_block.number {
                 self.pending_safe_block = Some(safe);
@@ -212,9 +352,10 @@ where
 
         provider_rw.commit()?;
         // BALs live outside the main database and are intentionally flushed last.
-        let _ = self.provider.bal_store().flush(&canonical_blocks).inspect_err(|err| {
+        if let Err(err) = self.provider.bal_store().flush(&canonical_blocks) {
             warn!(target: "engine::persistence", last=?last_block, ?err, "Failed to flush BAL store");
-        });
+            self.fence_storage_fault(ReleaseFenceError::storage(err));
+        }
         debug!(target: "engine::persistence", first=?first_block, last=?last_block, "Saved range of blocks");
 
         let elapsed = start_time.elapsed();
@@ -225,6 +366,9 @@ where
     }
 
     fn maybe_run_pruner(&mut self, block_number: u64) -> Result<(), PersistenceError> {
+        if self.writer_is_closed() {
+            return Err(PersistenceError::ReleaseFenceClosed);
+        }
         // The durable save is already committed at this point, so pruning can happen after we
         // acknowledge the save without extending the synchronous persistence wait.
         if self.pruner.is_pruning_needed(block_number) {
@@ -233,14 +377,14 @@ where
             let provider_rw = self.provider.database_provider_rw()?;
             let _ = self.pruner.run_with_provider(&provider_rw, block_number)?;
             provider_rw.commit()?;
-            let pruned_bals = self
-                .provider
-                .bal_store()
-                .prune(block_number)
-                .inspect_err(|err| {
+            let pruned_bals = match self.provider.bal_store().prune(block_number) {
+                Ok(pruned) => pruned,
+                Err(err) => {
                     warn!(target: "engine::persistence", tip=?block_number, ?err, "Failed to prune BAL store");
-                })
-                .unwrap_or_default();
+                    self.fence_storage_fault(ReleaseFenceError::storage(err));
+                    0
+                }
+            };
             debug!(target: "engine::persistence", tip=?block_number, pruned_bals, "Finished pruning after saving blocks");
             self.metrics.prune_before_duration_seconds.record(prune_start.elapsed());
         }
@@ -252,6 +396,10 @@ where
 /// One of the errors that can happen when using the persistence service.
 #[derive(Debug, Error)]
 pub enum PersistenceError {
+    /// A mutation was attempted while the release writer was held or faulted.
+    #[error("persistence writer is release-fenced")]
+    ReleaseFenceClosed,
+
     /// A pruner error
     #[error(transparent)]
     PrunerError(#[from] PrunerError),
@@ -261,9 +409,59 @@ pub enum PersistenceError {
     ProviderError(#[from] ProviderError),
 }
 
+/// Refusal or failure of the persistence writer barrier.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReleaseFenceError {
+    /// Another operation holds the writer, including a cancelled acknowledgement.
+    #[error("persistence release fence is already held")]
+    Busy,
+    /// No matching acquisition remains active.
+    #[error("persistence release fence is not held")]
+    NotHeld,
+    /// The operation identifier does not match the active owner.
+    #[error("persistence release fence owner does not match")]
+    WrongOwner,
+    /// Metadata cannot be made durable at the requested head.
+    #[error("pending safe or finalized metadata is ahead of the requested head")]
+    PendingMetadataAhead,
+    /// The finished stage and static-file head must both identify the exact requested block.
+    #[error("persisted head mismatch: expected {expected:?}, actual {actual:?}, static tip {static_tip}")]
+    HeadMismatch {
+        /// Requested exact head.
+        expected: BlockNumHash,
+        /// Actual finished-stage head, if its canonical hash exists.
+        actual: Option<BlockNumHash>,
+        /// Last static-file header number.
+        static_tip: u64,
+    },
+    /// The canonical state/trie frontier must also reach the fenced head.
+    #[error("persistence state/trie frontier {actual:?} differs from release head {expected:?}")]
+    StateTrieHeadMismatch {
+        /// Requested canonical head.
+        expected: BlockNumHash,
+        /// Persisted execution state/trie block number.
+        actual: Option<u64>,
+    },
+    /// Storage errors permanently close this service's writer admission.
+    #[error("persistence release fence storage failure: {0}")]
+    Storage(String),
+    /// The persistence service has stopped or its channel is disconnected.
+    #[error("persistence service is unavailable")]
+    Unavailable,
+}
+
+impl ReleaseFenceError {
+    fn storage(error: impl std::fmt::Display) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
 /// A signal to the persistence service that part of the tree state can be persisted.
 #[derive(Debug)]
 pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
+    /// Engine-owned FIFO writer control. Its opaque request cannot be constructed externally.
+    ReleaseFence(PersistenceReleaseFenceRequest),
+
     /// Advances the block-data and state/trie persistence frontiers described by the input.
     SaveBlocks(SaveBlocksInput<N>, CrossbeamSender<PersistenceResult>),
 
@@ -280,11 +478,53 @@ pub enum PersistenceAction<N: NodePrimitives = EthPrimitives> {
     SaveSafeBlock(u64),
 }
 
+/// Opaque persistence control created only by this crate's engine-owned handle methods.
+///
+/// Public persistence action senders do not confer authority to acquire or release the fence.
+/// No public constructor, field, cloning or decoding path exposes the operation identifier.
+///
+/// ```compile_fail
+/// use reth_engine_tree::persistence::PersistenceReleaseFenceRequest;
+/// let request = PersistenceReleaseFenceRequest {};
+/// ```
+///
+/// ```compile_fail
+/// use reth_engine_tree::persistence::PersistenceHandle;
+/// fn release_without_engine_authority(handle: &PersistenceHandle) {
+///     let _ = handle.release_release_fence(7);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PersistenceReleaseFenceRequest {
+    operation: ReleaseFenceOperation,
+    tx: CrossbeamSender<Result<(), ReleaseFenceError>>,
+}
+
+#[derive(Debug)]
+enum ReleaseFenceOperation {
+    Acquire { id: u64, expected: BlockNumHash },
+    Release { id: u64 },
+}
+
+impl<N: NodePrimitives> PersistenceAction<N> {
+    fn mutates_canonical_storage(&self) -> bool {
+        matches!(
+            self,
+            Self::SaveBlocks(..) |
+                Self::RemoveBlocksAbove(..) |
+                Self::SaveFinalizedBlock(..) |
+                Self::SaveSafeBlock(..)
+        )
+    }
+}
+
 /// A handle to the persistence service
 #[derive(Debug, Clone)]
 pub struct PersistenceHandle<N: NodePrimitives = EthPrimitives> {
     /// The channel used to communicate with the persistence service
     sender: Sender<PersistenceAction<N>>,
+    /// Production clones share service admission state; service-side checks are authoritative.
+    writer_closed: Arc<AtomicBool>,
     /// Guard that joins the service thread when all handles are dropped.
     /// Uses `Arc` so the handle remains `Clone`.
     _service_guard: Arc<ServiceGuard>,
@@ -296,7 +536,11 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
     /// This is intended for testing purposes where you want to mock the persistence service.
     /// For production use, prefer [`spawn_service`](Self::spawn_service).
     pub fn new(sender: Sender<PersistenceAction<T>>) -> Self {
-        Self { sender, _service_guard: Arc::new(ServiceGuard(None)) }
+        Self {
+            sender,
+            writer_closed: Arc::new(AtomicBool::new(false)),
+            _service_guard: Arc::new(ServiceGuard(None)),
+        }
     }
 
     /// Create a new [`PersistenceHandle`], and spawn the persistence service.
@@ -318,6 +562,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         // spawn the persistence service
         let db_service =
             PersistenceService::new(provider_factory, db_service_rx, pruner, sync_metrics_tx);
+        let writer_closed = db_service.writer_closed.clone();
         let join_handle = spawn_os_thread("persistence", || {
             if let Err(err) = db_service.run() {
                 error!(target: "engine::persistence", ?err, "Persistence service failed");
@@ -326,6 +571,7 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
 
         PersistenceHandle {
             sender: db_service_tx,
+            writer_closed,
             _service_guard: Arc::new(ServiceGuard(Some(join_handle))),
         }
     }
@@ -336,7 +582,53 @@ impl<T: NodePrimitives> PersistenceHandle<T> {
         &self,
         action: PersistenceAction<T>,
     ) -> Result<(), SendError<PersistenceAction<T>>> {
+        if action.mutates_canonical_storage() && self.writer_closed.load(Ordering::Acquire) {
+            return Err(SendError(action));
+        }
         self.sender.send(action)
+    }
+
+    /// Acquire a FIFO persistence barrier for an engine-owned operation.
+    ///
+    /// The bounded acknowledgement follows all earlier action work, including pruning and
+    /// safe/finalized metadata commits. No deferred mutation queue is created. The existing
+    /// service ingress is unchanged; actions already queued behind acquisition are refused.
+    /// This low-level identifier is not a release capability: only the engine actor owns it.
+    pub(crate) fn acquire_release_fence(
+        &self,
+        id: u64,
+        expected: BlockNumHash,
+    ) -> crossbeam_channel::Receiver<Result<(), ReleaseFenceError>> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if self
+            .send_action(PersistenceAction::ReleaseFence(PersistenceReleaseFenceRequest {
+                operation: ReleaseFenceOperation::Acquire { id, expected },
+                tx: tx.clone(),
+            }))
+            .is_err()
+        {
+            let _ = tx.try_send(Err(ReleaseFenceError::Unavailable));
+        }
+        rx
+    }
+
+    /// Release only the active matching writer operation. Dropping this receiver does not
+    /// cancel the explicit release. The engine must treat a lost reply as an uncertain outcome.
+    pub(crate) fn release_release_fence(
+        &self,
+        id: u64,
+    ) -> crossbeam_channel::Receiver<Result<(), ReleaseFenceError>> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if self
+            .send_action(PersistenceAction::ReleaseFence(PersistenceReleaseFenceRequest {
+                operation: ReleaseFenceOperation::Release { id },
+                tx: tx.clone(),
+            }))
+            .is_err()
+        {
+            let _ = tx.try_send(Err(ReleaseFenceError::Unavailable));
+        }
+        rx
     }
 
     /// Tells the persistence service to advance its block-data and state/trie frontiers.
@@ -456,6 +748,207 @@ mod tests {
     }
 
     #[test]
+    fn test_release_fence_waits_for_pruning_and_refuses_queued_writes() {
+        use reth_provider::BlockNumReader;
+
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        let provider = create_test_provider_factory().with_bal_store(BalStoreHandle::new(
+            BlockingPruneBalStore { entered: entered_tx, resume: resume_rx },
+        ));
+        init_genesis(&provider).unwrap();
+        let (_finished_tx, finished_rx) = tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let pruner = Pruner::new_with_factory(provider.clone(), vec![], 0, 0, None, finished_rx);
+        let (metrics_tx, _metrics_rx) = unbounded_channel();
+        let handle =
+            PersistenceHandle::<EthPrimitives>::spawn_service(provider.clone(), pruner, metrics_tx);
+        let mut builder = TestBlockBuilder::eth();
+        let blocks = builder.get_executed_blocks(1..2).collect::<Vec<_>>();
+        let expected = blocks.last().unwrap().recovered_block().num_hash();
+        let (save_tx, save_rx) = crossbeam_channel::bounded(1);
+        handle.save_blocks(full_save_input(blocks), save_tx).unwrap();
+        assert_eq!(save_rx.recv_timeout(Duration::from_secs(10)).unwrap().last_block, expected);
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // SaveBlocks already replied, but the writer is still inside BAL pruning.
+        let acquire = handle.acquire_release_fence(7, expected);
+        let (later_save_tx, later_save_rx) = crossbeam_channel::bounded(1);
+        handle
+            .save_blocks(
+                full_save_input(builder.get_executed_blocks(2..3).collect()),
+                later_save_tx,
+            )
+            .unwrap();
+        let (remove_tx, remove_rx) = crossbeam_channel::bounded(1);
+        handle.remove_blocks_above(0, remove_tx).unwrap();
+        assert_eq!(
+            acquire.recv_timeout(Duration::from_millis(50)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        resume_tx.send(()).unwrap();
+        assert_eq!(acquire.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(()));
+        assert_eq!(
+            later_save_rx.recv_timeout(Duration::from_secs(10)).unwrap_err(),
+            crossbeam_channel::RecvTimeoutError::Disconnected
+        );
+        assert_eq!(
+            remove_rx.recv_timeout(Duration::from_secs(10)).unwrap_err(),
+            crossbeam_channel::RecvTimeoutError::Disconnected
+        );
+        let db = provider.provider().unwrap();
+        assert_eq!(db.best_block_number().unwrap(), expected.number);
+        assert_eq!(db.block_hash(expected.number).unwrap(), Some(expected.hash));
+        drop(db);
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        assert!(handle.clone().remove_blocks_above(0, tx).is_err());
+        assert!(handle
+            .release_release_fence(8)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            handle.release_release_fence(7).recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle.remove_blocks_above(0, tx).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap().last_block.number, 0);
+        assert_eq!(provider.provider().unwrap().best_block_number().unwrap(), 0);
+    }
+
+    #[derive(Debug)]
+    struct BlockingPruneBalStore {
+        entered: CrossbeamSender<()>,
+        resume: crossbeam_channel::Receiver<()>,
+    }
+
+    impl BalStore for BlockingPruneBalStore {
+        fn insert(&self, _num_hash: NumHash, _bal: RawBal) -> ProviderResult<()> {
+            Ok(())
+        }
+        fn prune(&self, _tip: BlockNumber) -> ProviderResult<usize> {
+            self.entered.send(()).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(0)
+        }
+        fn get_by_hashes(&self, hashes: &[BlockHash]) -> ProviderResult<Vec<Option<Bytes>>> {
+            Ok(vec![None; hashes.len()])
+        }
+    }
+
+    #[test]
+    fn test_release_fence_flushes_metadata_and_cancel_does_not_release() {
+        use reth_provider::ChainStateBlockReader;
+
+        let provider = create_test_provider_factory();
+        init_genesis(&provider).unwrap();
+        let (_finished_tx, finished_rx) = tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let pruner = Pruner::new_with_factory(provider.clone(), vec![], 5, 0, None, finished_rx);
+        let (metrics_tx, _metrics_rx) = unbounded_channel();
+        let handle =
+            PersistenceHandle::<EthPrimitives>::spawn_service(provider.clone(), pruner, metrics_tx);
+        let blocks = TestBlockBuilder::eth().get_executed_blocks(1..2).collect::<Vec<_>>();
+        let expected = blocks.last().unwrap().recovered_block().num_hash();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle.save_blocks(full_save_input(blocks), tx).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        handle.save_safe_block_number(1).unwrap();
+        handle.save_finalized_block_number(0).unwrap();
+        drop(handle.acquire_release_fence(11, expected));
+        // FIFO control reply proves the cancelled acquisition has been processed.
+        assert!(handle
+            .acquire_release_fence(12, expected)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        let db = provider.provider().unwrap();
+        assert_eq!(db.last_safe_block_number().unwrap(), Some(1));
+        assert_eq!(db.last_finalized_block_number().unwrap(), Some(0));
+        drop(db);
+        assert!(handle.save_safe_block_number(0).is_err());
+        assert_eq!(
+            handle.release_release_fence(11).recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+        assert!(handle
+            .release_release_fence(11)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn test_release_fence_checks_exact_persisted_head_and_pending_metadata() {
+        let handle = default_persistence_handle();
+        let blocks = TestBlockBuilder::eth().get_executed_blocks(1..2).collect::<Vec<_>>();
+        let expected = blocks.last().unwrap().recovered_block().num_hash();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle.save_blocks(full_save_input(blocks), tx).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let wrong_hash = BlockNumHash::new(expected.number, B256::random());
+        assert!(handle
+            .acquire_release_fence(1, wrong_hash)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        let ancestor = BlockNumHash::new(0, B256::random());
+        assert!(handle
+            .acquire_release_fence(2, ancestor)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        handle.save_safe_block_number(expected.number + 1).unwrap();
+        assert_eq!(
+            handle
+                .acquire_release_fence(3, expected)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Err(ReleaseFenceError::PendingMetadataAhead)
+        );
+        handle.save_safe_block_number(expected.number).unwrap();
+        assert_eq!(
+            handle
+                .acquire_release_fence(4, expected)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(
+            handle.release_release_fence(4).recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_release_fence_refuses_after_pruner_fault() {
+        let provider = create_test_provider_factory()
+            .with_bal_store(BalStoreHandle::new(FailingPruneBalStore));
+        init_genesis(&provider).unwrap();
+        let (_finished_tx, finished_rx) = tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let pruner = Pruner::new_with_factory(provider.clone(), vec![], 0, 0, None, finished_rx);
+        let (metrics_tx, _metrics_rx) = unbounded_channel();
+        let handle =
+            PersistenceHandle::<EthPrimitives>::spawn_service(provider, pruner, metrics_tx);
+        let blocks = TestBlockBuilder::eth().get_executed_blocks(1..2).collect::<Vec<_>>();
+        let expected = blocks.last().unwrap().recovered_block().num_hash();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle.save_blocks(full_save_input(blocks), tx).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(handle
+            .acquire_release_fence(1, expected)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        assert!(handle
+            .release_release_fence(1)
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        assert!(handle.remove_blocks_above(0, tx).is_err());
+    }
+
+    #[test]
     fn test_pruner_prunes_bal_store() {
         reth_tracing::init_test_tracing();
 
@@ -490,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pruner_ignores_bal_store_prune_error() {
+    fn test_pruner_retains_bal_store_prune_error_for_release_fence() {
         reth_tracing::init_test_tracing();
 
         let provider = create_test_provider_factory()
@@ -504,6 +997,8 @@ mod tests {
         let mut service = PersistenceService::new(provider, db_service_rx, pruner, sync_metrics_tx);
 
         service.maybe_run_pruner(2).unwrap();
+        assert!(matches!(service.release_fence_fault, Some(ReleaseFenceError::Storage(_))));
+        assert!(matches!(service.maybe_run_pruner(3), Err(PersistenceError::ReleaseFenceClosed)));
     }
 
     #[test]

@@ -108,6 +108,8 @@ pub mod metrics;
 pub mod persistence;
 /// Support for interacting with the blockchain tree.
 pub mod tree;
+/// Actor-owned canonical publication and randomness-release exclusion.
+pub mod writer_fence;
 
 /// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]

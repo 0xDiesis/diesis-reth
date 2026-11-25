@@ -3,7 +3,10 @@
 use crate::{
     common::{Attached, LaunchContextWith, WithConfigs},
     hooks::NodeHooks,
-    rpc::{EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, RethRpcAddOns, RpcHandle},
+    rpc::{
+        EngineShutdown, EngineValidatorAddOn, EngineValidatorBuilder, ExecutedBlockInsertRequest,
+        ExecutedBlockInsertSender, RethRpcAddOns, RpcHandle,
+    },
     setup::build_networked_pipeline,
     sync::{BackfillClientFor, BackfillContext, BackfillSyncBuilder, PipelineBackfill},
     AddOns, AddOnsContext, FullNode, LaunchContext, LaunchNode, Node, NodeAdapter,
@@ -19,6 +22,7 @@ use reth_engine_tree::{
     engine::{EngineApiKind, EngineApiRequest, EngineRequestHandler},
     launch::EngineOrchestratorBuilder,
     tree::TreeConfig,
+    writer_fence::WriterFenceBootstrap,
 };
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
@@ -48,6 +52,11 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+const DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY: usize = 64;
+
+/// Journal file name of the engine writer release fence inside the node data directory.
+const WRITER_FENCE_JOURNAL_NAME: &str = "engine-writer-release-fence";
+
 /// The engine node launcher.
 ///
 /// `B` builds the engine's backfill, the staged pipeline unless set with
@@ -63,6 +72,33 @@ pub struct EngineNodeLauncher<B = PipelineBackfill> {
 
     // Builds the backfill the engine runs while far behind the chain.
     backfill: B,
+    /// Optional already reconciled writer-fence bootstrap supplied by trusted node startup.
+    writer_fence_bootstrap: Option<WriterFenceBootstrap>,
+}
+
+/// Consume a supplied bootstrap only when it retains the exact launcher journal path and is
+/// still the exact Clean record under its retained lock and directory identity; otherwise
+/// perform the default clean-only acquisition.
+fn accept_writer_fence_bootstrap(
+    supplied: Option<WriterFenceBootstrap>,
+    expected: std::path::PathBuf,
+) -> Result<WriterFenceBootstrap, reth_engine_tree::writer_fence::WriterFenceError> {
+    match supplied {
+        None => WriterFenceBootstrap::acquire(expected),
+        Some(bootstrap) => {
+            if bootstrap.journal_path() != expected {
+                return Err(reth_engine_tree::writer_fence::WriterFenceError::Journal {
+                    message: format!(
+                        "supplied writer-fence bootstrap path {} differs from launcher path {}",
+                        bootstrap.journal_path().display(),
+                        expected.display()
+                    ),
+                })
+            }
+            bootstrap.recheck_clean()?;
+            Ok(bootstrap)
+        }
+    }
 }
 
 impl EngineNodeLauncher {
@@ -76,11 +112,23 @@ impl EngineNodeLauncher {
             ctx: LaunchContext::new(task_executor, data_dir),
             engine_tree_config,
             backfill: PipelineBackfill,
+            writer_fence_bootstrap: None,
         }
+    }
+
+    /// Exact writer-fence journal path for a node data directory.
+    pub fn writer_fence_journal_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+        data_dir.join(WRITER_FENCE_JOURNAL_NAME)
     }
 }
 
 impl<B> EngineNodeLauncher<B> {
+    /// Use a writer bootstrap already reconciled for this node data directory.
+    pub fn with_writer_fence_bootstrap(mut self, bootstrap: WriterFenceBootstrap) -> Self {
+        self.writer_fence_bootstrap = Some(bootstrap);
+        self
+    }
+
     async fn launch_node<N, DB, T, CB, AO>(
         self,
         target: NodeBuilderWithComponents<T, CB, AO>,
@@ -98,7 +146,15 @@ impl<B> EngineNodeLauncher<B> {
             + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
         B: BackfillSyncBuilder<NodeTypesWithDBAdapter<N, DB>, BackfillClientFor<T, CB::Components>>,
     {
-        let Self { ctx, engine_tree_config, mut backfill } = self;
+        let Self { ctx, engine_tree_config, mut backfill, writer_fence_bootstrap } = self;
+        // Acquire and inspect the durable release journal before genesis initialization, static
+        // file movement, component startup, or any other writer in this launch path. A supplied
+        // reconciled bootstrap is consumed only for this exact path after a fresh Clean recheck.
+        let require_tagged_forkchoice = writer_fence_bootstrap.is_some();
+        let writer_fence_bootstrap = accept_writer_fence_bootstrap(
+            writer_fence_bootstrap,
+            EngineNodeLauncher::writer_fence_journal_path(&ctx.data_dir.data_dir()),
+        )?;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             rocksdb_provider,
@@ -266,6 +322,10 @@ impl<B> EngineNodeLauncher<B> {
             // during this run.
             .maybe_store_messages(node_config.debug.engine_api_store.clone());
 
+        // Shared persisted-head counter. Written by the engine tree handler on persistence
+        // completion and read by Diesis consumers to gate overlay eviction.
+        let persisted_head = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let engine_kind = if ctx.chain_spec().is_optimism() {
             EngineApiKind::OpStack
         } else {
@@ -274,7 +334,7 @@ impl<B> EngineNodeLauncher<B> {
 
         let (backfill_client, backfill_factory) =
             (network_client.clone(), ctx.provider_factory().clone());
-        let mut orchestrator = EngineOrchestratorBuilder {
+        let (mut orchestrator, writer_fence_handle) = EngineOrchestratorBuilder {
             engine_kind,
             consensus,
             client: network_client,
@@ -291,6 +351,9 @@ impl<B> EngineNodeLauncher<B> {
             sync_metrics_tx: ctx.sync_metrics_tx(),
             evm_config: ctx.components().evm_config().clone(),
             runtime: ctx.task_executor().clone(),
+            persisted_head_notifier: Arc::clone(&persisted_head),
+            writer_fence_bootstrap,
+            require_tagged_forkchoice,
         }
         .build_with_backfill(|pipeline, runtime| {
             backfill.build(BackfillContext::new(
@@ -327,6 +390,9 @@ impl<B> EngineNodeLauncher<B> {
             engine_events,
             beacon_engine_handle,
             engine_shutdown: _,
+            executed_block_tx: _,
+            persisted_head: _,
+            writer_fence: _,
         } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Create engine shutdown handle
@@ -334,6 +400,12 @@ impl<B> EngineNodeLauncher<B> {
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target(disabled_stages)?;
+        let initial_backfill_permit = if initial_target.is_some() {
+            Some(writer_fence_handle.reserve_backfill_start().await?)
+        } else {
+            writer_fence_handle.open_qualified_ingress().await?;
+            None
+        };
         let mut built_payloads = ctx
             .components()
             .payload_builder_handle()
@@ -349,18 +421,37 @@ impl<B> EngineNodeLauncher<B> {
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
         let startup_sync_state_idle = ctx.node_config().debug.startup_sync_state_idle;
 
+        // Channel for typed direct executed-block admission from the Diesis pipeline. The
+        // acknowledgement proves only engine-tree admission; forkchoice and persistence remain
+        // separate. Created outside the async block so the sender can be exposed on RpcHandle.
+        let (executed_block_ingress_tx, executed_block_rx) =
+            tokio::sync::mpsc::channel::<
+                ExecutedBlockInsertRequest<<T::Types as reth_node_api::NodeTypes>::Primitives>,
+            >(DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        let executed_block_tx = ExecutedBlockInsertSender::new(
+            executed_block_ingress_tx,
+            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        );
+
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus_engine = move |mut on_graceful_shutdown| async move {
+            let mut res = Ok(());
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
                 // network_handle's sync state is already initialized at Syncing
-                orchestrator.start_backfill_sync(initial_target);
+                if let Err(error) = orchestrator.start_backfill_sync(
+                    initial_target,
+                    initial_backfill_permit.expect("permit reserved with startup target"),
+                ) {
+                    let _ = exit.send(Err(eyre::eyre!(error)));
+                    return
+                }
             } else if startup_sync_state_idle {
                 network_handle.update_sync_state(SyncState::Idle);
             }
 
-            let mut res = Ok(());
             let mut shutdown_rx = shutdown_rx.fuse();
+            let mut executed_block_rx = executed_block_rx;
 
             // advance the chain and await payloads built locally to add into the engine api
             // tree handler to prevent re-execution if that block is received as payload from
@@ -420,6 +511,17 @@ impl<B> EngineNodeLauncher<B> {
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                         }
                     }
+                    Some(request) = executed_block_rx.recv() => {
+                        debug!(
+                            target: "reth::cli",
+                            identity=?request.identity(),
+                            block=?request.block().recovered_block().num_hash(),
+                            "conditionally inserting pipeline executed block (direct insert)"
+                        );
+                        orchestrator.handler_mut().handler_mut().on_event(
+                            EngineApiRequest::InsertExecutedBlockIfCanonical(request).into()
+                        );
+                    }
                     shutdown_req = &mut shutdown_rx => {
                         if let Ok(req) = shutdown_req {
                             debug!(target: "reth::cli", "received engine shutdown request");
@@ -465,6 +567,9 @@ impl<B> EngineNodeLauncher<B> {
                 engine_events,
                 beacon_engine_handle,
                 engine_shutdown,
+                executed_block_tx: Some(executed_block_tx),
+                persisted_head: std::sync::Arc::clone(&persisted_head),
+                writer_fence: Some(writer_fence_handle),
             },
         };
         // Notify on node started
@@ -482,8 +587,8 @@ impl<B> EngineNodeLauncher<B> {
 
     /// Returns this launcher with the engine's backfill built by `backfill`.
     pub fn with_backfill<B2>(self, backfill: B2) -> EngineNodeLauncher<B2> {
-        let Self { ctx, engine_tree_config, .. } = self;
-        EngineNodeLauncher { ctx, engine_tree_config, backfill }
+        let Self { ctx, engine_tree_config, writer_fence_bootstrap, .. } = self;
+        EngineNodeLauncher { ctx, engine_tree_config, backfill, writer_fence_bootstrap }
     }
 }
 
@@ -508,5 +613,74 @@ where
 
     fn launch_node(self, target: NodeBuilderWithComponents<T, CB, AO>) -> Self::Future {
         Box::pin(self.launch_node(target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        accept_writer_fence_bootstrap, EngineNodeLauncher, ExecutedBlockInsertRequest,
+        ExecutedBlockInsertSender, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+    };
+    use reth_engine_tree::writer_fence::{WriterFenceBootstrap, WriterFenceError};
+
+    #[test]
+    fn supplied_bootstrap_is_consumed_only_at_the_exact_launcher_path() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let expected = EngineNodeLauncher::writer_fence_journal_path(data_dir.path());
+        let bootstrap = WriterFenceBootstrap::acquire(expected.clone()).unwrap();
+        let accepted = accept_writer_fence_bootstrap(Some(bootstrap), expected.clone()).unwrap();
+        assert_eq!(accepted.journal_path(), expected);
+        // The retained owner lock excludes a second clean-only acquisition while consumed.
+        assert!(matches!(
+            WriterFenceBootstrap::acquire(expected.clone()),
+            Err(WriterFenceError::Journal { .. })
+        ));
+        drop(accepted);
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let foreign = WriterFenceBootstrap::acquire(EngineNodeLauncher::writer_fence_journal_path(
+            other_dir.path(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            accept_writer_fence_bootstrap(Some(foreign), expected.clone()),
+            Err(WriterFenceError::Journal { message }) if message.contains("differs from launcher path")
+        ));
+
+        // Default startup keeps clean-only acquisition at the exact path.
+        let default = accept_writer_fence_bootstrap(None, expected.clone()).unwrap();
+        assert_eq!(default.journal_path(), expected);
+    }
+
+    #[test]
+    fn supplied_bootstrap_that_is_no_longer_exactly_clean_is_refused() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let expected = EngineNodeLauncher::writer_fence_journal_path(data_dir.path());
+        let bootstrap = WriterFenceBootstrap::acquire(expected.clone()).unwrap();
+        let clean = std::fs::read(&expected).unwrap();
+        // Any byte change to the retained record, including a corrupt or replaced journal,
+        // must be caught by the consumption-time recheck rather than trusted from earlier.
+        let mut changed = clean.clone();
+        changed[8] = 2;
+        std::fs::write(&expected, &changed).unwrap();
+        assert!(matches!(
+            accept_writer_fence_bootstrap(Some(bootstrap), expected.clone()),
+            Err(WriterFenceError::Journal { .. })
+        ));
+        std::fs::write(&expected, &clean[..clean.len() - 1]).unwrap();
+        let bootstrap = WriterFenceBootstrap::inspect(expected.clone());
+        assert!(matches!(bootstrap, Err(WriterFenceError::Journal { .. })));
+    }
+
+    #[test]
+    fn diesis_executed_block_channel_capacity_is_bounded() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecutedBlockInsertRequest>(
+            DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY,
+        );
+        let sender = ExecutedBlockInsertSender::new(tx, DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+
+        assert_eq!(sender.capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
+        assert_eq!(sender.available_capacity(), DIESIS_EXECUTED_BLOCK_CHANNEL_CAPACITY);
     }
 }

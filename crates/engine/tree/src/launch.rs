@@ -12,6 +12,7 @@ use crate::{
     engine::{EngineApiKind, EngineApiRequest, EngineApiRequestHandler, EngineHandler},
     persistence::PersistenceHandle,
     tree::{EngineApiTreeHandler, EngineValidator, TreeConfig, WaitForCaches},
+    writer_fence::{WriterFenceBootstrap, WriterFenceHandle},
 };
 use futures::Stream;
 use reth_consensus::FullConsensus;
@@ -22,7 +23,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory,
+    ProviderFactory, StorageSettingsCache,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
@@ -42,7 +43,7 @@ pub type EngineOrchestrator<T, N, Client, S, B> = ChainOrchestrator<
 
 // An [`EngineOrchestrator`], or the error its backfill failed to build with.
 type EngineOrchestratorResult<T, N, Client, S, B, E> =
-    Result<EngineOrchestrator<T, N, Client, S, B>, E>;
+    Result<(EngineOrchestrator<T, N, Client, S, B>, WriterFenceHandle<T>), E>;
 
 /// Components needed to build the engine [`ChainOrchestrator`] that drives the chain forward.
 ///
@@ -99,6 +100,12 @@ where
     pub evm_config: C,
     /// Runtime used to spawn engine tree tasks.
     pub runtime: Runtime,
+    /// Latest durable state/trie block observed by the engine.
+    pub persisted_head_notifier: Arc<std::sync::atomic::AtomicU64>,
+    /// Locked and reconciled writer journal.
+    pub writer_fence_bootstrap: WriterFenceBootstrap,
+    /// Require a publication session for forkchoice updates on a Diesis node.
+    pub require_tagged_forkchoice: bool,
 }
 
 impl<N, Client, S, V, C> EngineOrchestratorBuilder<N, Client, S, V, C>
@@ -114,7 +121,10 @@ where
     /// Spawns the engine services and returns the [`ChainOrchestrator`] driving them.
     pub fn build(
         self,
-    ) -> EngineOrchestrator<N::Payload, N::Primitives, Client, S, PipelineSync<N>> {
+    ) -> (
+        EngineOrchestrator<N::Payload, N::Primitives, Client, S, PipelineSync<N>>,
+        WriterFenceHandle<N::Payload>,
+    ) {
         let Ok(orchestrator) = self.build_with_backfill(|pipeline, runtime| {
             Ok::<_, Infallible>(PipelineSync::new(pipeline, runtime))
         });
@@ -146,17 +156,21 @@ where
             sync_metrics_tx,
             evm_config,
             runtime,
+            persisted_head_notifier,
+            writer_fence_bootstrap,
+            require_tagged_forkchoice,
         } = self;
 
         let backfill_sync = backfill(pipeline, pipeline_task_spawner)?;
         let downloader = BasicBlockDownloader::new(client, consensus.clone());
 
+        let use_hashed_state = provider.cached_storage_settings().use_hashed_state();
         let persistence_handle =
             PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
 
         let canonical_in_memory_state = blockchain_db.canonical_in_memory_state();
 
-        let (to_tree_tx, from_tree) = EngineApiTreeHandler::spawn_new(
+        let (to_tree_tx, from_tree, writer_fence) = EngineApiTreeHandler::spawn_new(
             blockchain_db,
             consensus,
             payload_validator,
@@ -168,11 +182,20 @@ where
             engine_kind,
             evm_config,
             runtime,
+            use_hashed_state,
+            persisted_head_notifier,
+            writer_fence_bootstrap,
+            require_tagged_forkchoice,
         );
 
         let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
         let handler = EngineHandler::new(engine_handler, downloader, incoming_requests);
 
-        Ok(ChainOrchestrator::new(handler, backfill_sync))
+        let writer_fence_actor = writer_fence.actor();
+        Ok((
+            ChainOrchestrator::new(handler, backfill_sync)
+                .with_writer_fence_actor(writer_fence_actor),
+            writer_fence,
+        ))
     }
 }

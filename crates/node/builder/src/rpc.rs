@@ -4,8 +4,22 @@ pub use jsonrpsee::{
     core::middleware::layer::Either,
     server::middleware::rpc::{RpcService, RpcServiceBuilder},
 };
+#[cfg(feature = "test-utils")]
+pub use reth_engine_tree::tree::release_harness::{JoinedHarness, JoinedRestart};
 use reth_engine_tree::tree::WaitForCaches;
-pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
+pub use reth_engine_tree::{
+    engine::{
+        DirectInsertBlockIdentity, ExecutedBlockAdmissionOutcome, ExecutedBlockInsertError,
+        ExecutedBlockInsertRequest, ExecutedBlockInsertSender,
+    },
+    tree::{BasicEngineValidator, EngineValidator},
+    writer_fence::{
+        AbortableRelease, ArmedRelease, LocalReleaseRecovery, PendingReleaseRecovery,
+        PublicationSession, ReleaseBinding, ReleaseFenceReceipt, ReleaseRecoveryPhase,
+        ReleaseRecoveryQuery, ReleaseRecoverySource, WriterFenceBootstrap, WriterFenceError,
+        WriterFenceHandle, WriterFenceStartup,
+    },
+};
 pub use reth_rpc_builder::{
     middleware::{RethAuthHttpMiddleware, RethRpcMiddleware},
     Identity, Stack,
@@ -357,6 +371,17 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
     /// Handle to trigger engine shutdown.
     pub engine_shutdown: EngineShutdown,
+    /// Optional bounded sender for conditional direct insertion into the engine tree, bypassing
+    /// `new_payload` re-execution. Its high-level API retains capacity across both internal queues
+    /// and returns a typed admission outcome. `Admitted` only proves tree admission; forkchoice
+    /// and persistence remain separate operations.
+    pub executed_block_tx:
+        Option<ExecutedBlockInsertSender<<Node::Types as NodeTypes>::Primitives>>,
+    /// Latest block number through which state and trie data are durable.
+    /// The Diesis pipeline uses this frontier to decide when it can evict overlays.
+    pub persisted_head: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Actor-bound capability for tagged canonical publication and randomness release exclusion.
+    pub writer_fence: Option<WriterFenceHandle<<Node::Types as NodeTypes>::Payload>>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -367,6 +392,9 @@ impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, Et
             engine_events: self.engine_events.clone(),
             beacon_engine_handle: self.beacon_engine_handle.clone(),
             engine_shutdown: self.engine_shutdown.clone(),
+            executed_block_tx: self.executed_block_tx.clone(),
+            persisted_head: self.persisted_head.clone(),
+            writer_fence: self.writer_fence.clone(),
         }
     }
 }
@@ -1131,6 +1159,9 @@ where
             engine_events,
             beacon_engine_handle: engine_handle,
             engine_shutdown: EngineShutdown::default(),
+            executed_block_tx: None,
+            persisted_head: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writer_fence: None,
         })
     }
 
