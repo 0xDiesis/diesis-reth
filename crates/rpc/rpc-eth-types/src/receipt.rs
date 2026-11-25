@@ -1,22 +1,27 @@
 //! RPC receipt response builder, extends a layer one receipt with layer two data.
 
 use crate::EthApiError;
-use alloy_consensus::{ReceiptEnvelope, Transaction};
+use alloy_consensus::{ReceiptEnvelope, Transaction, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, TxKind};
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
 use reth_chainspec::EthChainSpec;
-use reth_ethereum_primitives::Receipt;
+use reth_ethereum_primitives::{DiesisTxType, Receipt};
 use reth_primitives_traits::{NodePrimitives, SealedHeaderFor, TransactionMeta};
 use reth_rpc_convert::transaction::{ConvertReceiptInput, ReceiptConverter};
 use std::sync::Arc;
 
 /// Builds an [`TransactionReceipt`] obtaining the inner receipt envelope from the given closure.
+///
+/// The closure is fallible so chain-specific receipt types without an
+/// Ethereum envelope representation (e.g. Diesis ML-DSA `0x70` receipts) can
+/// surface a typed RPC error instead of panicking on data that legitimately
+/// appears in canonical blocks.
 pub fn build_receipt<N, E>(
     input: ConvertReceiptInput<'_, N>,
     blob_params: Option<BlobParams>,
-    build_rpc_receipt: impl FnOnce(N::Receipt, usize, TransactionMeta) -> E,
-) -> TransactionReceipt<E>
+    build_rpc_receipt: impl FnOnce(N::Receipt, usize, TransactionMeta) -> Result<E, EthApiError>,
+) -> Result<TransactionReceipt<E>, EthApiError>
 where
     N: NodePrimitives,
 {
@@ -33,8 +38,8 @@ where
         TxKind::Call(addr) => (None, Some(Address(*addr))),
     };
 
-    TransactionReceipt {
-        inner: build_rpc_receipt(receipt, next_log_index, meta),
+    Ok(TransactionReceipt {
+        inner: build_rpc_receipt(receipt, next_log_index, meta)?,
         transaction_hash: meta.tx_hash,
         transaction_index: Some(meta.index),
         block_hash: Some(meta.block_hash),
@@ -47,14 +52,14 @@ where
         // EIP-4844 fields
         blob_gas_price,
         blob_gas_used,
-    }
+    })
 }
 
 /// Converter for Ethereum receipts.
 #[derive(derive_more::Debug)]
 pub struct EthReceiptConverter<
     ChainSpec,
-    Builder = fn(Receipt, usize, TransactionMeta) -> ReceiptEnvelope<Log>,
+    Builder = fn(Receipt, usize, TransactionMeta) -> Result<ReceiptEnvelope<Log>, EthApiError>,
 > {
     chain_spec: Arc<ChainSpec>,
     #[debug(skip)]
@@ -76,28 +81,7 @@ where
 impl<ChainSpec> EthReceiptConverter<ChainSpec> {
     /// Creates a new converter with the given chain spec.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self {
-            chain_spec,
-            build_rpc_receipt: |receipt: Receipt, next_log_index, meta: TransactionMeta| {
-                let mut log_index = next_log_index;
-                receipt
-                    .map_logs(|log| {
-                        let idx = log_index;
-                        log_index += 1;
-                        Log {
-                            inner: log,
-                            block_hash: Some(meta.block_hash),
-                            block_number: Some(meta.block_number),
-                            block_timestamp: Some(meta.timestamp),
-                            transaction_hash: Some(meta.tx_hash),
-                            transaction_index: Some(meta.index),
-                            log_index: Some(idx as u64),
-                            removed: false,
-                        }
-                    })
-                    .into()
-            },
-        }
+        Self { chain_spec, build_rpc_receipt: build_ethereum_receipt_envelope }
     }
 
     /// Sets new builder for the converter.
@@ -109,11 +93,48 @@ impl<ChainSpec> EthReceiptConverter<ChainSpec> {
     }
 }
 
+fn build_ethereum_receipt_envelope(
+    receipt: Receipt,
+    next_log_index: usize,
+    meta: TransactionMeta,
+) -> Result<ReceiptEnvelope<Log>, EthApiError> {
+    let mut log_index = next_log_index;
+    let tx_type = receipt.tx_type;
+    let receipt = receipt
+        .map_logs(|log| {
+            let idx = log_index;
+            log_index += 1;
+            Log {
+                inner: log,
+                block_hash: Some(meta.block_hash),
+                block_number: Some(meta.block_number),
+                block_timestamp: Some(meta.timestamp),
+                transaction_hash: Some(meta.tx_hash),
+                transaction_index: Some(meta.index),
+                log_index: Some(idx as u64),
+                removed: false,
+            }
+        })
+        .into_with_bloom()
+        .map_receipt(Into::into);
+
+    match tx_type {
+        DiesisTxType::Legacy => Ok(ReceiptEnvelope::Legacy(receipt)),
+        DiesisTxType::Eip2930 => Ok(ReceiptEnvelope::Eip2930(receipt)),
+        DiesisTxType::Eip1559 => Ok(ReceiptEnvelope::Eip1559(receipt)),
+        DiesisTxType::Eip4844 => Ok(ReceiptEnvelope::Eip4844(receipt)),
+        DiesisTxType::Eip7702 => Ok(ReceiptEnvelope::Eip7702(receipt)),
+        DiesisTxType::MlDsa => Err(EthApiError::Unsupported(
+            "MlDsa receipts cannot be converted to Ethereum receipt envelopes",
+        )),
+    }
+}
+
 impl<N, ChainSpec, Builder, Rpc> ReceiptConverter<N> for EthReceiptConverter<ChainSpec, Builder>
 where
     N: NodePrimitives,
     ChainSpec: EthChainSpec + 'static,
-    Builder: Fn(N::Receipt, usize, TransactionMeta) -> Rpc + 'static,
+    Builder: Fn(N::Receipt, usize, TransactionMeta) -> Result<Rpc, EthApiError> + 'static,
 {
     type RpcReceipt = TransactionReceipt<Rpc>;
     type RpcLog = Log;
@@ -138,9 +159,39 @@ where
             .and_then(|input| self.chain_spec.blob_params_at_timestamp(input.meta.timestamp));
 
         for input in inputs {
-            receipts.push(build_receipt(input, blob_params, &self.build_rpc_receipt));
+            receipts.push(build_receipt(input, blob_params, &self.build_rpc_receipt)?);
         }
 
         Ok(receipts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::B256;
+
+    use super::*;
+
+    #[test]
+    fn ml_dsa_receipt_returns_typed_unsupported_error() {
+        let receipt = Receipt {
+            tx_type: DiesisTxType::MlDsa,
+            cumulative_gas_used: 21_000,
+            logs: Vec::new(),
+            success: true,
+        };
+        let meta = TransactionMeta {
+            tx_hash: B256::repeat_byte(0x11),
+            index: 0,
+            block_hash: B256::repeat_byte(0x22),
+            block_number: 1,
+            base_fee: Some(1),
+            excess_blob_gas: None,
+            timestamp: 1,
+        };
+
+        let error = build_ethereum_receipt_envelope(receipt, 0, meta)
+            .expect_err("ML-DSA must not be mislabeled as an Ethereum receipt envelope");
+        assert!(matches!(error, EthApiError::Unsupported(_)));
     }
 }

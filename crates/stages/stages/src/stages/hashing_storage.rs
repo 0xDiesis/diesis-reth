@@ -279,6 +279,7 @@ mod tests {
         stage_test_suite_ext, ExecuteStageTestRunner, StageTestRunner, TestRunnerError,
         TestStageDB, UnwindStageTestRunner,
     };
+    use alloy_consensus::transaction::TxHashRef;
     use alloy_primitives::{Address, U256};
     use assert_matches::assert_matches;
     use rand::Rng;

@@ -92,6 +92,10 @@ where
         &self.block_assembler
     }
 
+    fn supports_transaction_type(&self, ty: u8) -> bool {
+        self.inner.supports_transaction_type(ty)
+    }
+
     fn with_jit_support_enabled(self, enabled: bool) -> Self {
         Self::new(self.inner.with_jit_support_enabled(enabled))
     }
@@ -178,7 +182,7 @@ where
         let convert = |tx: Bytes| {
             let tx = TransactionSigned::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
             let signer = tx.try_recover().map_err(AnyError::new)?;
-            Ok::<_, AnyError>(ExecutableRecoveredTx::new(tx.with_signer(signer)))
+            ExecutableRecoveredTx::try_new(tx.with_signer(signer)).map_err(AnyError::new)
         };
 
         Ok((transactions, convert))

@@ -24,7 +24,7 @@ use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, NextBlockEnvAttributes, SenderRe
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 
 #[cfg(feature = "std")]
-use alloy_consensus::Transaction;
+use alloy_consensus::{transaction::TransactionEnvelope, Transaction};
 #[cfg(feature = "std")]
 use alloy_eips::Decodable2718;
 #[cfg(feature = "std")]
@@ -486,6 +486,11 @@ where
         })
     }
 
+    fn supports_transaction_type(&self, ty: u8) -> bool {
+        ty != reth_ethereum_primitives::ML_DSA_TX_TYPE_ID ||
+            TypeId::of::<EvmF>() != TypeId::of::<factory::RethEvmFactory>()
+    }
+
     fn reuses_prewarm_results(&self) -> bool {
         // Custom factories may change transaction validation or read state outside the database.
         let factory = TypeId::of::<EvmF>();
@@ -581,7 +586,7 @@ where
                 tx.try_recover()
             }
             .map_err(AnyError::new)?;
-            Ok::<_, AnyError>(ExecutableRecoveredTx::new(tx.with_signer(signer)))
+            ExecutableRecoveredTx::try_new(tx.with_signer(signer)).map_err(AnyError::new)
         };
 
         Ok((txs, convert))

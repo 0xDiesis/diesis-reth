@@ -1024,6 +1024,7 @@ mod tests {
         BlockHashReader, BlockNumReader, BlockWriter, DBProvider, HeaderSyncGapProvider,
         PruneCheckpointWriter, StageCheckpointWriter, TransactionsProvider,
     };
+    use alloy_consensus::transaction::TxHashRef;
     use alloy_eips::BlockNumHash;
     use alloy_primitives::{TxNumber, B256};
     use assert_matches::assert_matches;

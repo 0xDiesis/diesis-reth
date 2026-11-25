@@ -666,6 +666,11 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         Ok(executor.into_state())
     }
 
+    /// Whether this EVM accepts a transaction type before constructing its transaction environment.
+    fn supports_transaction_type(&self, _ty: u8) -> bool {
+        true
+    }
+
     /// Returns whether engine validation may commit transaction results from speculative prewarm
     /// execution instead of executing the transactions again.
     ///

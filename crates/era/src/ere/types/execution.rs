@@ -819,13 +819,13 @@ mod tests {
         // post-state root, proving a single `SlimReceipt` type round-trips across forks.
         let receipts = vec![
             SlimReceipt {
-                tx_type: TxType::Eip1559,
+                tx_type: alloy_consensus::TxType::Eip1559,
                 status: Eip658Value::Eip658(true),
                 cumulative_gas_used: 21000,
                 logs: vec![],
             },
             SlimReceipt {
-                tx_type: TxType::Legacy,
+                tx_type: alloy_consensus::TxType::Legacy,
                 status: Eip658Value::PostState(B256::repeat_byte(0xab)),
                 cumulative_gas_used: 42000,
                 logs: vec![],

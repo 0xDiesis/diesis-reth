@@ -740,10 +740,9 @@ pub(super) mod serde_bincode_compat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxType;
     use alloy_primitives::{map::HashMap, Address, B256};
     use evm2::evm::AccountInfo;
-    use reth_ethereum_primitives::Receipt;
+    use reth_ethereum_primitives::{Receipt, TxType};
     use reth_trie_common::bundle_state::BundleState;
 
     #[test]

@@ -765,7 +765,7 @@ mod tests {
 
     fn converted_tx() -> TestTx {
         TestTx::new(reth_primitives_traits::Recovered::new_unchecked(
-            reth_ethereum_primitives::TransactionSigned::Legacy(
+            reth_ethereum_primitives::TransactionSigned::from(
                 alloy_consensus::Signed::new_unchecked(
                     alloy_consensus::TxLegacy::default(),
                     alloy_primitives::Signature::test_signature(),

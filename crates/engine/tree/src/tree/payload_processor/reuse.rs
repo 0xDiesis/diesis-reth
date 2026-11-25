@@ -1106,7 +1106,10 @@ impl<T: EvmTypes> Inspector<T> for BalanceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{transaction::Recovered, TxEip1559, TxLegacy};
+    use alloy_consensus::{
+        transaction::{Recovered, TxHashRef},
+        TxEip1559, TxLegacy,
+    };
     use alloy_primitives::{bytes, Bytes, Signature, TxKind};
     use evm2::{
         evm::{CacheDB, EmptyDB},

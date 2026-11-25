@@ -1,4 +1,3 @@
-use alloy_consensus::{EthereumTxEnvelope, TxEip4844};
 use alloy_eips::{eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, Encodable2718};
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
@@ -7,6 +6,7 @@ use reth_e2e_test_utils::{
     node::Finality, test_chain_spec, test_chain_spec_builder, test_genesis,
     transaction::TransactionTestContext, wait::poll_until, E2ETestSetupExt,
 };
+use reth_ethereum_primitives::TransactionSigned;
 use reth_node_core::args::TxPoolArgs;
 use reth_node_ethereum::EthereumNode;
 use reth_primitives_traits::Recovered;
@@ -95,10 +95,7 @@ async fn maintain_txpool_stale_eviction() -> eyre::Result<()> {
     // create a tx with insufficient gas fee and it will be parked
     let envelop =
         TransactionTestContext::transfer_tx_with_gas_fee(1, Some(8_u128), wallet.inner).await;
-    let tx = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop.clone()),
-        Default::default(),
-    );
+    let tx = Recovered::new_unchecked(TransactionSigned::from(envelop.clone()), Default::default());
     let pooled_tx = EthPooledTransaction::new(tx.clone(), 200);
 
     txpool.add_transaction(TransactionOrigin::External, pooled_tx).await.unwrap();
@@ -146,19 +143,13 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
 
     // build tx1 from wallet1
     let envelop1 = TransactionTestContext::transfer_tx(1, w1.clone()).await;
-    let tx1 = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop1.clone()),
-        w1.address(),
-    );
+    let tx1 = Recovered::new_unchecked(TransactionSigned::from(envelop1.clone()), w1.address());
     let pooled_tx1 = EthPooledTransaction::new(tx1.clone(), 200);
     let tx_hash1 = *pooled_tx1.hash();
 
     // build tx2 from wallet2
     let envelop2 = TransactionTestContext::transfer_tx(1, w2.clone()).await;
-    let tx2 = Recovered::new_unchecked(
-        EthereumTxEnvelope::<TxEip4844>::from(envelop2.clone()),
-        w2.address(),
-    );
+    let tx2 = Recovered::new_unchecked(TransactionSigned::from(envelop2.clone()), w2.address());
     let pooled_tx2 = EthPooledTransaction::new(tx2.clone(), 200);
     let tx_hash2 = *pooled_tx2.hash();
 

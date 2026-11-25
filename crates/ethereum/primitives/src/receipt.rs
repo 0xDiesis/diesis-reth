@@ -1,20 +1,21 @@
-use alloy_consensus::TxType;
 pub use alloy_consensus::{EthereumReceipt, TxTy};
 
+use crate::DiesisTxType;
+
 /// Raw ethereum receipt.
-pub type Receipt<T = TxType> = EthereumReceipt<T>;
+pub type Receipt<T = DiesisTxType> = EthereumReceipt<T>;
 
 #[cfg(feature = "rpc")]
 /// Receipt representation for RPC.
-pub type RpcReceipt<T = TxType> = EthereumReceipt<T, alloy_rpc_types_eth::Log>;
+pub type RpcReceipt<T = DiesisTxType> = EthereumReceipt<T, alloy_rpc_types_eth::Log>;
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
     use crate::TransactionSigned;
-    use alloy_consensus::{ReceiptWithBloom, TxReceipt, TxType};
-    use alloy_eips::eip2718::Encodable2718;
+    use alloy_consensus::{ReceiptWithBloom, TxType};
+    use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_primitives::{
         address, b256, bytes, hex_literal::hex, Address, Bloom, Bytes, Log, LogData,
     };
@@ -23,6 +24,30 @@ mod tests {
     use reth_primitives_traits::proofs::{
         calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
     };
+
+    #[test]
+    fn ml_dsa_receipt_preserves_the_wire_and_compact_encodings() {
+        let receipt = Receipt {
+            tx_type: DiesisTxType::MlDsa,
+            success: true,
+            cumulative_gas_used: 21_000,
+            logs: Vec::new(),
+        };
+        let with_bloom = ReceiptWithBloom { receipt: receipt.clone(), logs_bloom: Bloom::ZERO };
+
+        let mut expected = vec![0x70, 0xf9, 0x01, 0x08, 0x01, 0x82, 0x52, 0x08, 0xb9, 0x01, 0x00];
+        expected.extend([0; 256]);
+        expected.push(0xc0);
+        assert_eq!(with_bloom.encoded_2718(), expected);
+        assert_eq!(ReceiptWithBloom::<Receipt>::decode_2718_exact(&expected).unwrap(), with_bloom);
+
+        let mut compact = Vec::new();
+        receipt.to_compact(&mut compact);
+        assert_eq!(compact, [0x17, 0x70, 0x52, 0x08, 0x00]);
+        let (decoded, remainder) = Receipt::from_compact(&compact, compact.len());
+        assert_eq!(decoded, receipt);
+        assert!(remainder.is_empty());
+    }
 
     /// Ethereum full block.
     ///
@@ -232,10 +257,13 @@ mod tests {
     #[test]
     #[cfg(feature = "rpc")]
     fn test_receipt_serde() {
-        use alloy_consensus::ReceiptEnvelope;
+        // `TxReceipt` provides `into_with_bloom`; it is not otherwise in scope
+        // under the feature set selected when this crate is built alongside
+        // `reth-rpc-eth-types` (feature unification).
+        use alloy_consensus::{ReceiptEnvelope, TxReceipt};
 
         let input = r#"{"status":"0x1","cumulativeGasUsed":"0x175cc0e","logs":[{"address":"0xa18b9ca2a78660d44ab38ae72e72b18792ffe413","topics":["0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0x000000000000000000000000e7e7d8006cbff47bc6ac2dabf592c98e97502708","0x0000000000000000000000007a250d5630b4cf539739df2c5dacb4c659f2488d"],"data":"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","blockHash":"0xbf9e6a368a399f996a0f0b27cab4191c028c3c99f5f76ea08a5b70b961475fcb","blockNumber":"0x164b59f","blockTimestamp":"0x68c9a713","transactionHash":"0x533aa9e57865675bb94f41aa2895c0ac81eee69686c77af16149c301e19805f1","transactionIndex":"0x14d","logIndex":"0x238","removed":false}],"logsBloom":"0x00000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000400000040000000000000004000000000000000000000000000000000000000000000020000000000000000000000000080000000000000000000000000200000020000000000000000000000000000000000000000000000000000000000000020000010000000000000000000000000000000000000000000000000000000000000","type":"0x2","transactionHash":"0x533aa9e57865675bb94f41aa2895c0ac81eee69686c77af16149c301e19805f1","transactionIndex":"0x14d","blockHash":"0xbf9e6a368a399f996a0f0b27cab4191c028c3c99f5f76ea08a5b70b961475fcb","blockNumber":"0x164b59f","gasUsed":"0xb607","effectiveGasPrice":"0x4a3ee768","from":"0xe7e7d8006cbff47bc6ac2dabf592c98e97502708","to":"0xa18b9ca2a78660d44ab38ae72e72b18792ffe413","contractAddress":null}"#;
-        let receipt: RpcReceipt = serde_json::from_str(input).unwrap();
+        let receipt: RpcReceipt<TxType> = serde_json::from_str(input).unwrap();
         let envelope: ReceiptEnvelope<alloy_rpc_types_eth::Log> =
             serde_json::from_str(input).unwrap();
 

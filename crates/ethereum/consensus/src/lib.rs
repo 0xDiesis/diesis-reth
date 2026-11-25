@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use alloc::{fmt::Debug, sync::Arc};
-use alloy_consensus::{constants::MAXIMUM_EXTRA_DATA_SIZE, EMPTY_OMMER_ROOT_HASH};
+use alloy_consensus::{constants::MAXIMUM_EXTRA_DATA_SIZE, Typed2718, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -29,7 +29,7 @@ use reth_consensus_common::validation::{
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
-    Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+    Block, BlockBody, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
 
 mod validation;
@@ -151,10 +151,12 @@ where
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), ConsensusError> {
+        reject_diesis_transactions::<B>(body)?;
         validate_body_against_header(body, header.header())
     }
 
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError> {
+        reject_diesis_transactions::<B>(block.body())?;
         validate_block_pre_execution(block, &self.chain_spec)
     }
 
@@ -163,8 +165,18 @@ where
         block: &SealedBlock<B>,
         transaction_root: Option<TransactionRoot>,
     ) -> Result<(), ConsensusError> {
+        reject_diesis_transactions::<B>(block.body())?;
         validate_block_pre_execution_with_tx_root(block, &self.chain_spec, transaction_root)
     }
+}
+
+fn reject_diesis_transactions<B: Block>(body: &B::Body) -> Result<(), ConsensusError> {
+    use reth_primitives_traits::transaction::error::InvalidTransactionError;
+
+    if body.transactions().iter().any(|tx| tx.ty() == reth_ethereum_primitives::ML_DSA_TX_TYPE_ID) {
+        return Err(InvalidTransactionError::TxTypeNotSupported.into());
+    }
+    Ok(())
 }
 
 impl<H, ChainSpec> HeaderValidator<H> for EthBeaconConsensus<ChainSpec>

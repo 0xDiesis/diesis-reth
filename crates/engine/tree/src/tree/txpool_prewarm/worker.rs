@@ -352,12 +352,12 @@ fn entry_counts(reads: &CachedReads) -> (usize, usize, usize) {
 mod tests {
     use super::{super::Transaction as PoolTransaction, *};
     use crate::tree::payload_processor::reuse::{PoolResults, POOL_BENEFICIARY};
-    use alloy_consensus::{transaction::Recovered, Signed, TxLegacy};
+    use alloy_consensus::{transaction::Recovered, TxLegacy};
     use alloy_primitives::{Address, Signature, TxKind};
     use crossbeam_channel::{unbounded, Sender};
     use evm2::BaseEvmTypes;
     use parking_lot::{Mutex, RwLock};
-    use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+    use reth_ethereum_primitives::{EthPrimitives, Transaction, TransactionSigned};
     use reth_evm::EvmEnvFor;
     use reth_evm_ethereum::EthEvmConfig;
     use reth_provider::test_utils::MockEthProvider;
@@ -523,11 +523,11 @@ mod tests {
             ..Default::default()
         };
         let hash = B256::repeat_byte(recipient);
-        let signed = TransactionSigned::Legacy(Signed::new_unchecked(
-            transaction,
+        let signed = TransactionSigned::new(
+            Transaction::Legacy(transaction),
             Signature::test_signature(),
             hash,
-        ));
+        );
         let sender = Address::repeat_byte(0xAA);
         PoolTransaction { hash, sender, transaction: Recovered::new_unchecked(signed, sender) }
     }

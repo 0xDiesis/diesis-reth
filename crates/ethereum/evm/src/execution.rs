@@ -39,7 +39,7 @@ use reth_execution_types::{BlockState, StateUpdate};
 
 mod tests {
     use super::*;
-    use alloy_consensus::{SignableTransaction, TxLegacy, TxType};
+    use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_genesis::Genesis;
     use alloy_primitives::{address, Signature, TxKind};
     use evm2::{
@@ -47,7 +47,7 @@ mod tests {
     };
     use reth_chainspec::{Chain, ChainSpec, MAINNET};
     use reth_ethereum_forks::{EthereumHardfork, ForkCondition};
-    use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
+    use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned, TxType};
     use reth_evm::{BlockExecutorFactory, ConfigureEvm, Executor};
     use reth_execution_types::BlockExecutionOutput;
     use reth_primitives_traits::RecoveredBlock;
@@ -237,7 +237,7 @@ mod tests {
             ]))),
         );
         let transaction = Recovered::new_unchecked(
-            TransactionSigned::Legacy(
+            TransactionSigned::from(
                 TxLegacy {
                     gas_price: 1_000_000_000,
                     gas_limit: 100_000,

@@ -1,4 +1,4 @@
-use alloy_consensus::{transaction::TxHashRef, BlockHeader};
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Typed2718};
 use alloy_eips::{eip2718::Encodable2718, BlockId, BlockNumberOrTag};
 use alloy_genesis::ChainConfig;
 use alloy_primitives::{hex::decode, uint, Address, Bytes, B256, U256, U64};
@@ -291,6 +291,16 @@ where
         let block: ProviderBlock<Eth::Provider> = Decodable::decode(&mut rlp_block.as_ref())
             .map_err(BlockError::RlpDecodeRawBlock)
             .map_err(Eth::Error::from_eth_err)?;
+
+        let evm_config = self.eth_api().evm_config();
+        if block
+            .body()
+            .transactions()
+            .iter()
+            .any(|tx| !evm_config.supports_transaction_type(tx.ty()))
+        {
+            return Err(Eth::Error::from_eth_err(EthApiError::Unsupported("transaction type")));
+        }
 
         let evm_env = self
             .eth_api()

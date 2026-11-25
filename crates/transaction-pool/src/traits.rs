@@ -2106,7 +2106,7 @@ mod tests {
             }
             .into_signed(Signature::test_signature()),
         );
-        let transaction = Recovered::new_unchecked(tx, Default::default());
+        let transaction = Recovered::new_unchecked(TransactionSigned::from(tx), Default::default());
         let pooled_tx = EthPooledTransaction::new(transaction.clone(), 200);
 
         // Check that the pooled transaction is created correctly

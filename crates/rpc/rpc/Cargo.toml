@@ -91,7 +91,7 @@ humantime = { workspace = true, optional = true }
 
 [dev-dependencies]
 reth-testing-utils.workspace = true
-reth-ethereum-primitives.workspace = true
+reth-ethereum-primitives = { workspace = true, features = ["rpc"] }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-db-api.workspace = true

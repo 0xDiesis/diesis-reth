@@ -303,6 +303,7 @@ impl TransactionLookup {
 #[cfg(test)]
 mod tests {
     use crate::segments::{PruneInput, PruneLimiter, Segment, SegmentOutput, TransactionLookup};
+    use alloy_consensus::transaction::TxHashRef;
     use alloy_primitives::{BlockNumber, TxNumber, B256};
     use assert_matches::assert_matches;
     use itertools::{

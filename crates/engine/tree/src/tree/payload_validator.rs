@@ -110,7 +110,7 @@ use crate::tree::{
     CacheWaitDurations, CachedStateProvider, EngineApiMetrics, EngineApiTreeState, ExecutionEnv,
     PayloadHandle, TreeConfig, WaitForCaches,
 };
-use alloy_consensus::{transaction::Either, Transaction as _};
+use alloy_consensus::{transaction::Either, Transaction as _, Typed2718};
 use alloy_eip7928::{
     bal::{Bal, DecodedBal},
     BlockAccessList,
@@ -150,7 +150,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::{
     AlloyBlockHeader, BlockBody, BlockTy, FastInstant as Instant, GotExpected, NodePrimitives,
-    RecoveredBlock, SealedBlock, SealedHeader, SignerRecoverable, TxTy,
+    RecoveredBlock, SealedBlock, SealedHeader, SignedTransaction, TxTy,
 };
 use reth_provider::{
     BlockExecutionOutput, BlockReader, ChangeSetReader, DatabaseProviderFactory,
@@ -430,7 +430,17 @@ where
             }
             BlockOrPayload::Block(block) => {
                 let txs = block.body().clone_transactions();
-                let convert = |tx: N::SignedTx| tx.try_into_recovered();
+                let evm_config = self.evm_config.clone();
+                let convert = move |tx: N::SignedTx| {
+                    use reth_errors::RethError;
+                    use reth_primitives_traits::transaction::error::InvalidTransactionError;
+
+                    if !evm_config.supports_transaction_type(tx.ty()) {
+                        return Err(RethError::other(InvalidTransactionError::TxTypeNotSupported))
+                    }
+                    let signer = tx.try_recover().map_err(RethError::other)?;
+                    Ok(tx.with_signer(signer))
+                };
                 Either::Right((txs, convert))
             }
         })

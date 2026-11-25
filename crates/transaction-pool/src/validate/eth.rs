@@ -2310,16 +2310,17 @@ mod tests {
             ..Default::default()
         };
 
-        let txs = [legacy.into(), eip2930.into()].map(|tx: alloy_consensus::TypedTransaction| {
-            let signed = reth_ethereum_primitives::TransactionSigned::new_unhashed(
-                tx.into(),
-                alloy_primitives::Signature::test_signature(),
-            );
-            EthPooledTransaction::new(
-                alloy_consensus::transaction::Recovered::new_unchecked(signed, sender),
-                200,
-            )
-        });
+        let txs =
+            [legacy.into(), eip2930.into()].map(|tx: reth_ethereum_primitives::Transaction| {
+                let signed = reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                    tx,
+                    alloy_primitives::Signature::test_signature(),
+                );
+                EthPooledTransaction::new(
+                    alloy_consensus::transaction::Recovered::new_unchecked(signed, sender),
+                    200,
+                )
+            });
 
         let provider = mock_provider();
         provider.add_account(sender, ExtendedAccount::new(0, U256::MAX));

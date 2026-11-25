@@ -474,6 +474,7 @@ impl RocksDBProvider {
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::transaction::TxHashRef;
     use std::sync::Arc;
 
     use super::*;

@@ -195,9 +195,9 @@ impl<T: TxReceipt> From<Receipts70<T>> for Receipts<T> {
 mod tests {
     use super::*;
     use crate::{message::RequestPair, GetReceipts, Receipts};
-    use alloy_consensus::TxType;
     use alloy_primitives::{b256, hex, Address, Bloom, Log};
     use alloy_rlp::{Decodable, Encodable};
+    use reth_ethereum_primitives::TxType;
 
     #[test]
     fn roundtrip_eip1559() {

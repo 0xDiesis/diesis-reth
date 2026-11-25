@@ -26,7 +26,7 @@ use evm2::{
 };
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_forks::EthereumHardforks;
-use reth_ethereum_primitives::{Receipt, TransactionSigned};
+use reth_ethereum_primitives::{DiesisTxType, Receipt, TransactionSigned};
 use reth_evm::{
     BlockExecutionError, BlockExecutionOutput, BlockExecutor, ExecutorTx, GasOutput,
     ReceiptBuilder, ReceiptBuilderCtx, RecoveredTx,
@@ -512,7 +512,7 @@ where
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
     type Evm = Evm<'a, F::Types>;
-    type TransactionResultWithState = EthTransactionResultWithState<F::Types>;
+    type TransactionResultWithState = EthTransactionResultWithState<F::Types, DiesisTxType>;
     type BlockAccessList = Bal;
 
     fn evm(&self) -> &Self::Evm {
@@ -767,7 +767,7 @@ mod tests {
     }
 
     fn transfer(from: Address, to: Address, nonce: u64) -> Recovered<TransactionSigned> {
-        let tx = TransactionSigned::Legacy(
+        let tx = TransactionSigned::from(
             TxLegacy {
                 chain_id: Some(1),
                 nonce,
@@ -889,7 +889,7 @@ mod tests {
         );
         let evm = factory.evm_with_env(Db::new(database), env);
         let mut executor = factory.create_executor(evm, segment(0, 1, B256::ZERO).ctx);
-        let tx = TransactionSigned::Legacy(
+        let tx = TransactionSigned::from(
             TxLegacy {
                 chain_id: Some(1),
                 gas_limit: 100_000,
@@ -1093,7 +1093,7 @@ mod tests {
         let mut block_gas = 0;
         for nonce in 0..2 {
             // Creating a recipient charges state gas, separating receipt and block gas totals.
-            let tx = TransactionSigned::Legacy(
+            let tx = TransactionSigned::from(
                 TxLegacy {
                     chain_id: Some(1),
                     nonce,
@@ -1157,7 +1157,7 @@ mod tests {
         executor.apply_pre_execution_changes().unwrap();
 
         let blob_tx = |nonce| {
-            let tx = TransactionSigned::Eip4844(
+            let tx = TransactionSigned::from(
                 TxEip4844 {
                     chain_id: 1,
                     nonce,

@@ -708,7 +708,10 @@ impl MockTransaction {
 }
 
 impl PoolTransaction for MockTransaction {
-    type TryFromConsensusError = ValueError<EthereumTxEnvelope<TxEip4844>>;
+    // Matches the error type of `TryFrom<TransactionSigned> for PooledTransactionVariant`,
+    // which is fallible because EIP-4844 txs lack sidecars and ML-DSA txs have no pooled
+    // Ethereum representation.
+    type TryFromConsensusError = ValueError<TransactionSigned>;
 
     type Consensus = TransactionSigned;
 
@@ -972,10 +975,13 @@ impl TryFrom<Recovered<TransactionSigned>> for MockTransaction {
 
     fn try_from(tx: Recovered<TransactionSigned>) -> Result<Self, Self::Error> {
         let (transaction, sender) = tx.into_parts();
-        let hash = *transaction.tx_hash();
+        let hash = *transaction.hash();
         let size = transaction.size();
 
-        match transaction.into_typed_transaction() {
+        // The fork's `TransactionSigned` is a struct wrapping the `Transaction` enum, so the
+        // inner transaction is extracted via `into_parts` rather than the envelope API.
+        let (transaction, _, _) = transaction.into_parts();
+        match transaction {
             Transaction::Legacy(TxLegacy {
                 chain_id,
                 nonce,
@@ -1102,6 +1108,11 @@ impl TryFrom<Recovered<TransactionSigned>> for MockTransaction {
                 size,
                 cost: U256::from(gas_limit) * U256::from(max_fee_per_gas) + value,
             }),
+            // ML-DSA (0x70) has no mock representation; reject instead of panicking so callers
+            // surface a typed error for unsupported transaction types.
+            tx @ Transaction::MlDsa(_) => {
+                Err(TryFromRecoveredTransactionError::UnsupportedTransactionType(tx.ty()))
+            }
         }
     }
 }
@@ -1111,7 +1122,7 @@ impl TryFrom<Recovered<TxEnvelope>> for MockTransaction {
 
     fn try_from(tx: Recovered<TxEnvelope>) -> Result<Self, Self::Error> {
         let (transaction, sender) = tx.into_parts();
-        let hash = *transaction.tx_hash();
+        let hash = *transaction.hash();
         let size = transaction.size();
 
         match transaction {

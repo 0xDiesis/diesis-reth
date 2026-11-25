@@ -1,6 +1,8 @@
 //! Conversion helpers for Ethereum execution.
 
-use alloy_consensus::{transaction::Recovered, BlockHeader};
+use alloy_consensus::{
+    error::ValueError, transaction::Recovered, BlockHeader, EthereumTxEnvelope, TxEip4844,
+};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, BlockNumber, BlockTimestamp, U256};
 use alloy_rpc_types_engine::ExecutionData;
@@ -130,18 +132,21 @@ pub struct ExecutableRecoveredTx {
 }
 
 impl ExecutableRecoveredTx {
-    /// Creates a transaction wrapper and precomputes the transaction environment.
-    pub fn new(tx: Recovered<TransactionSigned>) -> Self {
+    /// Creates a wrapper for a transaction supported by the stock Ethereum EVM.
+    pub fn try_new(
+        tx: Recovered<TransactionSigned>,
+    ) -> Result<Self, ValueError<TransactionSigned>> {
         // Cache the hash before cloning so neither envelope hashes on the execution thread.
-        tx.inner().tx_hash();
-        let tx_env = tx.clone().map(|signed| match signed {
-            TransactionSigned::Eip7702(signed) => {
-                let body = signed.strip_signature();
-                evm2::ethereum::TxEnvelope::Eip7702(recover_authorizations(body))
-            }
+        tx.inner().hash();
+        let signed = EthereumTxEnvelope::<TxEip4844>::try_from(tx.inner().clone())?;
+        let env = match signed {
+            EthereumTxEnvelope::Eip7702(signed) => evm2::ethereum::TxEnvelope::Eip7702(
+                recover_authorizations(signed.strip_signature()),
+            ),
             signed => signed.into(),
-        });
-        Self { tx_env, tx }
+        };
+        let tx_env = Recovered::new_unchecked(env, tx.signer());
+        Ok(Self { tx_env, tx })
     }
 }
 
