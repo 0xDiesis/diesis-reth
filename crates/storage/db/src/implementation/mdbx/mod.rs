@@ -771,7 +771,7 @@ mod tests {
         table::{Encode, Table, TableInfo},
         tables_to_generic,
     };
-    use reth_libmdbx::Error;
+    use reth_libmdbx::{Error, WriteFlags};
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
     use tempfile::TempDir;
@@ -805,6 +805,36 @@ mod tests {
     #[test]
     fn db_creation() {
         let _tempdir = create_test_db(DatabaseEnvKind::RW);
+    }
+
+    #[test]
+    fn reopens_database_with_legacy_named_tables() {
+        let tempdir = TempDir::new().expect(ERROR_TEMPDIR);
+        let args = || DatabaseArguments::new(ClientVersion::default());
+        let db = crate::init_db(tempdir.path(), args()).unwrap();
+        let legacy_names = ["VerkleNodes", "VerkleRoots", "VerkleRootNodes", "VerkleStateDiffs"];
+        let canonical_hash = B256::with_last_byte(1);
+
+        let tx = db.inner.begin_rw_txn().expect(ERROR_INIT_TX);
+        for name in legacy_names {
+            let table = tx.create_db(Some(name), DatabaseFlags::empty()).unwrap();
+            tx.put(table.dbi(), b"legacy-key", b"legacy-value", WriteFlags::empty()).unwrap();
+        }
+        tx.commit().expect(ERROR_COMMIT);
+        db.update(|tx| tx.put::<CanonicalHeaders>(1, canonical_hash).unwrap()).unwrap();
+        drop(db);
+
+        let reopened = crate::init_db(tempdir.path(), args()).expect("reopen existing MDBX");
+        let tx = reopened.tx().expect(ERROR_INIT_TX);
+        assert_eq!(tx.get::<CanonicalHeaders>(1).unwrap(), Some(canonical_hash));
+        drop(tx);
+
+        let tx = reopened.inner.begin_ro_txn().expect(ERROR_INIT_TX);
+        for name in legacy_names {
+            let table = tx.open_db(Some(name)).unwrap();
+            let value = tx.get::<Vec<u8>>(table.dbi(), b"legacy-key").unwrap();
+            assert_eq!(value.as_deref(), Some(b"legacy-value".as_slice()));
+        }
     }
 
     #[test]
