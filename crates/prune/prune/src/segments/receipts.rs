@@ -5,14 +5,14 @@
 
 use crate::{
     db_ext::DbTxPruneExt,
-    segments::{self, PruneInput},
+    segments::{self, checkpoint_block, PruneInput},
     PrunerError,
 };
 use reth_db_api::{table::Value, tables, transaction::DbTxMut};
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    errors::provider::ProviderResult, BlockReader, DBProvider, EitherWriter,
-    NodePrimitivesProvider, PruneCheckpointWriter, StaticFileProviderFactory, StorageSettingsCache,
+    errors::provider::ProviderResult, DBProvider, EitherWriter, NodePrimitivesProvider,
+    PruneCheckpointWriter, StaticFileProviderFactory, StorageSettingsCache,
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment, SegmentOutput, SegmentOutputCheckpoint};
 use reth_static_file_types::StaticFileSegment;
@@ -24,7 +24,6 @@ pub(crate) fn prune<Provider>(
 ) -> Result<SegmentOutput, PrunerError>
 where
     Provider: DBProvider<Tx: DbTxMut>
-        + BlockReader
         + StorageSettingsCache
         + StaticFileProviderFactory
         + NodePrimitivesProvider<Primitives: NodePrimitives<Receipt: Value>>,
@@ -36,7 +35,7 @@ where
     debug!(target: "pruner", "Pruning receipts from database.");
 
     // Original database implementation for when receipts are not on static files (old nodes)
-    let tx_range = match input.get_next_tx_num_range(provider)? {
+    let tx_range = match input.get_next_tx_num_range(provider.tx_ref())? {
         Some(range) => range,
         None => {
             trace!(target: "pruner", "No receipts to prune");
@@ -58,9 +57,7 @@ where
     )?;
     trace!(target: "pruner", %pruned, %done, "Pruned receipts");
 
-    let last_pruned_block = provider
-        .block_by_transaction_id(last_pruned_transaction)?
-        .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
+    let last_pruned_block = checkpoint_block(provider.tx_ref(), last_pruned_transaction)?
         // If there's more receipts to prune, set the checkpoint block number to previous,
         // so we could finish pruning its receipts on the next run.
         .checked_sub(if done { 0 } else { 1 });

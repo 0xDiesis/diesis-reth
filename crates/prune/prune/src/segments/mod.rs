@@ -4,8 +4,9 @@ mod user;
 
 use crate::{PruneLimiter, PrunerError};
 use alloy_primitives::{BlockNumber, TxNumber};
+use reth_db_api::{cursor::DbCursorRO, tables, transaction::DbTx};
 use reth_provider::{
-    errors::provider::ProviderResult, BlockReader, PruneCheckpointWriter, StaticFileProviderFactory,
+    errors::provider::ProviderResult, PruneCheckpointWriter, StaticFileProviderFactory,
 };
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PruneProgress, PrunePurpose, PruneSegment, SegmentOutput,
@@ -103,6 +104,17 @@ where
     })
 }
 
+/// Resolves a pruning checkpoint from database metadata even after its body has expired.
+fn checkpoint_block(tx: &impl DbTx, id: TxNumber) -> Result<BlockNumber, PrunerError> {
+    if let Some((_, block)) = tx.cursor_read::<tables::TransactionBlocks>()?.seek(id)? &&
+        let Some(indices) = tx.get::<tables::BlockBodyIndices>(block)? &&
+        indices.tx_num_range().contains(&id)
+    {
+        return Ok(block)
+    }
+    Err(PrunerError::InconsistentData("Block for transaction is not found"))
+}
+
 /// A segment represents a pruning of some portion of the data.
 ///
 /// Segments are called from [`Pruner`](crate::Pruner) with the following lifecycle:
@@ -164,9 +176,9 @@ impl PruneInput {
     /// 2. If checkpoint doesn't exist, return 0.
     ///
     /// To get the range end: get last tx number for `to_block`.
-    pub(crate) fn get_next_tx_num_range<Provider: BlockReader>(
+    pub(crate) fn get_next_tx_num_range(
         &self,
-        provider: &Provider,
+        tx: &impl DbTx,
     ) -> ProviderResult<Option<RangeInclusive<TxNumber>>> {
         let from_tx_number = self.previous_checkpoint
             // Checkpoint exists, prune from the next transaction after the highest pruned one
@@ -185,7 +197,8 @@ impl PruneInput {
             // No checkpoint exists, prune from genesis
             .unwrap_or_default();
 
-        let to_tx_number = match provider.block_body_indices(self.to_block)? {
+        // Bodies may already have expired this block. Pruning only needs its database metadata.
+        let to_tx_number = match tx.get::<tables::BlockBodyIndices>(self.to_block)? {
             Some(body) => {
                 let last_tx = body.last_tx_num();
                 if last_tx + body.tx_count() == 0 {
@@ -243,11 +256,7 @@ impl PruneInput {
 mod tests {
     use super::*;
     use alloy_primitives::B256;
-    use reth_provider::{
-        providers::BlockchainProvider,
-        test_utils::{create_test_provider_factory, MockEthProvider},
-        BlockWriter,
-    };
+    use reth_provider::{test_utils::create_test_provider_factory, BlockWriter};
     use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
 
     #[test]
@@ -259,10 +268,11 @@ mod tests {
         };
 
         // Default provider with no block corresponding to block 10
-        let provider = MockEthProvider::default();
+        let factory = create_test_provider_factory();
+        let provider = factory.provider().unwrap();
 
         // No block body for block 10, expected None
-        let range = input.get_next_tx_num_range(&provider).expect("Expected range");
+        let range = input.get_next_tx_num_range(provider.tx_ref()).expect("Expected range");
         assert!(range.is_none());
     }
 
@@ -296,10 +306,10 @@ mod tests {
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider::new(factory).unwrap();
+        let provider = factory.provider().unwrap();
 
         // Since there are no transactions, expected None
-        let range = input.get_next_tx_num_range(&provider).expect("Expected range");
+        let range = input.get_next_tx_num_range(provider.tx_ref()).expect("Expected range");
         assert!(range.is_none());
     }
 
@@ -334,10 +344,11 @@ mod tests {
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider::new(factory).unwrap();
+        let provider = factory.provider().unwrap();
 
         // Get the next tx number range
-        let range = input.get_next_tx_num_range(&provider).expect("Expected range").unwrap();
+        let range =
+            input.get_next_tx_num_range(provider.tx_ref()).expect("Expected range").unwrap();
 
         // Calculate the total number of transactions
         let num_txs = blocks.iter().map(|block| block.transaction_count() as u64).sum::<u64>();
@@ -380,10 +391,11 @@ mod tests {
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider::new(factory).unwrap();
+        let provider = factory.provider().unwrap();
 
         // Fetch the range and check if it is correct
-        let range = input.get_next_tx_num_range(&provider).expect("Expected range").unwrap();
+        let range =
+            input.get_next_tx_num_range(provider.tx_ref()).expect("Expected range").unwrap();
 
         // Calculate the total number of transactions
         let num_txs = blocks.iter().map(|block| block.transaction_count() as u64).sum::<u64>();
@@ -416,7 +428,7 @@ mod tests {
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider::new(factory).unwrap();
+        let provider = factory.provider().unwrap();
 
         // Get the last tx number
         // Calculate the total number of transactions
@@ -435,7 +447,7 @@ mod tests {
         };
 
         // We expect an empty range since the previous checkpoint is the last tx number
-        let range = input.get_next_tx_num_range(&provider).expect("Expected range");
+        let range = input.get_next_tx_num_range(provider.tx_ref()).expect("Expected range");
         assert!(range.is_none());
     }
 }

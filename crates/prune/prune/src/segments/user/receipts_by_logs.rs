@@ -1,12 +1,16 @@
 use crate::{
     db_ext::DbTxPruneExt,
-    segments::{PruneInput, Segment},
+    segments::{checkpoint_block, PruneInput, Segment},
     PrunerError,
 };
 use alloy_consensus::TxReceipt;
-use reth_db_api::{table::Value, tables, transaction::DbTxMut};
+use reth_db_api::{
+    table::Value,
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_primitives_traits::NodePrimitives;
-use reth_provider::{BlockReader, DBProvider, NodePrimitivesProvider, PruneCheckpointWriter};
+use reth_provider::{DBProvider, NodePrimitivesProvider, PruneCheckpointWriter};
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment, ReceiptsLogPruneConfig, SegmentOutput,
     MINIMUM_UNWIND_SAFE_DISTANCE,
@@ -27,7 +31,6 @@ impl<Provider> Segment<Provider> for ReceiptsByLogs
 where
     Provider: DBProvider<Tx: DbTxMut>
         + PruneCheckpointWriter
-        + BlockReader
         + NodePrimitivesProvider<Primitives: NodePrimitives<Receipt: Value>>,
 {
     fn segment(&self) -> PruneSegment {
@@ -64,9 +67,11 @@ where
         let initial_last_pruned_block = last_pruned_block;
 
         let mut from_tx_number = match initial_last_pruned_block {
-            Some(block) => {
-                provider.block_body_indices(block)?.map(|block| block.next_tx_num()).unwrap_or(0)
-            }
+            Some(block) => provider
+                .tx_ref()
+                .get::<tables::BlockBodyIndices>(block)?
+                .map(|block| block.next_tx_num())
+                .unwrap_or(0),
             None => 0,
         };
 
@@ -134,7 +139,7 @@ where
             let block_range = start_block..=end_block;
 
             // Calculate the transaction range from this block range
-            let tx_range_end = match provider.block_body_indices(end_block)? {
+            let tx_range_end = match provider.tx_ref().get::<tables::BlockBodyIndices>(end_block)? {
                 Some(body) => body.next_tx_num(),
                 None => {
                     trace!(
@@ -185,9 +190,7 @@ where
                 .insert(last_pruned_transaction.unwrap_or_default().max(last_skipped_transaction));
 
             last_pruned_block = Some(
-                provider
-                    .block_by_transaction_id(last_pruned_transaction)?
-                    .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
+                checkpoint_block(provider.tx_ref(), last_pruned_transaction)?
                     // If there's more receipts to prune, set the checkpoint block number to
                     // previous, so we could finish pruning its receipts on the
                     // next run.

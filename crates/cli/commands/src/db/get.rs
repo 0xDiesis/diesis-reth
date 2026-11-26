@@ -240,17 +240,17 @@ impl Command {
                     return Ok(())
                 }
 
-                let content = tool.provider_factory.static_file_provider().find_static_file(
-                    segment,
-                    |provider| {
-                        let mut cursor = provider.cursor()?;
-                        cursor.get(key.into(), mask).map(|result| {
-                            result.map(|vec| {
-                                vec.iter().map(|slice| slice.to_vec()).collect::<Vec<_>>()
-                            })
-                        })
-                    },
-                )?;
+                let static_files = tool.provider_factory.static_file_provider();
+                let content = if let Some(provider) =
+                    static_files.get_maybe_segment_provider(segment, key)?
+                {
+                    provider
+                        .cursor()?
+                        .get(key.into(), mask)?
+                        .map(|columns| columns.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>())
+                } else {
+                    None
+                };
 
                 match content {
                     Some(content) => {

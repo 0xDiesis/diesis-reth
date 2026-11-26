@@ -2079,7 +2079,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
             reader.get_transaction_hash_number(tx_hash)
         })?;
         if let Some(id) = id &&
-            self.transaction_history_is_expired(id)?
+            self.transaction_history_is_unavailable(id)?
         {
             return Ok(None)
         }
@@ -2118,10 +2118,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         {
             let (header, block_hash) = sealed_header.split();
             if let Some(block_body) = self.block_body_indices(block_number)? {
-                // the index of the tx in the block is the offset:
-                // len([start..tx_id])
-                // NOTE: `transaction_id` is always `>=` the block's first
-                // index
+                // The transaction-to-block lookup verified membership in this body range.
                 let index = transaction_id - block_body.first_tx_num();
 
                 let meta = TransactionMeta {
@@ -3976,11 +3973,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> PruneCheckpointReader for DatabaseProvide
         // TransactionBlocks::seek can also land after expired history, so verify the body range.
         let pruned_tx = first_tx_range.start().checked_sub(1);
         let pruned_block = if let Some(tx) = pruned_tx {
-            if let Some((_, block)) =
-                self.tx.cursor_read::<tables::TransactionBlocks>()?.seek(tx)? &&
-                let Some(indices) = self.tx.get::<tables::BlockBodyIndices>(block)? &&
-                indices.tx_num_range().contains(&tx)
-            {
+            if let Some(block) = super::history_floor::transaction_block(&self.tx, tx)? {
                 Some(block).max(lowest_block.checked_sub(1))
             } else {
                 return Ok(checkpoints)

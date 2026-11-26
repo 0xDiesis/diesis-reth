@@ -128,7 +128,9 @@ mod tests {
 
     use super::*;
     use crate::eth::helpers::{signer::DevSigner, types::EthRpcConverter};
-    use alloy_consensus::{BlobTransactionSidecar, Block, Header, Transaction};
+    use alloy_consensus::{
+        transaction::TxHashRef as _, BlobTransactionSidecar, Block, Header, Transaction,
+    };
     use alloy_eips::{
         eip2718::Encodable2718,
         eip4844::{Blob, Bytes48},

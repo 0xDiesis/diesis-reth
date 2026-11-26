@@ -30,7 +30,7 @@ use reth_storage_api::{
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::bundle_state::PlainStorageRevert;
 use std::{
-    ops::{Add, Bound, RangeBounds, RangeInclusive, Sub},
+    ops::{Bound, RangeBounds, RangeInclusive},
     sync::Arc,
 };
 
@@ -98,30 +98,6 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         self.storage_provider
     }
 
-    // Helper function to convert range bounds
-    fn convert_range_bounds<T>(
-        &self,
-        range: impl RangeBounds<T>,
-        end_unbounded: impl FnOnce() -> T,
-    ) -> (T, T)
-    where
-        T: Copy + Add<Output = T> + Sub<Output = T> + From<u8>,
-    {
-        let start = match range.start_bound() {
-            Bound::Included(&n) => n,
-            Bound::Excluded(&n) => n + T::from(1u8),
-            Bound::Unbounded => T::from(0u8),
-        };
-
-        let end = match range.end_bound() {
-            Bound::Included(&n) => n,
-            Bound::Excluded(&n) => n - T::from(1u8),
-            Bound::Unbounded => end_unbounded(),
-        };
-
-        (start, end)
-    }
-
     /// Fetches a range of data from both in-memory state and persistent storage while a predicate
     /// is met.
     ///
@@ -157,11 +133,13 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         // mean that our database provider would not have access to the flushed blocks (since it's
         // working under an older view), while the in-memory state may have deleted them
         // entirely. Resulting in gaps on the range.
+        let Some((start, end)) = convert_range_bounds(range) else { return Ok(Vec::new()) };
+
         let mut in_memory_chain =
             self.head_block.as_ref().map(|b| b.chain().collect::<Vec<_>>()).unwrap_or_default();
         let db_provider = &self.storage_provider;
 
-        let (start, end) = self.convert_range_bounds(range, || {
+        let end = end.unwrap_or_else(|| {
             // the first block is the highest one.
             in_memory_chain
                 .first()
@@ -255,6 +233,8 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         ) -> ProviderResult<Vec<R>>,
         M: Fn(RangeInclusive<usize>, &BlockState<N::Primitives>) -> ProviderResult<Vec<R>>,
     {
+        let Some((start, end)) = convert_range_bounds(range) else { return Ok(Vec::new()) };
+
         let in_mem_chain = self.head_block.iter().flat_map(|b| b.chain()).collect::<Vec<_>>();
         let provider = &self.storage_provider;
 
@@ -272,7 +252,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
             .ok_or(ProviderError::BlockBodyIndicesNotFound(last_database_block_number))?;
         let mut in_memory_tx_num = last_block_body_index.next_tx_num();
 
-        let (start, end) = self.convert_range_bounds(range, || {
+        let end = end.unwrap_or_else(|| {
             in_mem_chain
                 .iter()
                 .map(|b| b.block_ref().recovered_block().body().transactions().len() as u64)
@@ -1477,6 +1457,21 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
 
         Ok(changesets)
     }
+}
+
+/// Converts a nonempty range to inclusive bounds, leaving an unbounded end unresolved.
+fn convert_range_bounds(range: impl RangeBounds<u64>) -> Option<(u64, Option<u64>)> {
+    let start = match range.start_bound() {
+        Bound::Included(&number) => number,
+        Bound::Excluded(&number) => number.checked_add(1)?,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&number) => Some(number),
+        Bound::Excluded(&number) => Some(number.checked_sub(1)?),
+        Bound::Unbounded => None,
+    };
+    end.is_none_or(|end| start <= end).then_some((start, end))
 }
 
 #[cfg(test)]

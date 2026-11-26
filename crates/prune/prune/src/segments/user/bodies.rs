@@ -130,15 +130,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pruner;
-    use alloy_primitives::BlockNumber;
+    use crate::{segments::SegmentSet, Pruner};
+    use alloy_primitives::{Address, BlockNumber};
+    use reth_db_api::{
+        models::StoredBlockBodyIndices,
+        tables,
+        transaction::{DbTx, DbTxMut},
+    };
     use reth_exex_types::FinishedExExHeight;
     use reth_provider::{
         test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
         DBProvider, DatabaseProviderFactory, ProviderFactory, PruneCheckpointWriter,
         StaticFileWriter,
     };
-    use reth_prune_types::{PruneMode, PruneProgress, PruneSegment};
+    use reth_prune_types::{PruneMode, PruneModes, PruneProgress, PruneSegment};
     use reth_static_file_types::{
         SegmentHeader, SegmentRangeInclusive, StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
     };
@@ -369,6 +374,64 @@ mod tests {
             Some(499_999),
             "Checkpoint should be 499_999 (end of deleted jar 0), not 899_999 (to_block)"
         );
+    }
+
+    #[test]
+    fn jar_deletion_does_not_block_receipt_and_sender_pruning() {
+        let first_retained_block = DEFAULT_BLOCKS_PER_STATIC_FILE;
+        let last_expired_block = first_retained_block - 1;
+        let tip = 2 * DEFAULT_BLOCKS_PER_STATIC_FILE - 1;
+        let mode = PruneMode::Before(first_retained_block);
+        let modes = PruneModes {
+            bodies_history: Some(mode),
+            receipts: Some(mode),
+            sender_recovery: Some(mode),
+            ..Default::default()
+        };
+        let factory = create_test_provider_factory().with_prune_modes(modes.clone());
+        setup_static_file_jars(&factory, tip);
+
+        let writer = factory.provider_rw().unwrap();
+        for (number, id) in [(last_expired_block, 999), (first_retained_block, 1000)] {
+            writer.tx_ref().put::<tables::TransactionBlocks>(id, number).unwrap();
+            writer
+                .tx_ref()
+                .put::<tables::BlockBodyIndices>(
+                    number,
+                    StoredBlockBodyIndices { first_tx_num: id, tx_count: 1 },
+                )
+                .unwrap();
+            writer.tx_ref().put::<tables::Receipts>(id, Default::default()).unwrap();
+            writer.tx_ref().put::<tables::TransactionSenders>(id, Address::ZERO).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let static_files = factory.static_file_provider();
+        let segments = SegmentSet::from_components(static_files.clone(), modes).into_vec();
+        let (_, exex_height) = tokio::sync::watch::channel(FinishedExExHeight::NoExExs);
+        let mut pruner =
+            Pruner::new_with_factory(factory.clone(), segments, 5, 10_000, None, exex_height);
+        let result = pruner.run(tip).unwrap();
+
+        assert_eq!(result.progress, PruneProgress::Finished);
+        assert_eq!(static_files.earliest_history_height(), first_retained_block);
+        assert_eq!(result.segments.len(), 3);
+        for ((segment, output), expected) in result.segments.iter().zip([
+            PruneSegment::Bodies,
+            PruneSegment::Receipts,
+            PruneSegment::SenderRecovery,
+        ]) {
+            assert_eq!(*segment, expected);
+            let checkpoint = output.checkpoint.unwrap();
+            assert_eq!(checkpoint.block_number, Some(last_expired_block));
+            assert_eq!(checkpoint.tx_number, Some(999));
+        }
+
+        let reader = factory.provider().unwrap();
+        assert!(reader.tx_ref().get::<tables::Receipts>(999).unwrap().is_none());
+        assert!(reader.tx_ref().get::<tables::TransactionSenders>(999).unwrap().is_none());
+        assert!(reader.tx_ref().get::<tables::Receipts>(1000).unwrap().is_some());
+        assert!(reader.tx_ref().get::<tables::TransactionSenders>(1000).unwrap().is_some());
     }
 
     #[test]

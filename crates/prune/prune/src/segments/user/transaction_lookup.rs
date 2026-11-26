@@ -1,10 +1,14 @@
 use crate::{
     db_ext::DbTxPruneExt,
-    segments::{PruneInput, Segment, SegmentOutput},
+    segments::{checkpoint_block, PruneInput, Segment, SegmentOutput},
     PrunerError,
 };
 use alloy_primitives::TxNumber;
-use reth_db_api::{table::Value, tables, transaction::DbTxMut};
+use reth_db_api::{
+    table::Value,
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_provider::{
     BlockReader, DBProvider, PruneCheckpointReader, RocksDBProviderFactory,
@@ -72,7 +76,8 @@ where
                 .previous_checkpoint
                 .is_none_or(|checkpoint| checkpoint.block_number < Some(lowest_range.start())) &&
             let Some(previous_block) = lowest_range.start().checked_sub(1) &&
-            let Some(body_indices) = provider.block_body_indices(previous_block)? &&
+            let Some(body_indices) =
+                provider.tx_ref().get::<tables::BlockBodyIndices>(previous_block)? &&
             let Some(tx_number) = body_indices.next_tx_num().checked_sub(1)
         {
             // Only skip earlier transactions if any exist.
@@ -88,7 +93,7 @@ where
             );
         }
 
-        let (start, end) = match input.get_next_tx_num_range(provider)? {
+        let (start, end) = match input.get_next_tx_num_range(provider.tx_ref())? {
             Some(range) => range,
             None => {
                 trace!(target: "pruner", "No transaction lookup entries to prune");
@@ -107,9 +112,7 @@ where
             let pruned = provider.tx_ref().clear_table::<tables::TransactionHashNumbers>()?;
             trace!(target: "pruner", %pruned, "Cleared transaction lookup table");
 
-            let last_pruned_block = provider
-                .block_by_transaction_id(end)?
-                .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?;
+            let last_pruned_block = checkpoint_block(provider.tx_ref(), end)?;
 
             return Ok(SegmentOutput {
                 progress: PruneProgress::Finished,
@@ -177,9 +180,7 @@ where
 
         let last_pruned_transaction = last_pruned_transaction.unwrap_or(tx_range_end);
 
-        let last_pruned_block = provider
-            .block_by_transaction_id(last_pruned_transaction)?
-            .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
+        let last_pruned_block = checkpoint_block(provider.tx_ref(), last_pruned_transaction)?
             // If there's more transaction lookup entries to prune, set the checkpoint block number
             // to previous, so we could finish pruning its transaction lookup entries on the next
             // run.
@@ -224,9 +225,7 @@ impl TransactionLookup {
             rocksdb.clear::<tables::TransactionHashNumbers>()?;
             trace!(target: "pruner", "Cleared transaction lookup table (RocksDB)");
 
-            let last_pruned_block = provider
-                .block_by_transaction_id(end)?
-                .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?;
+            let last_pruned_block = checkpoint_block(provider.tx_ref(), end)?;
 
             return Ok(SegmentOutput {
                 progress: PruneProgress::Finished,
@@ -282,9 +281,7 @@ impl TransactionLookup {
         let last_pruned_transaction =
             if deleted > 0 { start + deleted as u64 - 1 } else { tx_range_end };
 
-        let last_pruned_block = provider
-            .block_by_transaction_id(last_pruned_transaction)?
-            .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
+        let last_pruned_block = checkpoint_block(provider.tx_ref(), last_pruned_transaction)?
             .checked_sub(if done { 0 } else { 1 });
 
         let progress = limiter.progress(done);

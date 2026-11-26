@@ -8,6 +8,7 @@ use alloy_consensus::{
     proofs::calculate_transaction_root, transaction::TxHashRef as _, SignableTransaction, TxLegacy,
 };
 use alloy_primitives::{BlockNumber, Signature, TxNumber};
+use reth_db_api::{tables, transaction::DbTxMut};
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_storage_api::StateWriteConfig;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
@@ -155,4 +156,40 @@ fn receipt_read_families_enforce_the_body_floor_without_hash_errors() {
     assert!(provider.receipts_by_block(2.into()).unwrap().is_some());
     assert_eq!(provider.receipts_by_block_range(2..=2).unwrap().len(), 1);
     assert!(provider.receipts_by_block_range(RangeInclusive::new(2, 1)).unwrap().is_empty());
+}
+
+#[test]
+fn missing_transaction_boundary_cannot_expose_expired_history() {
+    let (factory, data) = populated_factory();
+    let expired_hash = *data.blocks[0].0.body().transactions[0].tx_hash();
+    let retained_hash = *data.blocks[1].0.body().transactions[0].tx_hash();
+    let writer = factory.provider_rw().unwrap();
+    let expired_id = writer.transaction_id(expired_hash).unwrap().unwrap();
+    let retained_id = writer.transaction_id(retained_hash).unwrap().unwrap();
+    assert!(writer.tx_ref().delete::<tables::TransactionBlocks>(expired_id, None).unwrap());
+    writer.commit().unwrap();
+
+    let static_files = factory.static_file_provider();
+    static_files.raise_history_floor(2);
+    let provider = factory.provider().unwrap();
+
+    assert_eq!(provider.block_by_transaction_id(expired_id).unwrap(), None);
+    assert_eq!(provider.transaction_id(expired_hash).unwrap(), None);
+    assert!(provider.transaction_by_hash_with_meta(expired_hash).unwrap().is_none());
+    assert!(matches!(
+        provider.transaction_by_id(expired_id),
+        Err(ProviderError::BlockNumberForTransactionIndexNotFound)
+    ));
+    assert!(matches!(
+        provider.receipt(expired_id),
+        Err(ProviderError::BlockNumberForTransactionIndexNotFound)
+    ));
+    assert!(matches!(
+        static_files.transaction_by_id(expired_id),
+        Err(ProviderError::UnsupportedProvider)
+    ));
+
+    assert!(provider.transaction_by_id(retained_id).unwrap().is_some());
+    let (_, meta) = provider.transaction_by_hash_with_meta(retained_hash).unwrap().unwrap();
+    assert_eq!((meta.block_number, meta.index), (2, 0));
 }

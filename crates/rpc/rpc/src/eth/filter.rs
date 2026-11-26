@@ -234,6 +234,11 @@ where
             let mut filters = self.inner.active_filters.inner.lock().await;
             let filter = filters.get_mut(&id).ok_or(EthFilterError::FilterNotFound(id))?;
 
+            // An expired polling cursor cannot be advanced past missing changes.
+            if matches!(filter.kind, FilterKind::Log(_)) {
+                self.inner.ensure_log_history_available(filter.block)?;
+            }
+
             if filter.block > best_number {
                 // no new blocks since the last poll
                 return Ok(FilterChanges::Empty)
@@ -477,6 +482,16 @@ where
         self.eth_api.cache()
     }
 
+    fn ensure_log_history_available(&self, requested: u64) -> Result<(), EthFilterError> {
+        let earliest_available = self.provider().earliest_block_number()?;
+        if requested < earliest_available {
+            return Err(
+                EthApiError::PrunedHistoryUnavailable { requested, earliest_available }.into()
+            )
+        }
+        Ok(())
+    }
+
     /// Returns logs matching given filter object.
     async fn logs_for_filter(
         self: Arc<Self>,
@@ -609,16 +624,6 @@ where
                 let (from_block_number, to_block_number) =
                     logs_utils::get_filter_block_range(from, to, start_block, info)?;
 
-                // Check if the requested range overlaps with pruned history (EIP-4444)
-                let earliest_block = self.provider().earliest_block_number()?;
-                if from_block_number < earliest_block {
-                    return Err(EthApiError::PrunedHistoryUnavailable {
-                        requested: from_block_number,
-                        earliest_available: earliest_block,
-                    }
-                    .into());
-                }
-
                 self.get_logs_in_block_range(filter, from_block_number, to_block_number, limits)
                     .await
             }
@@ -668,6 +673,8 @@ where
             return Err(EthFilterError::InvalidBlockRangeParams)
         }
 
+        self.ensure_log_history_available(from_block)?;
+
         if let Some(max_blocks_per_filter) =
             limits.max_blocks_per_filter.filter(|limit| to_block - from_block > *limit)
         {
@@ -700,7 +707,10 @@ where
             }
         });
 
-        rx.await.map_err(|_| EthFilterError::InternalError)?
+        let result = rx.await.map_err(|_| EthFilterError::InternalError)?;
+        // Pruning can advance the floor while a cache-backed scan is in flight.
+        self.ensure_log_history_available(from_block)?;
+        result
     }
 
     /// Returns all logs in the given _inclusive_ range that match the filter
@@ -1415,13 +1425,19 @@ mod tests {
     use reth_db_api::models::StoredBlockBodyIndices;
     use reth_ethereum_primitives::TxType;
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_execution_types::ExecutionOutcome;
     use reth_network_api::noop::NoopNetwork;
-    use reth_provider::test_utils::MockEthProvider;
+    use reth_provider::{
+        providers::BlockchainProvider,
+        test_utils::{create_test_provider_factory, MockEthProvider},
+        BlockWriter, OriginalValuesKnown, StateWriter, StaticFileProviderFactory,
+    };
     use reth_rpc_convert::RpcConverter;
     use reth_rpc_eth_api::{helpers::SpawnBlocking, node::RpcNodeCoreAdapter};
     use reth_rpc_eth_types::receipt::EthReceiptConverter;
+    use reth_storage_api::{CanonChainTracker, StateWriteConfig};
     use reth_tasks::Runtime;
-    use reth_testing_utils::generators;
+    use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
     use std::{collections::VecDeque, sync::Arc};
 
@@ -1484,6 +1500,72 @@ mod tests {
         let filter = Filter::new().from_block(100u64).to_block(BlockNumberOrTag::Latest);
         let result = eth_filter.inner.clone().logs_for_filter(filter, QueryLimits::default()).await;
         assert!(matches!(result, Err(EthFilterError::InvalidBlockRangeParams)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn filter_changes_rejects_expired_cursor_with_cached_receipts() {
+        let factory = create_test_provider_factory();
+        let static_files = factory.static_file_provider();
+        let mut rng = generators::rng();
+        let blocks = random_block_range(
+            &mut rng,
+            0..=1,
+            BlockRangeParams { tx_count: 1..2, ..Default::default() },
+        );
+        let expired_hash = blocks[0].hash();
+        let log = alloy_primitives::Log::default();
+        let receipt = reth_ethereum_primitives::Receipt { logs: vec![log], ..Default::default() };
+
+        let writer = factory.provider_rw().unwrap();
+        for block in &blocks {
+            writer.insert_block(&block.clone().try_recover().unwrap()).unwrap();
+        }
+        writer
+            .write_state(
+                &ExecutionOutcome {
+                    first_block: 0,
+                    receipts: vec![vec![receipt.clone()], vec![receipt]],
+                    ..Default::default()
+                },
+                OriginalValuesKnown::No,
+                StateWriteConfig::default(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let provider =
+            BlockchainProvider::with_latest(factory, blocks[0].sealed_header().clone()).unwrap();
+        let eth_api = EthApiBuilder::new(
+            provider.clone(),
+            testing_pool(),
+            NoopNetwork::default(),
+            EthEvmConfig::new(provider.chain_spec()),
+        )
+        .build();
+        let eth_filter = EthFilter::new(eth_api, EthFilterConfig::default(), Runtime::test());
+        let id = eth_filter.new_filter(Filter::default()).await.unwrap();
+        let fixed_from_id = eth_filter.new_filter(Filter::new().from_block(1)).await.unwrap();
+
+        eth_filter.inner.eth_cache().get_block_and_receipts(expired_hash).await.unwrap().unwrap();
+        let (_, receipts) = eth_filter
+            .inner
+            .eth_cache()
+            .maybe_cached_block_and_receipts(expired_hash)
+            .await
+            .unwrap();
+        assert_eq!(receipts.unwrap()[0].logs.len(), 1);
+
+        provider.set_canonical_head(blocks[1].sealed_header().clone());
+        static_files.raise_history_floor(1);
+
+        for id in [id.clone(), id, fixed_from_id] {
+            let err = EthFilterApiServer::filter_changes(&eth_filter, id).await.unwrap_err();
+            assert_eq!(err.code(), EthRpcErrorCode::PrunedHistory.code());
+            assert_eq!(
+                err.message(),
+                "pruned history unavailable: requested 0, earliest available 1"
+            );
+        }
     }
 
     #[tokio::test]

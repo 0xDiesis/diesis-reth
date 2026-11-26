@@ -6,7 +6,7 @@ use crate::{
 };
 use alloy_consensus::{transaction::TxHashRef as _, SignableTransaction, TxLegacy};
 use alloy_primitives::{Address, BlockNumber, Signature, TxHash, U160};
-use reth_db_api::{tables, transaction::DbTxMut};
+use reth_db_api::{models::StoredBlockBodyIndices, tables, transaction::DbTxMut};
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
@@ -35,6 +35,12 @@ fn populated_provider(
     let db = factory.provider_rw().unwrap();
     for block in 0..=2 {
         db.tx_ref().put::<tables::TransactionBlocks>(block, block).unwrap();
+        db.tx_ref()
+            .put::<tables::BlockBodyIndices>(
+                block,
+                StoredBlockBodyIndices { first_tx_num: block, tx_count: 1 },
+            )
+            .unwrap();
     }
     db.commit().unwrap();
 
@@ -99,15 +105,18 @@ fn direct_static_transaction_ranges_obey_the_body_floor() {
 }
 
 #[test]
-fn direct_static_transaction_hash_reads_obey_the_body_floor() {
+fn standalone_transaction_hash_lookups_require_an_index() {
     let (_factory, provider, expired_hash, available_hash) = populated_provider();
     provider.raise_history_floor(2);
 
-    assert!(provider.transaction_id(expired_hash).unwrap().is_none());
-    assert!(provider.transaction_by_hash(expired_hash).unwrap().is_none());
-
-    assert_eq!(provider.transaction_id(available_hash).unwrap(), Some(2));
-    assert!(provider.transaction_by_hash(available_hash).unwrap().is_some());
+    for hash in [expired_hash, available_hash, TxHash::ZERO] {
+        assert!(matches!(provider.transaction_id(hash), Err(ProviderError::UnsupportedProvider)));
+        assert!(matches!(
+            provider.transaction_by_hash(hash),
+            Err(ProviderError::UnsupportedProvider)
+        ));
+        assert!(matches!(provider.receipt_by_hash(hash), Err(ProviderError::UnsupportedProvider)));
+    }
 }
 
 #[test]
@@ -135,13 +144,4 @@ fn direct_static_receipt_ranges_obey_the_body_floor() {
 
     assert_expired(provider.receipts_by_tx_range(1..2), 1, 2);
     assert_eq!(provider.receipts_by_tx_range(2..3).unwrap().len(), 1);
-}
-
-#[test]
-fn direct_static_receipt_hash_reads_obey_the_body_floor() {
-    let (_factory, provider, expired_hash, available_hash) = populated_provider();
-    provider.raise_history_floor(2);
-
-    assert!(provider.receipt_by_hash(expired_hash).unwrap().is_none());
-    assert!(provider.receipt_by_hash(available_hash).unwrap().is_some());
 }

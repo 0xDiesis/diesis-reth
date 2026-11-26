@@ -1,12 +1,11 @@
 use crate::{
     db_ext::DbTxPruneExt,
-    segments::{self, PruneInput, Segment},
+    segments::{self, checkpoint_block, PruneInput, Segment},
     PrunerError,
 };
 use reth_db_api::{tables, transaction::DbTxMut};
 use reth_provider::{
-    BlockReader, DBProvider, EitherWriterDestination, StaticFileProviderFactory,
-    StorageSettingsCache,
+    DBProvider, EitherWriterDestination, StaticFileProviderFactory, StorageSettingsCache,
 };
 use reth_prune_types::{
     PruneMode, PruneProgress, PrunePurpose, PruneSegment, SegmentOutput, SegmentOutputCheckpoint,
@@ -27,8 +26,7 @@ impl SenderRecovery {
 
 impl<Provider> Segment<Provider> for SenderRecovery
 where
-    Provider:
-        DBProvider<Tx: DbTxMut> + BlockReader + StorageSettingsCache + StaticFileProviderFactory,
+    Provider: DBProvider<Tx: DbTxMut> + StorageSettingsCache + StaticFileProviderFactory,
 {
     fn segment(&self) -> PruneSegment {
         PruneSegment::SenderRecovery
@@ -69,7 +67,7 @@ where
         }
         debug!(target: "pruner", "Pruning transaction senders from database.");
 
-        let tx_range = match input.get_next_tx_num_range(provider)? {
+        let tx_range = match input.get_next_tx_num_range(provider.tx_ref())? {
             Some(range) => range,
             None => {
                 trace!(target: "pruner", "No transaction senders to prune");
@@ -83,9 +81,7 @@ where
             let pruned = provider.tx_ref().clear_table::<tables::TransactionSenders>()?;
             trace!(target: "pruner", %pruned, "Cleared transaction senders table");
 
-            let last_pruned_block = provider
-                .block_by_transaction_id(tx_range_end)?
-                .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?;
+            let last_pruned_block = checkpoint_block(provider.tx_ref(), tx_range_end)?;
 
             return Ok(SegmentOutput {
                 progress: PruneProgress::Finished,
@@ -109,9 +105,7 @@ where
             )?;
         trace!(target: "pruner", %pruned, %done, "Pruned transaction senders");
 
-        let last_pruned_block = provider
-            .block_by_transaction_id(last_pruned_transaction)?
-            .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
+        let last_pruned_block = checkpoint_block(provider.tx_ref(), last_pruned_transaction)?
             // If there's more transaction senders to prune, set the checkpoint block number to
             // previous, so we could finish pruning its transaction senders on the next run.
             .checked_sub(if done { 0 } else { 1 });

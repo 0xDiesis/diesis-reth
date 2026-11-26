@@ -2,7 +2,8 @@ use super::ConsistentProvider;
 use crate::{
     providers::blockchain_provider::BlockchainProvider,
     test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
-    BlockReaderIdExt, BlockWriter, ProviderError, ReceiptProviderIdExt, StaticFileProviderFactory,
+    BlockReaderIdExt, BlockWriter, HeaderProvider, ProviderError, ReceiptProvider,
+    ReceiptProviderIdExt, StaticFileProviderFactory,
 };
 use alloy_consensus::Header;
 use alloy_eips::{BlockId, BlockNumberOrTag};
@@ -14,7 +15,11 @@ use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
 use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
 use reth_trie::bundle_state::BundleState;
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    ops::{Bound, Range},
+    sync::Arc,
+};
 
 fn assert_expired<T: Debug>(result: ProviderResult<T>, requested: u64, earliest_available: u64) {
     match result {
@@ -112,4 +117,21 @@ fn noncanonical_receipt_fallback_cannot_bypass_the_body_floor() -> eyre::Result<
     let available = BlockId::Hash(blocks[2].hash().into());
     assert_eq!(provider.receipts_by_block_id(available)?.unwrap().len(), 1);
     Ok(())
+}
+
+#[test]
+fn empty_boundary_ranges_do_not_access_history() {
+    let provider = tagged_provider(1, 1);
+    for bounds in [
+        (Bound::Included(0), Bound::Excluded(0)),
+        (Bound::Unbounded, Bound::Excluded(0)),
+        (Bound::Excluded(u64::MAX), Bound::Unbounded),
+        (Bound::Included(2), Bound::Included(1)),
+    ] {
+        assert!(provider.headers_range(bounds).unwrap().is_empty());
+        assert!(provider.receipts_by_tx_range(bounds).unwrap().is_empty());
+    }
+    let empty = Range { start: 0, end: 0 };
+    assert!(provider.headers_range(empty.clone()).unwrap().is_empty());
+    assert!(provider.receipts_by_tx_range(empty).unwrap().is_empty());
 }

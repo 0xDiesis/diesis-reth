@@ -89,7 +89,6 @@ fn every_header_family_enforces_only_the_header_floor() {
     provider.raise_header_history_floor(1);
 
     assert_expired(provider.header_by_number(0), 0, 1);
-    assert_expired(provider.header(B256::with_last_byte(1)), 0, 1);
     assert_expired(provider.headers_range(0..=1), 0, 1);
     assert_expired(provider.sealed_header(0), 0, 1);
     assert_expired(provider.sealed_headers_range(0..=1), 0, 1);
@@ -97,11 +96,23 @@ fn every_header_family_enforces_only_the_header_floor() {
     assert_expired(provider.canonical_hashes_range(0, 2), 0, 1);
 
     assert!(provider.header_by_number(1).unwrap().is_some());
-    assert!(provider.header(B256::with_last_byte(2)).unwrap().is_some());
     assert_eq!(provider.headers_range(1..=1).unwrap().len(), 1);
     assert!(provider.sealed_header(1).unwrap().is_some());
     assert_eq!(provider.sealed_headers_range(1..=1).unwrap().len(), 1);
     assert_eq!(provider.block_hash(1).unwrap(), Some(B256::with_last_byte(2)));
     assert_eq!(provider.canonical_hashes_range(1, 2).unwrap().len(), 1);
     assert!(provider.headers_range(RangeInclusive::new(2, 1)).unwrap().is_empty());
+}
+
+#[test]
+fn standalone_header_hash_lookups_require_an_index() {
+    let (static_dir, _) = create_test_static_files_dir();
+    let provider: StaticFileProvider<EthPrimitives> =
+        StaticFileProviderBuilder::read_write(&static_dir).build().unwrap();
+    append_empty_history(&provider, 0);
+    provider.raise_header_history_floor(1);
+
+    for hash in [B256::with_last_byte(1), B256::with_last_byte(2), B256::ZERO] {
+        assert!(matches!(provider.header(hash), Err(ProviderError::UnsupportedProvider)));
+    }
 }

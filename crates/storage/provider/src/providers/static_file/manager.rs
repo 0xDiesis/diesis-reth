@@ -2196,27 +2196,6 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
     }
 
-    /// Iterates through segment `static_files` in reverse order, executing a function until it
-    /// returns some object. Useful for finding objects by [`TxHash`] or [`BlockHash`].
-    pub fn find_static_file<T>(
-        &self,
-        segment: StaticFileSegment,
-        func: impl Fn(StaticFileJarProvider<'_, N>) -> ProviderResult<Option<T>>,
-    ) -> ProviderResult<Option<T>> {
-        if let Some(ranges) =
-            self.indexes.read().get(segment).map(|index| &index.expected_block_ranges_by_max_block)
-        {
-            // Iterate through all ranges in reverse order (highest to lowest)
-            for range in ranges.values().rev() {
-                if let Some(res) = func(self.get_or_create_jar_provider(segment, range)?)? {
-                    return Ok(Some(res));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Fetches data within a specified range across multiple static files.
     ///
     /// This function iteratively retrieves data using `get_fn` for each item in the given range.
@@ -2786,19 +2765,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvider<N> {
     type Header = N::BlockHeader;
 
-    fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        self.find_static_file(StaticFileSegment::Headers, |jar| {
-            let Some(blocks) = jar.user_header().block_range() else { return Ok(None) };
-            let mut cursor = jar.cursor()?;
-            // Static files index rows by number. The database provider has a separate hash index.
-            for number in (blocks.start()..=blocks.end()).rev() {
-                if cursor.get_one::<BlockHashMask>(number.into())? == Some(block_hash) {
-                    self.ensure_header_history_available(number)?;
-                    return cursor.get_one::<HeaderMask<Self::Header>>(number.into())
-                }
-            }
-            Ok(None)
-        })
+    fn header(&self, _block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
+        // Static files index headers by block number. Hash lookups need the database index.
+        Err(ProviderError::UnsupportedProvider)
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
@@ -2922,11 +2891,8 @@ impl<N: NodePrimitives<SignedTx: Value + SignedTransaction, Receipt: Value>> Rec
             })
     }
 
-    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
-        if let Some(num) = self.transaction_id(hash)? {
-            return self.receipt(num);
-        }
-        Ok(None)
+    fn receipt_by_hash(&self, _hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
+        Err(ProviderError::UnsupportedProvider)
     }
 
     fn receipts_by_block(
@@ -3024,41 +2990,14 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
     }
 }
 
-impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> StaticFileProvider<N> {
-    fn find_transaction(&self, hash: TxHash) -> ProviderResult<Option<(TxNumber, N::SignedTx)>> {
-        self.find_static_file(StaticFileSegment::Transactions, |jar| {
-            let header = jar.user_header();
-            if header
-                .block_range()
-                .is_some_and(|blocks| blocks.end() < self.earliest_history_height())
-            {
-                return Ok(None)
-            }
-            let Some(txs) = header.tx_range() else { return Ok(None) };
-            let mut cursor = jar.cursor()?;
-            for id in (txs.start()..=txs.end()).rev() {
-                if let Some(tx) = cursor.get_one::<TransactionMask<N::SignedTx>>(id.into())? &&
-                    *tx.tx_hash() == hash
-                {
-                    return match self.ensure_jar_transaction_history(header, id) {
-                        Ok(()) => Ok(Some((id, tx))),
-                        Err(ProviderError::BlockExpired { .. }) => Ok(None),
-                        Err(err) => Err(err),
-                    }
-                }
-            }
-            Ok(None)
-        })
-    }
-}
-
 impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsProvider
     for StaticFileProvider<N>
 {
     type Transaction = N::SignedTx;
 
-    fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
-        Ok(self.find_transaction(tx_hash)?.map(|(id, _)| id))
+    fn transaction_id(&self, _tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
+        // Static files index transactions by number. Hash lookups need the database index.
+        Err(ProviderError::UnsupportedProvider)
     }
 
     fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
@@ -3094,8 +3033,8 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
             })
     }
 
-    fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        Ok(self.find_transaction(hash)?.map(|(_, tx)| tx))
+    fn transaction_by_hash(&self, _hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
+        Err(ProviderError::UnsupportedProvider)
     }
 
     fn transaction_by_hash_with_meta(
