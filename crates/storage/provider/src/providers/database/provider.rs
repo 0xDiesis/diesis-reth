@@ -1443,7 +1443,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         }
         // The pivot's own body is never stored, so reads of `pivot` find nothing while blocks
         // below it are reported as expired.
-        static_files.set_earliest_history_height(pivot);
+        static_files.raise_history_floor(pivot);
         Ok(())
     }
 }
@@ -2047,7 +2047,11 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     }
 
     fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
-        self.ensure_transaction_history(id)
+        let block = super::history_floor::transaction_block(&self.tx, id)?;
+        if let Some(block) = block {
+            self.ensure_body_history(block)?;
+        }
+        Ok(block)
     }
 }
 
@@ -2074,7 +2078,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
             let mut reader = EitherReader::new_transaction_hash_numbers(self, rocksdb_ref)?;
             reader.get_transaction_hash_number(tx_hash)
         })?;
-        if let Some(id) = id && self.transaction_history_is_expired(id)? {
+        if let Some(id) = id &&
+            self.transaction_history_is_expired(id)?
+        {
             return Ok(None)
         }
         Ok(id)
@@ -2105,31 +2111,30 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
-        if let Some(transaction_id) = self.transaction_id(tx_hash)? {
-            if let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
-                let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
-                let Some(sealed_header) = self.sealed_header(block_number)?
-            {
-                let (header, block_hash) = sealed_header.split();
-                if let Some(block_body) = self.block_body_indices(block_number)? {
-                    // the index of the tx in the block is the offset:
-                    // len([start..tx_id])
-                    // NOTE: `transaction_id` is always `>=` the block's first
-                    // index
-                    let index = transaction_id - block_body.first_tx_num();
+        if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
+            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
+            let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
+            let Some(sealed_header) = self.sealed_header(block_number)?
+        {
+            let (header, block_hash) = sealed_header.split();
+            if let Some(block_body) = self.block_body_indices(block_number)? {
+                // the index of the tx in the block is the offset:
+                // len([start..tx_id])
+                // NOTE: `transaction_id` is always `>=` the block's first
+                // index
+                let index = transaction_id - block_body.first_tx_num();
 
-                    let meta = TransactionMeta {
-                        tx_hash,
-                        index,
-                        block_hash,
-                        block_number,
-                        base_fee: header.base_fee_per_gas(),
-                        excess_blob_gas: header.excess_blob_gas(),
-                        timestamp: header.timestamp(),
-                    };
+                let meta = TransactionMeta {
+                    tx_hash,
+                    index,
+                    block_hash,
+                    block_number,
+                    base_fee: header.base_fee_per_gas(),
+                    excess_blob_gas: header.excess_blob_gas(),
+                    timestamp: header.timestamp(),
+                };
 
-                    return Ok(Some((transaction, meta)))
-                }
+                return Ok(Some((transaction, meta)))
             }
         }
 
@@ -2140,15 +2145,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        if let Some(block_number) = self.convert_hash_or_number(id)? {
-            self.ensure_body_history(block_number)?;
-            if let Some(body) = self.block_body_indices(block_number)? {
-                let tx_range = body.tx_num_range();
-                return if tx_range.is_empty() {
-                    Ok(Some(Vec::new()))
-                } else {
-                    self.transactions_by_tx_range(tx_range).map(Some)
-                }
+        if let Some(block_number) = self.convert_hash_or_number(id)? &&
+            let Some(body) = self.block_body_indices(block_number)?
+        {
+            let tx_range = body.tx_num_range();
+            return if tx_range.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                self.transactions_by_tx_range(tx_range).map(Some)
             }
         }
         Ok(None)
@@ -2162,7 +2166,6 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         if range.is_empty() {
             return Ok(Vec::new())
         }
-        self.ensure_body_range(&range)?;
 
         self.block_body_indices_range(range.start..=range.end.saturating_sub(1))?
             .into_iter()
@@ -2234,21 +2237,20 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        if let Some(number) = self.convert_hash_or_number(block)? {
-            self.ensure_body_history(number)?;
-            if let Some(body) = self.block_body_indices(number)? {
-                let tx_range = body.tx_num_range();
-                return if tx_range.is_empty() {
-                    Ok(Some(Vec::new()))
-                } else {
-                    let receipts = self.receipts_by_tx_range(tx_range)?;
+        if let Some(number) = self.convert_hash_or_number(block)? &&
+            let Some(body) = self.block_body_indices(number)?
+        {
+            let tx_range = body.tx_num_range();
+            return if tx_range.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                let receipts = self.receipts_by_tx_range(tx_range)?;
 
-                    if receipts.len() != body.tx_count as usize {
-                        return Ok(None)
-                    }
-
-                    Ok(Some(receipts))
+                if receipts.len() != body.tx_count as usize {
+                    return Ok(None)
                 }
+
+                Ok(Some(receipts))
             }
         }
         Ok(None)

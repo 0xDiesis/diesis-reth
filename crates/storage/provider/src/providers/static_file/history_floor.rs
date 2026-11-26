@@ -6,7 +6,7 @@ pub(super) fn raise_floor(floor: &AtomicU64, first_available: BlockNumber) {
     floor.fetch_max(first_available, Ordering::Relaxed);
 }
 
-pub(super) fn ensure_available(
+pub(super) const fn ensure_available(
     requested: BlockNumber,
     earliest_available: BlockNumber,
 ) -> ProviderResult<()> {

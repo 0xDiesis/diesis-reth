@@ -1,7 +1,8 @@
 use super::{
     history_floor::{ensure_available, raise_floor},
-    metrics::StaticFileProviderMetrics, writer::StaticFileWriters, LoadedJar,
-    StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
+    metrics::StaticFileProviderMetrics,
+    writer::StaticFileWriters,
+    LoadedJar, StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
 };
 use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
@@ -59,7 +60,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, OnceLock,
     },
 };
 use tracing::{debug, info, info_span, instrument, trace, warn};
@@ -301,6 +302,16 @@ impl BeforeCacheInsertHook {
     }
 }
 
+struct TransactionBlockLookup(
+    Box<dyn Fn(TxNumber) -> ProviderResult<Option<BlockNumber>> + Send + Sync>,
+);
+
+impl Debug for TransactionBlockLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionBlockLookup").finish_non_exhaustive()
+    }
+}
+
 /// [`StaticFileProviderInner`] manages all existing [`StaticFileJarProvider`].
 #[derive(Debug)]
 pub struct StaticFileProviderInner<N> {
@@ -323,6 +334,8 @@ pub struct StaticFileProviderInner<N> {
     /// This additional tracker exists for more efficient lookups because the node must be aware of
     /// the expired height.
     earliest_history_height: AtomicU64,
+    /// Resolves transaction numbers when a static file contains expired history.
+    transaction_block_lookup: OnceLock<TransactionBlockLookup>,
     /// First block whose header is available to provider readers.
     earliest_header_height: AtomicU64,
     /// Directory where `static_files` are located
@@ -365,6 +378,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             indexes: Default::default(),
             writers: Default::default(),
             earliest_history_height: Default::default(),
+            transaction_block_lookup: Default::default(),
             earliest_header_height: Default::default(),
             path: path.as_ref().to_path_buf(),
             metrics: None,
@@ -1423,7 +1437,10 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 let mut last_block = highest_block.unwrap_or_default();
                 debug!(target: "reth::providers::static_file", last_block, highest_tx, "Verifying last transaction matches last block indices");
                 loop {
-                    let Some(indices) = provider.block_body_indices(last_block)? else {
+                    // Verification needs persisted indices even when the block body has expired.
+                    let Some(indices) =
+                        provider.tx_ref().get::<tables::BlockBodyIndices>(last_block)?
+                    else {
                         debug!(target: "reth::providers::static_file", last_block, "Block body indices not found, static files ahead of database");
                         // If the block body indices can not be found, then it means that static
                         // files is ahead of database, and the `ensure_invariants` check will fix
@@ -1590,9 +1607,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         block: BlockNumber,
     ) -> ProviderResult<Option<TxNumber>>
     where
-        Provider: BlockReader + PruneCheckpointReader,
+        Provider: DBProvider + PruneCheckpointReader,
     {
-        if let Some(indices) = provider.block_body_indices(block)? {
+        if let Some(indices) = provider.tx_ref().get::<tables::BlockBodyIndices>(block)? {
             return Ok(Some(indices.next_tx_num()))
         }
         Ok(provider
@@ -2029,9 +2046,49 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         self.earliest_history_height.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Sets the earliest available block number, matching what [`Self::initialize_index`] derives.
-    pub(crate) fn set_earliest_history_height(&self, block: BlockNumber) {
-        self.earliest_history_height.store(block, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn set_transaction_block_lookup(
+        &self,
+        lookup: impl Fn(TxNumber) -> ProviderResult<Option<BlockNumber>> + Send + Sync + 'static,
+    ) {
+        self.transaction_block_lookup.get_or_init(|| TransactionBlockLookup(Box::new(lookup)));
+    }
+
+    fn ensure_jar_transaction_history(
+        &self,
+        header: &SegmentHeader,
+        id: TxNumber,
+    ) -> ProviderResult<()> {
+        let floor = self.earliest_history_height();
+        let Some(blocks) = header.block_range() else { return Ok(()) };
+        if blocks.start() >= floor || !header.tx_range().is_some_and(|txs| txs.contains(id)) {
+            return Ok(())
+        }
+
+        // Jar headers describe the entire file. The database can resolve the exact block for
+        // a transaction when a file straddles the floor.
+        if let Some(block) =
+            self.transaction_block_lookup.get().map(|lookup| (lookup.0)(id)).transpose()?.flatten()
+        {
+            return ensure_available(block, floor);
+        }
+        if blocks.end() < floor {
+            return ensure_available(blocks.start(), floor);
+        }
+        Err(ProviderError::UnsupportedProvider)
+    }
+
+    fn ensure_static_transaction_range(
+        &self,
+        segment: StaticFileSegment,
+        range: &Range<TxNumber>,
+    ) -> ProviderResult<()> {
+        if !range.is_empty() &&
+            self.earliest_history_height() > 0 &&
+            let Some(jar) = self.get_maybe_segment_provider(segment, range.start)?
+        {
+            self.ensure_jar_transaction_history(jar.user_header(), range.start)?;
+        }
+        Ok(())
     }
 
     /// Raises the first block whose body history may be returned.
@@ -2730,21 +2787,18 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
     type Header = N::BlockHeader;
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        let header = self.find_static_file(StaticFileSegment::Headers, |jar_provider| {
-            Ok(jar_provider
-                .cursor()?
-                .get_two::<HeaderWithHashMask<Self::Header>>((&block_hash).into())?
-                .and_then(|(header, hash)| {
-                    if hash == block_hash {
-                        return Some(header);
-                    }
-                    None
-                }))
-        })?;
-        if let Some(header) = &header {
-            self.ensure_header_history_available(header.number())?;
-        }
-        Ok(header)
+        self.find_static_file(StaticFileSegment::Headers, |jar| {
+            let Some(blocks) = jar.user_header().block_range() else { return Ok(None) };
+            let mut cursor = jar.cursor()?;
+            // Static files index rows by number. The database provider has a separate hash index.
+            for number in (blocks.start()..=blocks.end()).rev() {
+                if cursor.get_one::<BlockHashMask>(number.into())? == Some(block_hash) {
+                    self.ensure_header_history_available(number)?;
+                    return cursor.get_one::<HeaderMask<Self::Header>>(number.into())
+                }
+            }
+            Ok(None)
+        })
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
@@ -2855,7 +2909,10 @@ impl<N: NodePrimitives<SignedTx: Value + SignedTransaction, Receipt: Value>> Rec
 
     fn receipt(&self, num: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
         self.get_segment_provider_for_transaction(StaticFileSegment::Receipts, num, None)
-            .and_then(|provider| provider.receipt(num))
+            .and_then(|provider| {
+                self.ensure_jar_transaction_history(provider.user_header(), num)?;
+                provider.receipt(num)
+            })
             .or_else(|err| {
                 if let ProviderError::MissingStaticFileTx(_, _) = err {
                     Ok(None)
@@ -2883,9 +2940,14 @@ impl<N: NodePrimitives<SignedTx: Value + SignedTransaction, Receipt: Value>> Rec
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
+        let range = to_range(range);
+        self.ensure_static_transaction_range(StaticFileSegment::Receipts, &range)?;
+        if range.is_empty() {
+            return Ok(Vec::new())
+        }
         self.fetch_range_with_predicate(
             StaticFileSegment::Receipts,
-            to_range(range),
+            range,
             |cursor, number| cursor.get_one::<ReceiptMask<Self::Receipt>>(number.into()),
             |_| true,
         )
@@ -2906,6 +2968,10 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
         &self,
         tx_range: Range<TxNumber>,
     ) -> ProviderResult<Vec<(TxHash, TxNumber)>> {
+        self.ensure_static_transaction_range(StaticFileSegment::Transactions, &tx_range)?;
+        if tx_range.is_empty() {
+            return Ok(Vec::new())
+        }
         let tx_range_size = (tx_range.end - tx_range.start) as usize;
 
         // Transactions are different size, so chunks will not all take the same processing time. If
@@ -2958,29 +3024,49 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
     }
 }
 
+impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> StaticFileProvider<N> {
+    fn find_transaction(&self, hash: TxHash) -> ProviderResult<Option<(TxNumber, N::SignedTx)>> {
+        self.find_static_file(StaticFileSegment::Transactions, |jar| {
+            let header = jar.user_header();
+            if header
+                .block_range()
+                .is_some_and(|blocks| blocks.end() < self.earliest_history_height())
+            {
+                return Ok(None)
+            }
+            let Some(txs) = header.tx_range() else { return Ok(None) };
+            let mut cursor = jar.cursor()?;
+            for id in (txs.start()..=txs.end()).rev() {
+                if let Some(tx) = cursor.get_one::<TransactionMask<N::SignedTx>>(id.into())? &&
+                    *tx.tx_hash() == hash
+                {
+                    return match self.ensure_jar_transaction_history(header, id) {
+                        Ok(()) => Ok(Some((id, tx))),
+                        Err(ProviderError::BlockExpired { .. }) => Ok(None),
+                        Err(err) => Err(err),
+                    }
+                }
+            }
+            Ok(None)
+        })
+    }
+}
+
 impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsProvider
     for StaticFileProvider<N>
 {
     type Transaction = N::SignedTx;
 
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
-        self.find_static_file(StaticFileSegment::Transactions, |jar_provider| {
-            let mut cursor = jar_provider.cursor()?;
-            if cursor
-                .get_one::<TransactionMask<Self::Transaction>>((&tx_hash).into())?
-                .and_then(|tx| (*tx.tx_hash() == tx_hash).then_some(tx))
-                .is_some()
-            {
-                Ok(cursor.number())
-            } else {
-                Ok(None)
-            }
-        })
+        Ok(self.find_transaction(tx_hash)?.map(|(id, _)| id))
     }
 
     fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
         self.get_segment_provider_for_transaction(StaticFileSegment::Transactions, num, None)
-            .and_then(|provider| provider.transaction_by_id(num))
+            .and_then(|provider| {
+                self.ensure_jar_transaction_history(provider.user_header(), num)?;
+                provider.transaction_by_id(num)
+            })
             .or_else(|err| {
                 if let ProviderError::MissingStaticFileTx(_, _) = err {
                     Ok(None)
@@ -2995,7 +3081,10 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
         num: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
         self.get_segment_provider_for_transaction(StaticFileSegment::Transactions, num, None)
-            .and_then(|provider| provider.transaction_by_id_unhashed(num))
+            .and_then(|provider| {
+                self.ensure_jar_transaction_history(provider.user_header(), num)?;
+                provider.transaction_by_id_unhashed(num)
+            })
             .or_else(|err| {
                 if let ProviderError::MissingStaticFileTx(_, _) = err {
                     Ok(None)
@@ -3006,12 +3095,7 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        self.find_static_file(StaticFileSegment::Transactions, |jar_provider| {
-            Ok(jar_provider
-                .cursor()?
-                .get_one::<TransactionMask<Self::Transaction>>((&hash).into())?
-                .and_then(|tx| (*tx.tx_hash() == hash).then_some(tx)))
-        })
+        Ok(self.find_transaction(hash)?.map(|(_, tx)| tx))
     }
 
     fn transaction_by_hash_with_meta(
@@ -3042,9 +3126,14 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
+        let range = to_range(range);
+        self.ensure_static_transaction_range(StaticFileSegment::Transactions, &range)?;
+        if range.is_empty() {
+            return Ok(Vec::new())
+        }
         self.fetch_range_with_predicate(
             StaticFileSegment::Transactions,
-            to_range(range),
+            range,
             |cursor, number| cursor.get_one::<TransactionMask<Self::Transaction>>(number.into()),
             |_| true,
         )
@@ -3054,9 +3143,14 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Address>> {
+        let range = to_range(range);
+        self.ensure_static_transaction_range(StaticFileSegment::TransactionSenders, &range)?;
+        if range.is_empty() {
+            return Ok(Vec::new())
+        }
         self.fetch_range_with_predicate(
             StaticFileSegment::TransactionSenders,
-            to_range(range),
+            range,
             |cursor, number| cursor.get_one::<TransactionSenderMask>(number.into()),
             |_| true,
         )
@@ -3064,7 +3158,10 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
 
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
         self.get_segment_provider_for_transaction(StaticFileSegment::TransactionSenders, id, None)
-            .and_then(|provider| provider.transaction_sender(id))
+            .and_then(|provider| {
+                self.ensure_jar_transaction_history(provider.user_header(), id)?;
+                provider.transaction_sender(id)
+            })
             .or_else(|err| {
                 if let ProviderError::MissingStaticFileTx(_, _) = err {
                     Ok(None)

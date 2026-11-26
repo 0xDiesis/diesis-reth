@@ -13,7 +13,7 @@ use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
 use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
-use revm::database::BundleState;
+use reth_trie::bundle_state::BundleState;
 use std::{fmt::Debug, sync::Arc};
 
 fn assert_expired<T: Debug>(result: ProviderResult<T>, requested: u64, earliest_available: u64) {

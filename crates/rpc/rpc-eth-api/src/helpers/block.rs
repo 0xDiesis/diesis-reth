@@ -1,6 +1,9 @@
 //! Database access for `eth_` block RPC methods. Loads block and receipt data w.r.t. network.
 
-use super::{history_floor::ensure_body_history, LoadPendingBlock, LoadReceipt, SpawnBlocking};
+use super::{
+    history_floor::{ensure_provider_body_history, history_block_hash},
+    LoadPendingBlock, LoadReceipt, SpawnBlocking,
+};
 use crate::{
     node::RpcNodeCoreExt, EthApiTypes, FromEthApiError, FullEthApiTypes, RpcBlock, RpcNodeCore,
     RpcReceipt,
@@ -17,7 +20,9 @@ use reth_primitives_traits::{
 };
 use reth_rpc_convert::{transaction::ConvertReceiptInput, RpcConvert, RpcHeader};
 use reth_rpc_eth_types::block::SharedReceipts;
-use reth_storage_api::{BlockIdReader, BlockReader, ProviderHeader, ProviderReceipt, ProviderTx};
+use reth_storage_api::{
+    BlockReader, BlockReaderIdExt, ProviderHeader, ProviderReceipt, ProviderTx,
+};
 use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use std::sync::Arc;
 
@@ -44,10 +49,14 @@ pub trait EthBlocks: LoadBlock<RpcConvert: RpcConvert<Primitives = Self::Primiti
         Self: FullEthApiTypes,
     {
         async move {
-            let Some(block) = self.recovered_block(block_id).await? else { return Ok(None) };
+            let header = if block_id.is_pending() {
+                self.recovered_block(block_id).await?.map(|block| block.clone_sealed_header())
+            } else {
+                self.provider().sealed_header_by_id(block_id).map_err(Self::Error::from_eth_err)?
+            };
+
             // Header responses omit the block size: https://github.com/ethereum/execution-apis/pull/877
-            let header = self.converter().convert_header(block.clone_sealed_header(), None)?;
-            Ok(Some(header))
+            Ok(header.map(|header| self.converter().convert_header(header, None)).transpose()?)
         }
     }
 
@@ -181,31 +190,17 @@ pub trait EthBlocks: LoadBlock<RpcConvert: RpcConvert<Primitives = Self::Primiti
                 }
             }
 
-            if let Some(number) = self
-                .provider()
-                .block_number_for_id(block_id)
-                .map_err(Self::Error::from_eth_err)?
-            {
-                let earliest = self
-                    .provider()
-                    .earliest_block_number()
-                    .map_err(Self::Error::from_eth_err)?;
-                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
-            }
-
-            if let Some(block_hash) = self
-                .provider()
-                .block_hash_for_id(block_id)
-                .map_err(Self::Error::from_eth_err)?
-            {
-                if let Some((block, receipts)) = self
+            if let Some(block_hash) =
+                history_block_hash(self.provider(), block_id).map_err(Self::Error::from_eth_err)? &&
+                let Some((block, receipts)) = self
                     .cache()
                     .get_block_and_receipts(block_hash)
                     .await
                     .map_err(Self::Error::from_eth_err)?
-                {
-                    return Ok(Some((block, receipts.into())));
-                }
+            {
+                ensure_provider_body_history(self.provider(), block.number())
+                    .map_err(Self::Error::from_eth_err)?;
+                return Ok(Some((block, receipts.into())));
             }
 
             Ok(None)
@@ -303,28 +298,21 @@ pub trait LoadBlock: LoadPendingBlock + SpawnBlocking + RpcNodeCoreExt {
                 };
             }
 
-            let block_hash = match self
-                .provider()
-                .block_hash_for_id(block_id)
-                .map_err(Self::Error::from_eth_err)?
-            {
-                Some(block_hash) => block_hash,
-                None => return Ok(None),
+            let Some(block_hash) =
+                history_block_hash(self.provider(), block_id).map_err(Self::Error::from_eth_err)?
+            else {
+                return Ok(None);
             };
-
-            if let Some(number) = self
-                .provider()
-                .block_number_for_id(block_id)
-                .map_err(Self::Error::from_eth_err)?
-            {
-                let earliest = self
-                    .provider()
-                    .earliest_block_number()
+            let block = self
+                .cache()
+                .get_recovered_block(block_hash)
+                .await
+                .map_err(Self::Error::from_eth_err)?;
+            if let Some(block) = &block {
+                ensure_provider_body_history(self.provider(), block.number())
                     .map_err(Self::Error::from_eth_err)?;
-                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
             }
-
-            self.cache().get_recovered_block(block_hash).await.map_err(Self::Error::from_eth_err)
+            Ok(block)
         }
     }
 
@@ -351,19 +339,21 @@ pub trait LoadBlock: LoadPendingBlock + SpawnBlocking + RpcNodeCoreExt {
                 return Ok(self.recovered_block(block_id).await?.map(|block| (block, None)));
             }
 
-            let block_hash = match self
-                .provider()
-                .block_hash_for_id(block_id)
-                .map_err(Self::Error::from_eth_err)?
-            {
-                Some(block_hash) => block_hash,
-                None => return Ok(None),
+            let Some(block_hash) =
+                history_block_hash(self.provider(), block_id).map_err(Self::Error::from_eth_err)?
+            else {
+                return Ok(None);
             };
-
-            self.cache()
+            let result = self
+                .cache()
                 .get_recovered_block_and_maybe_bal(block_hash)
                 .await
-                .map_err(Self::Error::from_eth_err)
+                .map_err(Self::Error::from_eth_err)?;
+            if let Some((block, _)) = &result {
+                ensure_provider_body_history(self.provider(), block.number())
+                    .map_err(Self::Error::from_eth_err)?;
+            }
+            Ok(result)
         }
     }
 }

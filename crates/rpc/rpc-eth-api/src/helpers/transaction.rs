@@ -2,7 +2,7 @@
 //! network.
 
 use super::{
-    history_floor::{body_history_is_expired, ensure_body_history},
+    history_floor::{body_history_is_expired, ensure_provider_body_history, history_block_hash},
     EthApiSpec, EthSigner, LoadBlock, LoadFee, LoadReceipt, LoadState, SpawnBlocking,
 };
 use crate::{
@@ -221,20 +221,19 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
     ) -> impl Future<Output = Result<Option<Vec<ProviderTx<Self::Provider>>>, Self::Error>> + Send
     {
         async move {
-            if let Some(number) =
-                self.provider().block_number(block).map_err(Self::Error::from_eth_err)?
-            {
-                let earliest = self
-                    .provider()
-                    .earliest_block_number()
-                    .map_err(Self::Error::from_eth_err)?;
-                ensure_body_history(number, earliest).map_err(Self::Error::from_eth_err)?;
-            }
-            self.cache()
-                .get_recovered_block(block)
-                .await
-                .map(|b| b.map(|b| b.body().transactions().to_vec()))
-                .map_err(Self::Error::from_eth_err)
+            let Some(hash) = history_block_hash(self.provider(), block.into())
+                .map_err(Self::Error::from_eth_err)?
+            else {
+                return Ok(None);
+            };
+            let Some(block) =
+                self.cache().get_recovered_block(hash).await.map_err(Self::Error::from_eth_err)?
+            else {
+                return Ok(None);
+            };
+            ensure_provider_body_history(self.provider(), block.number())
+                .map_err(Self::Error::from_eth_err)?;
+            Ok(Some(block.body().transactions().to_vec()))
         }
     }
 
@@ -332,10 +331,8 @@ pub trait EthTransactions: LoadTransaction<Provider: BlockReaderIdExt> {
             if let Some(cached) = self.cache().get_transaction_by_hash(hash).await &&
                 let Some(tx) = cached.recovered_transaction().map(|tx| tx.cloned())
             {
-                let earliest = self
-                    .provider()
-                    .earliest_block_number()
-                    .map_err(Self::Error::from_eth_err)?;
+                let earliest =
+                    self.provider().earliest_block_number().map_err(Self::Error::from_eth_err)?;
                 if body_history_is_expired(cached.block.number(), earliest) {
                     return Ok(None)
                 }
@@ -838,10 +835,8 @@ pub trait LoadTransaction: SpawnBlocking + FullEthApiTypes + RpcNodeCoreExt {
         async move {
             // First, try the RPC cache
             if let Some(cached) = self.cache().get_transaction_by_hash(hash).await {
-                let earliest = self
-                    .provider()
-                    .earliest_block_number()
-                    .map_err(Self::Error::from_eth_err)?;
+                let earliest =
+                    self.provider().earliest_block_number().map_err(Self::Error::from_eth_err)?;
                 if body_history_is_expired(cached.block.number(), earliest) {
                     return Ok(None)
                 }

@@ -1,13 +1,16 @@
-use super::{StaticFileProvider, StaticFileProviderBuilder};
-use crate::{ReceiptProvider, TransactionsProvider, TransactionsProviderExt};
+use super::StaticFileProvider;
+use crate::{
+    test_utils::{create_test_provider_factory, MockNodeTypesWithDB},
+    ProviderFactory, ReceiptProvider, StaticFileProviderFactory, StaticFileWriter,
+    TransactionsProvider, TransactionsProviderExt,
+};
 use alloy_consensus::{transaction::TxHashRef as _, SignableTransaction, TxLegacy};
 use alloy_primitives::{Address, BlockNumber, Signature, TxHash, U160};
-use reth_db::test_utils::create_test_static_files_dir;
+use reth_db_api::{tables, transaction::DbTxMut};
 use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::fmt::Debug;
-use tempfile::TempDir;
 
 fn assert_expired<T: Debug>(
     result: ProviderResult<T>,
@@ -25,10 +28,15 @@ fn assert_expired<T: Debug>(
     }
 }
 
-fn populated_provider() -> (TempDir, StaticFileProvider<EthPrimitives>, TxHash, TxHash) {
-    let (static_dir, _) = create_test_static_files_dir();
-    let provider: StaticFileProvider<EthPrimitives> =
-        StaticFileProviderBuilder::read_write(&static_dir).build().unwrap();
+fn populated_provider(
+) -> (ProviderFactory<MockNodeTypesWithDB>, StaticFileProvider<EthPrimitives>, TxHash, TxHash) {
+    let factory = create_test_provider_factory();
+    let provider = factory.static_file_provider();
+    let db = factory.provider_rw().unwrap();
+    for block in 0..=2 {
+        db.tx_ref().put::<tables::TransactionBlocks>(block, block).unwrap();
+    }
+    db.commit().unwrap();
 
     let mut hashes = Vec::new();
     {
@@ -61,12 +69,12 @@ fn populated_provider() -> (TempDir, StaticFileProvider<EthPrimitives>, TxHash, 
         writer.commit().unwrap();
     }
 
-    (static_dir, provider, hashes[1], hashes[2])
+    (factory, provider, hashes[1], hashes[2])
 }
 
 #[test]
 fn direct_static_transaction_number_reads_obey_the_body_floor() {
-    let (_static_dir, provider, _, _) = populated_provider();
+    let (_factory, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.transaction_by_id(1), 1, 2);
@@ -78,7 +86,7 @@ fn direct_static_transaction_number_reads_obey_the_body_floor() {
 
 #[test]
 fn direct_static_transaction_ranges_obey_the_body_floor() {
-    let (_static_dir, provider, _, _) = populated_provider();
+    let (_factory, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.transactions_by_tx_range(1..2), 1, 2);
@@ -92,7 +100,7 @@ fn direct_static_transaction_ranges_obey_the_body_floor() {
 
 #[test]
 fn direct_static_transaction_hash_reads_obey_the_body_floor() {
-    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+    let (_factory, provider, expired_hash, available_hash) = populated_provider();
     provider.raise_history_floor(2);
 
     assert!(provider.transaction_id(expired_hash).unwrap().is_none());
@@ -104,7 +112,7 @@ fn direct_static_transaction_hash_reads_obey_the_body_floor() {
 
 #[test]
 fn direct_static_transaction_sender_obeys_the_body_floor() {
-    let (_static_dir, provider, _, _) = populated_provider();
+    let (_factory, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.transaction_sender(1), 1, 2);
@@ -113,7 +121,7 @@ fn direct_static_transaction_sender_obeys_the_body_floor() {
 
 #[test]
 fn direct_static_receipt_number_reads_obey_the_body_floor() {
-    let (_static_dir, provider, _, _) = populated_provider();
+    let (_factory, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.receipt(1), 1, 2);
@@ -122,7 +130,7 @@ fn direct_static_receipt_number_reads_obey_the_body_floor() {
 
 #[test]
 fn direct_static_receipt_ranges_obey_the_body_floor() {
-    let (_static_dir, provider, _, _) = populated_provider();
+    let (_factory, provider, _, _) = populated_provider();
     provider.raise_history_floor(2);
 
     assert_expired(provider.receipts_by_tx_range(1..2), 1, 2);
@@ -131,7 +139,7 @@ fn direct_static_receipt_ranges_obey_the_body_floor() {
 
 #[test]
 fn direct_static_receipt_hash_reads_obey_the_body_floor() {
-    let (_static_dir, provider, expired_hash, available_hash) = populated_provider();
+    let (_factory, provider, expired_hash, available_hash) = populated_provider();
     provider.raise_history_floor(2);
 
     assert!(provider.receipt_by_hash(expired_hash).unwrap().is_none());

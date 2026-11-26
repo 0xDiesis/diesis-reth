@@ -5,10 +5,10 @@ use crate::{
     },
     traits::{BlockSource, ReceiptProvider},
     BalProvider, BalStoreHandle, BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider,
-    DatabaseProviderFactory, EitherWriterDestination, HeaderProvider, HeaderSyncGapProvider,
-    InMemoryBalStore, MetadataProvider, ProviderError, PruneCheckpointReader,
-    RocksDBProviderFactory, StageCheckpointReader, StateProviderBox, StaticFileProviderFactory,
-    StaticFileWriter, TransactionVariant, TransactionsProvider,
+    DatabaseProviderFactory, HeaderProvider, HeaderSyncGapProvider, InMemoryBalStore,
+    MetadataProvider, ProviderError, PruneCheckpointReader, RocksDBProviderFactory,
+    StageCheckpointReader, StateProviderBox, StaticFileProviderFactory, StaticFileWriter,
+    TransactionVariant, TransactionsProvider,
 };
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::BlockHashOrNumber;
@@ -152,6 +152,11 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
         )
         .storage_settings()?
         .unwrap_or(legacy_settings);
+
+        let history_db = db.clone();
+        static_file_provider.set_transaction_block_lookup(move |id| {
+            history_floor::transaction_block(&history_db.tx()?, id)
+        });
 
         Ok(Self {
             db,

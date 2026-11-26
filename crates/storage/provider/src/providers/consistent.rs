@@ -66,12 +66,8 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         }
     }
 
-    fn history_is_expired(&self, number: BlockNumber, kind: HistoryKind) -> bool {
-        let static_files = self.storage_provider.static_file_provider();
-        number < match kind {
-            HistoryKind::Body => static_files.earliest_history_height(),
-            HistoryKind::Header => static_files.earliest_header_height(),
-        }
+    fn body_history_is_expired(&self, number: BlockNumber) -> bool {
+        number < self.storage_provider.static_file_provider().earliest_history_height()
     }
 
     /// Create a new provider using [`ProviderFactory`] and [`CanonicalInMemoryState`],
@@ -392,7 +388,7 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
                 match id {
                     HashOrNumber::Hash(tx_hash) => {
                         if tx_hash == *block.body().transactions()[tx_index].tx_hash() {
-                            if self.history_is_expired(block_state.number(), HistoryKind::Body) {
+                            if self.body_history_is_expired(block_state.number()) {
                                 return Ok(None)
                             }
                             return fetch_from_block_state(tx_index, in_memory_tx_num, block_state)
@@ -446,10 +442,10 @@ impl<N: ProviderNodeTypes> ConsistentProvider<N> {
         S: FnOnce(&DatabaseProviderRO<N::DB, N>) -> ProviderResult<R>,
         M: Fn(&BlockState<N::Primitives>) -> ProviderResult<R>,
     {
-        if let Some(number) = self.convert_hash_or_number(id)? {
-            self.ensure_history(number, history)?;
-        }
-        self.get_in_memory_or_storage_by_block(id, fetch_from_db, fetch_from_block_state)
+        self.get_in_memory_or_storage_by_block(id, fetch_from_db, |block_state| {
+            self.ensure_history(block_state.number(), history)?;
+            fetch_from_block_state(block_state)
+        })
     }
 }
 
@@ -588,6 +584,10 @@ impl<N: ProviderNodeTypes> BlockNumReader for ConsistentProvider<N> {
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
         self.storage_provider.last_block_number()
+    }
+
+    fn earliest_block_number(&self) -> ProviderResult<BlockNumber> {
+        Ok(self.storage_provider.static_file_provider().earliest_history_height())
     }
 
     fn block_number(&self, hash: B256) -> ProviderResult<Option<BlockNumber>> {
@@ -823,7 +823,7 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
         if let Some((tx, meta)) =
             self.head_block.as_ref().and_then(|b| b.transaction_meta_on_chain(hash))
         {
-            if self.history_is_expired(meta.block_number, HistoryKind::Body) {
+            if self.body_history_is_expired(meta.block_number) {
                 return Ok(None)
             }
             return Ok(Some(tx))
@@ -839,7 +839,7 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {
         if let Some((tx, meta)) =
             self.head_block.as_ref().and_then(|b| b.transaction_meta_on_chain(tx_hash))
         {
-            if self.history_is_expired(meta.block_number, HistoryKind::Body) {
+            if self.body_history_is_expired(meta.block_number) {
                 return Ok(None)
             }
             return Ok(Some((tx, meta)))
@@ -944,7 +944,7 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ConsistentProvider<N> {
             if let Some(tx_index) =
                 block.body().transactions_iter().position(|tx| *tx.tx_hash() == hash)
             {
-                if self.history_is_expired(block_state.number(), HistoryKind::Body) {
+                if self.body_history_is_expired(block_state.number()) {
                     return Ok(None)
                 }
                 // safe to use tx_index for receipts due to 1:1 correspondence
@@ -1000,6 +1000,7 @@ impl<N: ProviderNodeTypes> ReceiptProviderIdExt for ConsistentProvider<N> {
                         .as_ref()
                         .and_then(|b| b.block_on_chain(rpc_block_hash.block_hash.into()))
                 {
+                    self.ensure_history(state.number(), HistoryKind::Body)?;
                     receipts = Some(state.executed_block_receipts());
                 }
                 Ok(receipts)
@@ -1127,43 +1128,28 @@ impl<N: ProviderNodeTypes> BlockReaderIdExt for ConsistentProvider<N> {
     }
 
     fn header_by_number_or_tag(&self, id: BlockNumberOrTag) -> ProviderResult<Option<HeaderTy<N>>> {
-        Ok(match id {
-            BlockNumberOrTag::Latest => {
-                Some(self.canonical_in_memory_state.get_canonical_head().unseal())
-            }
-            BlockNumberOrTag::Finalized => {
-                self.canonical_in_memory_state.get_finalized_header().map(|h| h.unseal())
-            }
-            BlockNumberOrTag::Safe => {
-                self.canonical_in_memory_state.get_safe_header().map(|h| h.unseal())
-            }
-            BlockNumberOrTag::Earliest => self.header_by_number(self.earliest_block_number()?)?,
-            BlockNumberOrTag::Pending => self.canonical_in_memory_state.pending_header(),
-
-            BlockNumberOrTag::Number(num) => self.header_by_number(num)?,
-        })
+        Ok(self.sealed_header_by_number_or_tag(id)?.map(SealedHeader::unseal))
     }
 
     fn sealed_header_by_number_or_tag(
         &self,
         id: BlockNumberOrTag,
     ) -> ProviderResult<Option<SealedHeader<HeaderTy<N>>>> {
-        match id {
-            BlockNumberOrTag::Latest => {
-                Ok(Some(self.canonical_in_memory_state.get_canonical_head()))
+        let header = match id {
+            BlockNumberOrTag::Latest => Some(self.canonical_in_memory_state.get_canonical_head()),
+            BlockNumberOrTag::Finalized => self.canonical_in_memory_state.get_finalized_header(),
+            BlockNumberOrTag::Safe => self.canonical_in_memory_state.get_safe_header(),
+            BlockNumberOrTag::Pending => self.canonical_in_memory_state.pending_sealed_header(),
+            BlockNumberOrTag::Earliest => {
+                let floor = self.storage_provider.static_file_provider().earliest_header_height();
+                return self.sealed_header(floor)
             }
-            BlockNumberOrTag::Finalized => {
-                Ok(self.canonical_in_memory_state.get_finalized_header())
-            }
-            BlockNumberOrTag::Safe => Ok(self.canonical_in_memory_state.get_safe_header()),
-            BlockNumberOrTag::Earliest => self
-                .header_by_number(self.earliest_block_number()?)?
-                .map_or_else(|| Ok(None), |h| Ok(Some(SealedHeader::seal_slow(h)))),
-            BlockNumberOrTag::Pending => Ok(self.canonical_in_memory_state.pending_sealed_header()),
-            BlockNumberOrTag::Number(num) => self
-                .header_by_number(num)?
-                .map_or_else(|| Ok(None), |h| Ok(Some(SealedHeader::seal_slow(h)))),
+            BlockNumberOrTag::Number(num) => return self.sealed_header(num),
+        };
+        if let Some(header) = &header {
+            self.ensure_history(header.number(), HistoryKind::Header)?;
         }
+        Ok(header)
     }
 
     fn sealed_header_by_id(
@@ -1505,6 +1491,7 @@ mod tests {
         BlockWriter, HeaderProvider, ProviderError, ReceiptProvider, StaticFileProviderFactory,
         TransactionsProvider,
     };
+    use alloy_consensus::transaction::TxHashRef;
     use alloy_eips::BlockHashOrNumber;
     use alloy_primitives::{B256, U256};
     use itertools::Itertools;
@@ -1539,8 +1526,7 @@ mod tests {
         let mut rng = generators::rng();
         let factory = create_test_provider_factory();
         let static_files = factory.static_file_provider();
-        let (database_blocks, in_memory_blocks) =
-            random_blocks(&mut rng, 1, 2, None, None, 1..2);
+        let (database_blocks, in_memory_blocks) = random_blocks(&mut rng, 1, 2, None, None, 1..2);
 
         let provider_rw = factory.provider_rw()?;
         provider_rw.insert_block(
